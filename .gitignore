@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Java
+.gradle/
+java/**/build/
+*.class
+
+# Lint and type-check configuration is local tooling, not shipped source.
+.flake8
+.isort.cfg
+.pylintrc
+mypy.ini
+.ruff.toml

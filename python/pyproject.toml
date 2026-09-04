@@ -1,0 +1,63 @@
+[project]
+name = "convalesce-emit"
+version = "0.1.0"
+description = "Forward a data tool's own output to Convalesce, unchanged."
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Convalesce" }]
+keywords = ["data observability", "lineage", "airflow", "dagster", "prefect"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+# Deliberately wider than helper/platform/bot, which pin >=3.12,<3.13. This one
+# installs into a customer's Airflow or Dagster, so it has to meet their
+# interpreter rather than ask them to meet ours.
+requires-python = ">=3.9"
+# No dependencies, on purpose: it must never disturb a resolution that already
+# works in someone else's pipeline. Transport is urllib from the stdlib.
+dependencies = []
+
+[dependency-groups]
+dev = [
+  { include-group = "lint" },
+  { include-group = "test" },
+]
+lint = [
+  "black>=25.1",
+  "flake8>=7.1",
+  "isort>=6.0",
+  "mypy>=1.14",
+  "pylint>=3.3",
+]
+test = [
+  "pytest>=8.3",
+  "pytest-timeout>=2.3",
+]
+
+[project.urls]
+Homepage = "https://convalesce.com"
+Documentation = "https://docs.convalesce.com"
+Source = "https://github.com/convalesce/emit"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/convalesce_emit"]
+
+# Tests live beside the code, as they do across these repos, but a package
+# installed into a customer's Airflow has no use for them.
+exclude = ["**/test/**"]
+
+[tool.black]
+line-length = 81
+target-version = ["py39"]
+
+[tool.pytest.ini_options]
+testpaths = ["src", "plugins"]
+norecursedirs = [".git", ".venv", "build", "dist"]
+addopts = "-p no:warnings --tb=native -rpa --durations=3 --timeout=60"
