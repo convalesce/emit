@@ -1,0 +1,11 @@
+description = 'Forward a data tool\'s own output to Convalesce, unchanged.'
+
+// No dependencies at all: this jar loads into someone else's Spark driver and must not collide
+// with whatever Jackson, json4s or HTTP client that cluster already runs.
+dependencies {
+}
+
+publishing.publications.maven.pom {
+  name = 'convalesce-emit-core'
+  description = project.description
+}

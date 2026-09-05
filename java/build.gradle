@@ -1,0 +1,89 @@
+// Java 8 bytecode on purpose.
+//
+// Collect's Spark agent pins Java 17, which rules out every Spark 3.x cluster still on Java 8 or
+// 11 -- and those are common. A dependency-free forwarder has no reason to impose a JVM floor, so
+// this targets the widest one and gives up records and `var` to do it. The dev-kb Java guide
+// assumes 17+; this is a deliberate exception, not an oversight.
+subprojects {
+  apply plugin: 'java-library'
+  apply plugin: 'maven-publish'
+  apply plugin: 'signing'
+  apply plugin: 'com.diffplug.spotless'
+
+  group = 'io.convalesce'
+  version = '0.1.0'
+  // Artifact ids carry the product name; the Gradle project names do not have to.
+  base.archivesName = "convalesce-${project.name}"
+
+
+  repositories {
+    mavenCentral()
+  }
+
+  java {
+    withJavadocJar()
+    withSourcesJar()
+  }
+
+  tasks.withType(JavaCompile).configureEach {
+    options.release = 8
+    options.encoding = 'UTF-8'
+    options.compilerArgs << '-Xlint:all' << '-Werror'
+  }
+
+  tasks.withType(Javadoc).configureEach {
+    options.encoding = 'UTF-8'
+    // The Java 8 target means no module info; doclint would object to nothing here but the build
+    // should not fail on a missing @return in a getter either.
+    options.addStringOption('Xdoclint:none', '-quiet')
+  }
+
+  spotless {
+    java {
+      googleJavaFormat()
+      target 'src/**/*.java'
+    }
+  }
+
+  dependencies {
+    testImplementation 'junit:junit:4.13.2'
+  }
+
+  tasks.withType(Test).configureEach {
+    useJUnit()
+    testLogging {
+      exceptionFormat = 'full'
+    }
+  }
+
+  publishing {
+    publications {
+      maven(MavenPublication) {
+        from components.java
+        pom {
+          url = 'https://github.com/convalesce/emit'
+          licenses {
+            license {
+              name = 'Apache License, Version 2.0'
+              url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+            }
+          }
+          developers {
+            developer {
+              name = 'Convalesce'
+            }
+          }
+          scm {
+            url = 'https://github.com/convalesce/emit'
+          }
+        }
+      }
+    }
+  }
+
+  signing {
+    // Only when a key is configured, so a local build never asks for one.
+    required { gradle.taskGraph.hasTask('publish') }
+    sign publishing.publications.maven
+  }
+}
