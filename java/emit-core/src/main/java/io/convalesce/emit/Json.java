@@ -5,7 +5,7 @@ package io.convalesce.emit;
  *
  * <p>There is no JSON library here on purpose. This jar goes into someone else's Spark driver, and
  * a dependency-free artifact cannot collide with whatever Jackson or json4s version that cluster
- * already runs — the same reason the Python client is built on {@code urllib}. Shading would solve
+ * already runs, the same reason the Python client is built on {@code urllib}. Shading would solve
  * the collision too, at the cost of a fatter jar and a build step.
  *
  * <p>Only the envelope's own scalar fields are written here. The payload arrives as a JSON string

@@ -23,10 +23,10 @@ upgrade a package inside their pipeline.
 pip install convalesce-emit-airflow   # or -dagster, -prefect, -gx
 ```
 
-For Spark, two lines of config rather than a pip install — see [`java/`](java).
+For Spark, two lines of config rather than a pip install. See [`java/`](java).
 
 Each plugin pulls in `convalesce-emit`, which has **no dependencies of its
-own** — transport is `urllib` from the standard library. It installs into an
+own**: transport is `urllib` from the standard library. It installs into an
 existing Airflow or Dagster environment without touching a resolution that
 already works.
 
@@ -36,8 +36,8 @@ Set these on the worker; no code changes are needed.
 
 | Variable | Default | |
 | --- | --- | --- |
-| `CONVALESCE_INGEST_KEY` | — | required unless dry-running |
-| `CONVALESCE_WORKSPACE` | — | which account this is |
+| `CONVALESCE_INGEST_KEY` | none | required unless dry-running |
+| `CONVALESCE_WORKSPACE` | none | which account this is |
 | `CONVALESCE_ENDPOINT` | `https://api.convalesce.dev` | |
 | `CONVALESCE_DRY_RUN` | `false` | build envelopes, log them, send nothing |
 | `CONVALESCE_ENABLED` | `true` | set `false` to switch off entirely |
@@ -62,8 +62,8 @@ what it is holding.
 
 ## Great Expectations and row values
 
-A GX validation result carries sample failing values — `partial_unexpected_list`
-and its siblings — which are real rows from your table. Those are **replaced by
+A GX validation result carries sample failing values (`partial_unexpected_list`
+and its siblings) which are real rows from your table. Those are **replaced by
 their counts before anything leaves the process**, because Convalesce reads
 table shapes, run outcomes, row counts and lineage, not the rows themselves.
 
@@ -97,4 +97,4 @@ only registering with a real Airflow would have found.
 
 Nothing here raises into your pipeline. If our endpoint is down, the
 observation is logged and dropped. A DAG must not go red because we had a bad
-minute — we are watching your pipeline, not standing in it.
+minute: we are watching your pipeline, not standing in it.

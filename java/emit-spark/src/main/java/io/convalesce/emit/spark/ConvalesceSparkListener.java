@@ -24,7 +24,7 @@ import org.apache.spark.scheduler.SparkListenerTaskEnd;
  *
  * <p>Every callback does the same thing: hand the event to Spark's own serialiser and forward the
  * string. Nothing here reads a field off an event, which is why one artifact covers Spark 3.0
- * through 4.x and both Scala builds — the only Spark types touched are the event classes themselves
+ * through 4.x and both Scala builds: the only Spark types touched are the event classes themselves
  * and {@code JsonProtocol}, and none of them are Scala-version-specific in signature.
  *
  * <p>Nothing may escape into the customer's job. Every override wraps its body, and a failure to
@@ -106,7 +106,7 @@ public class ConvalesceSparkListener extends SparkListener {
    * Everything Spark does not have a dedicated callback for.
    *
    * <p>This is where SQL execution events arrive, which is where a job's inputs and outputs are
-   * described — the reason a lineage integration exists at all.
+   * described, which is the reason a lineage integration exists at all.
    */
   @Override
   public void onOtherEvent(SparkListenerEvent event) {
