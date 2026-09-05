@@ -1,0 +1,51 @@
+description = 'Forward Spark listener events to Convalesce, unchanged.'
+
+ext {
+  // Compiled against 3.5, which has both JsonProtocol shapes' callers in scope. The artifact is
+  // resolved reflectively at runtime, so this pins what we compile against, not what we support.
+  sparkVersion = '3.5.0'
+  scalaBinary = '2.12'
+}
+
+// Spark 3.3 is the last release whose JsonProtocol returns a json4s JValue rather than a String.
+// That path is exercised in its own source set against real 3.3 jars: reflection against a
+// hand-rolled fake proves nothing, and the first version of that code returned null on every
+// event because `render` needs an implicit its reflective caller cannot supply.
+ext.legacySparkVersion = '3.3.4'
+
+sourceSets {
+  legacyTest {
+    java.srcDir 'src/legacyTest/java'
+    compileClasspath += sourceSets.main.output
+    runtimeClasspath += sourceSets.main.output
+  }
+}
+
+configurations {
+  legacyTestImplementation.extendsFrom implementation
+}
+
+dependencies {
+  api project(':emit-core')
+  // compileOnly: Spark is always already on the cluster, and bundling any part of it is how a
+  // plugin breaks the job it is watching.
+  compileOnly "org.apache.spark:spark-core_${scalaBinary}:${sparkVersion}"
+  testImplementation "org.apache.spark:spark-core_${scalaBinary}:${sparkVersion}"
+  legacyTestImplementation 'junit:junit:4.13.2'
+  legacyTestImplementation "org.apache.spark:spark-core_${scalaBinary}:${legacySparkVersion}"
+}
+
+tasks.register('legacyTest', Test) {
+  description = 'Runs the Spark 3.3 JValue path against real Spark 3.3 jars.'
+  group = 'verification'
+  testClassesDirs = sourceSets.legacyTest.output.classesDirs
+  classpath = sourceSets.legacyTest.runtimeClasspath
+  useJUnit()
+}
+
+tasks.named('check') { dependsOn 'legacyTest' }
+
+publishing.publications.maven.pom {
+  name = 'convalesce-emit-spark'
+  description = project.description
+}
