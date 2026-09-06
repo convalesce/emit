@@ -1,0 +1,240 @@
+# The gate. Four jobs, because they fail for different reasons and a
+# reviewer should be able to see which at a glance: how the code is
+# written, what it does, whether the Java side still builds, and whether
+# the tools we forward from have moved underneath us.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # A second push supersedes the first: reviewing a run of code that has
+  # already been replaced wastes both the runner and the reviewer.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The lint configuration is deliberately not committed, so CI writes
+      # the same files a developer keeps locally. Copied from helper, which
+      # is where the house standard lives.
+      - name: Write lint configuration
+        working-directory: python
+        run: |
+          cat > .flake8 <<'EOF'
+          [flake8]
+          max-line-length = 81
+          doctests = True
+          ignore = W503,W504,E203,E266,E501,E731,E265
+          exclude = .git,.venv,build,dist
+          EOF
+          cat > .isort.cfg <<'EOF'
+          [settings]
+          known_first_party=convalesce_emit,convalesce_emit_airflow,convalesce_emit_dagster,convalesce_emit_gx,convalesce_emit_prefect
+          treat_all_comments_as_code=True
+          line_length=81
+          profile=black
+          EOF
+          cat > mypy.ini <<'EOF'
+          [mypy]
+          python_version = 3.10
+          show_error_codes = True
+          disallow_untyped_defs = True
+          disallow_incomplete_defs = True
+          check_untyped_defs = True
+          no_implicit_optional = True
+          warn_unused_configs = True
+          warn_unused_ignores = False
+          warn_return_any = True
+          allow_redefinition = True
+          follow_imports = silent
+          ignore_missing_imports = True
+          EOF
+          cat > .pylintrc <<'EOF'
+          [MAIN]
+          jobs = 4
+          [FORMAT]
+          max-line-length = 100
+          [BASIC]
+          class-rgx = (_?[A-Z][a-zA-Z0-9]*|Test_[a-z0-9_]+[0-9])$
+          variable-rgx = [a-z0-9_]{1,30}$
+          argument-rgx = [a-z0-9_]{1,30}$
+          [MESSAGES CONTROL]
+          disable = C0209,R0917,W1514,C0302,C0304,C0411,C0412,C0415,R0402,R0902,R0903,R0904,R0912,R0913,R0914,R0915,W0123,W0125,W0201,W0511,W0603,W0640,W1113,E0401
+          [REPORTS]
+          output-format = parseable
+          EOF
+      - run: pip install black isort flake8 mypy pylint
+      # black and isort rewrite files. --check and --check-only make them
+      # report instead, so a run cannot quietly pass by fixing what it was
+      # meant to fail on.
+      - name: Lint
+        working-directory: python
+        run: |
+          isort --check-only src plugins
+          black --check src plugins
+          flake8 src plugins
+          mypy src plugins
+          pylint src/convalesce_emit plugins/*/src/convalesce_emit_*
+
+  python-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor the packages declare. If it stops working the
+        # declaration is a lie, and a customer on an older Airflow finds out
+        # rather than us.
+        python: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install pytest pytest-timeout
+      # Installed rather than run from the source tree: a passing test run
+      # against src/ says nothing about whether the package installs, and
+      # that has already broken once.
+      - name: Install every distribution
+        working-directory: python
+        run: pip install . plugins/airflow plugins/dagster plugins/prefect plugins/gx
+      - name: Test
+        working-directory: python
+        run: pytest
+
+  java:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      # `check` runs spotless, the unit tests, and legacyTest, which
+      # exercises the Spark 3.3 JValue path against real Spark 3.3 jars.
+      # That path shipped broken once and returned null on every event.
+      - name: Build and check
+        working-directory: java
+        run: ./gradlew check
+      - name: Java 8 bytecode
+        working-directory: java
+        run: |
+          unzip -o -q emit-spark/build/libs/convalesce-emit-spark-*.jar -d /tmp/jar
+          version=$(javap -v /tmp/jar/io/convalesce/emit/spark/ConvalesceSparkListener.class \
+            | grep -m1 "major version" | tr -dc '0-9')
+          echo "major version: $version"
+          # 52 is Java 8. Anything higher and the jar stops loading on the
+          # Spark 3.x clusters this exists to reach.
+          test "$version" = "52"
+
+  tools:
+    # The job that earns its keep. Everything above tests our own logic; this
+    # tests the assumption underneath it, that a tool's callback API still
+    # matches what the plugin declares. Every version listed is a boundary
+    # where behaviour actually changes, and each one was found by running it.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Airflow 2.5 is the oldest release with a listener API at all.
+          - tool: airflow
+            spec: "apache-airflow==2.5.3"
+            python: "3.10"
+          # `on_task_instance_failed` gained its `error` argument in 2.10, so
+          # 2.9 and 2.10 exercise different hookspecs.
+          - tool: airflow
+            spec: "apache-airflow==2.9.3"
+            python: "3.11"
+          - tool: airflow
+            spec: "apache-airflow==2.10.5"
+            python: "3.11"
+          # Airflow 3 moved the task hookspecs to airflow._shared and dropped
+          # `session`.
+          - tool: airflow
+            spec: "apache-airflow==3.0.3"
+            python: "3.12"
+          # The two Great Expectations majors need two different action
+          # classes; one cannot satisfy both.
+          - tool: gx
+            spec: "great-expectations==0.18.22"
+            python: "3.11"
+          - tool: gx
+            spec: "great-expectations==1.22.0"
+            python: "3.12"
+          - tool: dagster
+            spec: "dagster==1.7.16"
+            python: "3.11"
+          - tool: dagster
+            spec: "dagster==1.13.21"
+            python: "3.12"
+          # Prefect 2 calls state hooks by keyword and Prefect 3 positionally.
+          - tool: prefect
+            spec: "prefect==2.20.26"
+            python: "3.11"
+          - tool: prefect
+            spec: "prefect==3.8.5"
+            python: "3.12"
+    name: ${{ matrix.spec }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install the tool and our plugin
+        working-directory: python
+        run: pip install "${{ matrix.spec }}" . "plugins/${{ matrix.tool }}"
+      - name: Forward a real event
+        working-directory: python
+        env:
+          CONVALESCE_DRY_RUN: "true"
+        run: python ../.github/scripts/probe_${{ matrix.tool }}.py
+
+  spark:
+    # Spark serialises its own events, and which method does it moved in 3.4.
+    # Both paths run here against real Spark.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.4 is the first release with sparkEventToJsonString; 3.5 and 4.0
+        # confirm it stayed. The pre-3.4 JValue path is covered by
+        # `./gradlew legacyTest` in the java job, because no Spark 3.3 image
+        # runs reliably on current runners.
+        spark: ["3.4.4", "3.5.3", "4.0.3"]
+    name: spark ${{ matrix.spark }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build the jars
+        working-directory: java
+        run: ./gradlew build -x test
+      - name: Run a job with the listener attached
+        run: |
+          docker run --rm \
+            -v "$PWD/java/emit-core/build/libs:/opt/core:ro" \
+            -v "$PWD/java/emit-spark/build/libs:/opt/spark:ro" \
+            -v "$PWD/.github/scripts/probe_spark.py:/opt/probe.py:ro" \
+            -e CONVALESCE_DRY_RUN=true \
+            -e HOME=/tmp \
+            "apache/spark:${{ matrix.spark }}" \
+            /opt/spark/bin/spark-submit --master "local[1]" \
+              --jars "$(ls java/emit-core/build/libs/*.jar | grep -v -e sources -e javadoc | sed 's|.*/|/opt/core/|')","$(ls java/emit-spark/build/libs/*.jar | grep -v -e sources -e javadoc | sed 's|.*/|/opt/spark/|')" \
+              --conf spark.extraListeners=io.convalesce.emit.spark.ConvalesceSparkListener \
+              /opt/probe.py 2>&1 | tee /tmp/out
+          # The listener must emit, and the job must still succeed.
+          grep -q "PROBE_ROWS" /tmp/out
+          grep -q "convalesce dry-run" /tmp/out
