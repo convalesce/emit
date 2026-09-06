@@ -60,6 +60,11 @@ subprojects {
     publications {
       maven(MavenPublication) {
         from components.java
+        // The artifactId is what a customer types; the Gradle project name is not.
+        // `base.archivesName` only renames the file, so without this the coordinate
+        // published is io.convalesce:emit-spark while every doc says
+        // io.convalesce:convalesce-emit-spark.
+        artifactId = "convalesce-${project.name}"
         pom {
           url = 'https://github.com/convalesce/emit'
           licenses {
@@ -75,6 +80,8 @@ subprojects {
           }
           scm {
             url = 'https://github.com/convalesce/emit'
+            connection = 'scm:git:https://github.com/convalesce/emit.git'
+            developerConnection = 'scm:git:ssh://git@github.com/convalesce/emit.git'
           }
         }
       }
