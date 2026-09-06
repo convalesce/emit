@@ -13,7 +13,7 @@ package io.convalesce.emit;
 public final class Config {
 
   /** Default endpoint, used when {@code CONVALESCE_ENDPOINT} is unset. */
-  public static final String DEFAULT_ENDPOINT = "https://api.convalesce.dev";
+  public static final String DEFAULT_ENDPOINT = "https://api.convalesce.io";
 
   private static final int DEFAULT_TIMEOUT_MS = 10_000;
   private static final int DEFAULT_MAX_RETRIES = 3;

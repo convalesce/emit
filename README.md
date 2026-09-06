@@ -38,7 +38,7 @@ Set these on the worker; no code changes are needed.
 | --- | --- | --- |
 | `CONVALESCE_INGEST_KEY` | none | required unless dry-running |
 | `CONVALESCE_WORKSPACE` | none | which account this is |
-| `CONVALESCE_ENDPOINT` | `https://api.convalesce.dev` | |
+| `CONVALESCE_ENDPOINT` | `https://api.convalesce.io` | |
 | `CONVALESCE_DRY_RUN` | `false` | build envelopes, log them, send nothing |
 | `CONVALESCE_ENABLED` | `true` | set `false` to switch off entirely |
 | `CONVALESCE_BATCH_SIZE` | `50` | |

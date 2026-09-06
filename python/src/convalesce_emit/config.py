@@ -26,7 +26,7 @@ import convalesce_emit.errors as ceerrors
 
 _LOG = logging.getLogger(__name__)
 
-DEFAULT_ENDPOINT = "https://api.convalesce.dev"
+DEFAULT_ENDPOINT = "https://api.convalesce.io"
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_MAX_RETRIES = 3
 # Fifty keeps a busy scheduler to roughly one request a second while staying

@@ -124,7 +124,9 @@ jobs:
       # That path shipped broken once and returned null on every event.
       - name: Build and check
         working-directory: java
-        run: ./gradlew check
+        # `build`, not `check`: check runs the tests but never assembles the
+        # jar, and the bytecode step below has nothing to look at.
+        run: ./gradlew build
       - name: Java 8 bytecode
         working-directory: java
         run: |
