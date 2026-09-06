@@ -128,7 +128,8 @@ jobs:
       - name: Java 8 bytecode
         working-directory: java
         run: |
-          unzip -o -q emit-spark/build/libs/convalesce-emit-spark-*.jar -d /tmp/jar
+          jar=$(ls emit-spark/build/libs/*.jar | grep -v -e sources -e javadoc | head -1)
+          unzip -o -q "$jar" -d /tmp/jar
           version=$(javap -v /tmp/jar/io/convalesce/emit/spark/ConvalesceSparkListener.class \
             | grep -m1 "major version" | tr -dc '0-9')
           echo "major version: $version"
@@ -192,7 +193,19 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Install the tool and our plugin
         working-directory: python
-        run: pip install "${{ matrix.spec }}" . "plugins/${{ matrix.tool }}"
+        # Airflow pins its own dependency tree; without its constraints file
+        # pip resolves, for instance, pendulum 3 against Airflow 2.5, which
+        # cannot call it. The other tools resolve cleanly on their own.
+        run: |
+          if [ "${{ matrix.tool }}" = "airflow" ]; then
+            version="${{ matrix.spec }}"
+            version="${version#apache-airflow==}"
+            pip install "${{ matrix.spec }}" \
+              --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${version}/constraints-${{ matrix.python }}.txt"
+          else
+            pip install "${{ matrix.spec }}"
+          fi
+          pip install . "plugins/${{ matrix.tool }}"
       - name: Forward a real event
         working-directory: python
         env:
@@ -225,14 +238,14 @@ jobs:
       - name: Run a job with the listener attached
         run: |
           docker run --rm \
-            -v "$PWD/java/emit-core/build/libs:/opt/core:ro" \
-            -v "$PWD/java/emit-spark/build/libs:/opt/spark:ro" \
+            -v "$PWD/java/emit-core/build/libs:/opt/emit-core:ro" \
+            -v "$PWD/java/emit-spark/build/libs:/opt/emit-spark:ro" \
             -v "$PWD/.github/scripts/probe_spark.py:/opt/probe.py:ro" \
             -e CONVALESCE_DRY_RUN=true \
             -e HOME=/tmp \
             "apache/spark:${{ matrix.spark }}" \
             /opt/spark/bin/spark-submit --master "local[1]" \
-              --jars "$(ls java/emit-core/build/libs/*.jar | grep -v -e sources -e javadoc | sed 's|.*/|/opt/core/|')","$(ls java/emit-spark/build/libs/*.jar | grep -v -e sources -e javadoc | sed 's|.*/|/opt/spark/|')" \
+              --jars "$(ls java/emit-core/build/libs/*.jar | grep -v -e sources -e javadoc | sed 's|.*/|/opt/emit-core/|')","$(ls java/emit-spark/build/libs/*.jar | grep -v -e sources -e javadoc | sed 's|.*/|/opt/emit-spark/|')" \
               --conf spark.extraListeners=io.convalesce.emit.spark.ConvalesceSparkListener \
               /opt/probe.py 2>&1 | tee /tmp/out
           # The listener must emit, and the job must still succeed.
