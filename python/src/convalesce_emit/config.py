@@ -37,6 +37,9 @@ DEFAULT_MAX_RETRIES = 3
 # Fifty keeps a busy scheduler to roughly one request a second while staying
 # small enough that a crash loses little.
 DEFAULT_BATCH_SIZE = 50
+# The receiver refuses a request body above one megabyte, and refuses it
+# whole, so a batch is closed before it would reach that.
+DEFAULT_MAX_BODY_BYTES = 1_000_000
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -56,6 +59,7 @@ class Config:
     :param timeout: seconds to wait on a single request
     :param max_retries: attempts after the first, for transient failures
     :param batch_size: observations to hold before sending
+    :param max_body_bytes: encoded size a batch is sent before reaching
     :param dry_run: build and log envelopes, send nothing
     :param enabled: when False, emitting is a no-op
     """
@@ -65,6 +69,7 @@ class Config:
     timeout: float = DEFAULT_TIMEOUT
     max_retries: int = DEFAULT_MAX_RETRIES
     batch_size: int = DEFAULT_BATCH_SIZE
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
     dry_run: bool = False
     enabled: bool = True
 
@@ -86,6 +91,9 @@ class Config:
             ),
             batch_size=int(
                 _read_num("CONVALESCE_BATCH_SIZE", DEFAULT_BATCH_SIZE)
+            ),
+            max_body_bytes=int(
+                _read_num("CONVALESCE_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES)
             ),
             dry_run=_read_bool("CONVALESCE_DRY_RUN", False),
             enabled=_read_bool("CONVALESCE_ENABLED", True),

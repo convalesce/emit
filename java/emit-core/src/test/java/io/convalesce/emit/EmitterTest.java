@@ -91,6 +91,53 @@ public class EmitterTest {
   }
 
   @Test
+  public void batchIsClosedByBodySizeNotOnlyCount() {
+    // The receiver refuses a body above its limit whole and does not retry, so fifty Spark plan
+    // events used to be dropped together.
+    Emitter emitter = new Emitter(Config.of(url, "secret-key", 50, 0, 10_000));
+    String payload = "{\"plan\":\"" + repeat("x", 4000) + "\"}";
+    for (int i = 0; i < 6; i++) {
+      emitter.emit("spark", "e", payload, null);
+    }
+    emitter.close();
+    assertTrue("expected more than one request, got " + bodies.size(), bodies.size() > 1);
+    int total = 0;
+    for (String body : bodies) {
+      assertTrue("body of " + body.length() + " bytes", body.length() <= 10_000);
+      total += countOccurrences(body, "\"observation_id\"");
+    }
+    assertEquals(6, total);
+  }
+
+  @Test
+  public void anOversizedObservationGoesAlone() {
+    Emitter emitter = new Emitter(Config.of(url, "secret-key", 50, 0, 4000));
+    emitter.emit("spark", "small", "{\"a\":1}", null);
+    emitter.emit("spark", "huge", "{\"plan\":\"" + repeat("x", 8000) + "\"}", null);
+    emitter.emit("spark", "small", "{\"b\":2}", null);
+    emitter.close();
+    boolean alone = false;
+    int total = 0;
+    for (String body : bodies) {
+      int count = countOccurrences(body, "\"observation_id\"");
+      total += count;
+      if (count == 1 && body.contains("\"huge\"")) {
+        alone = true;
+      }
+    }
+    assertTrue("the oversized observation shared a request", alone);
+    assertEquals(3, total);
+  }
+
+  private static String repeat(String unit, int times) {
+    StringBuilder out = new StringBuilder(unit.length() * times);
+    for (int i = 0; i < times; i++) {
+      out.append(unit);
+    }
+    return out.toString();
+  }
+
+  @Test
   public void closeFlushesAPartialBatch() {
     Emitter emitter = emitter(100, 0);
     emitter.emit("spark", "e", "{}", null);

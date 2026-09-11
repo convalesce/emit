@@ -19,26 +19,39 @@ import convalesce_emit.serialize as ceserial
 """
 
 import dataclasses
+import enum
 import io
 import logging
 import threading
 import types
-from typing import Any, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 _LOG = logging.getLogger(__name__)
 
 _SCALARS = (bool, int, float, str)
 # Tried in order. Pydantic models answer to the first, Airflow and Dagster
-# objects usually to the second or third, and namedtuples to the last.
-_DUMP_METHODS = ("model_dump", "dict", "to_dict", "_asdict")
+# objects usually to the second or third, Great Expectations results to the
+# fourth, and namedtuples to the last.
+_DUMP_METHODS = ("model_dump", "dict", "to_dict", "to_json_dict", "_asdict")
 
-# Deep enough for the payloads these tools actually produce. Anything past it
-# is machinery, not state.
-_MAX_DEPTH = 4
+# Levels of nesting walked before a value is described rather than opened.
+# One level is one mapping or object; a list is transparent, since it holds
+# more of the same thing rather than stepping into anything.
+#
+# Ten, because the deepest thing these tools nest sits at eight: a Great
+# Expectations checkpoint result arrives as a keyword argument (2), dumps to
+# a mapping of validation results (3, 4), each dumping to a list of
+# expectation results (5), each holding an expectation config (6) whose
+# kwargs (7) name the column (8). What keeps a payload bounded is the node
+# budget and the skip lists below, not this; depth only stops pathological
+# nesting from walking forever.
+_MAX_DEPTH = 10
 # Total values written. Caps breadth, which depth alone does not: one object
-# holding a registry of thousands is shallow and still enormous.
-_MAX_NODES = 2000
-_MAX_ITEMS = 200
+# holding a registry of thousands is shallow and still enormous. Sized for a
+# real DAG: one Airflow task event carries the whole DAG, at about sixty
+# values per task, and this leaves room for a few hundred tasks.
+_MAX_NODES = 20_000
+_MAX_ITEMS = 1000
 _MAX_STRING = 4096
 
 # Attribute names that lead out of the tool's own state and into the runtime.
@@ -125,10 +138,20 @@ def dump(  # pylint: disable=too-many-return-statements
             if len(obj) <= _MAX_STRING
             else obj[:_MAX_STRING] + "...(truncated)"
         )
+    if isinstance(obj, enum.Enum):
+        # The member's value is the tool's state; its name is Python's.
+        return dump(obj.value, budget=budget, depth=depth)
     if isinstance(obj, _SKIP_TYPES):
         return _describe(obj)
     if not budget.spend():
         return "...(truncated: size limit)"
+    if isinstance(obj, (list, tuple, set, frozenset)) and not _is_namedtuple(
+        obj
+    ):
+        # Transparent: the items are at the same depth as the list.
+        return [
+            dump(v, budget=budget, depth=depth) for v in list(obj)[:_MAX_ITEMS]
+        ]
     if depth >= _MAX_DEPTH:
         return _describe(obj)
     # Cycles are common once an object graph includes a parent pointer.
@@ -153,22 +176,10 @@ def _dump_container(obj: Any, budget: _Budget, depth: int) -> Any:
     """
     nxt = depth + 1
     if isinstance(obj, dict):
-        out = {}
-        for key, value in list(obj.items())[:_MAX_ITEMS]:
-            name = str(key)
-            if name.lower() in _SKIP_NAMES:
-                continue
-            out[name] = dump(value, budget=budget, depth=nxt)
-        return out
-    # Namedtuples are tuples, so this has to come first or a Dagster run
-    # arrives as an anonymous array with every field name lost.
-    dumped = _try_dump_methods(obj, budget, nxt)
-    if dumped is not _UNSET:
-        return dumped
-    if isinstance(obj, (list, tuple, set, frozenset)):
-        return [
-            dump(v, budget=budget, depth=nxt) for v in list(obj)[:_MAX_ITEMS]
-        ]
+        return _dump_mapping(obj, budget, nxt)
+    # An object and the mapping it dumps to are one level, not two: the
+    # mapping is the object, described by the tool's own method.
+    dumped = _try_dump_methods(obj, budget, depth)
     if dumped is not _UNSET:
         return dumped
     data = getattr(obj, "__dict__", None)
@@ -176,8 +187,21 @@ def _dump_container(obj: Any, budget: _Budget, depth: int) -> Any:
         public = {}
         for key, value in list(data.items())[:_MAX_ITEMS]:
             name = str(key)
-            # Leading underscores are the tool's internals, not its state.
-            if name.startswith("_") or name.lower() in _SKIP_NAMES:
+            if name.lower() in _SKIP_NAMES:
+                continue
+            # Leading underscores are the tool's internals, not its state,
+            # unless the class reads one back through a property of the
+            # public name: then the property is the state and the private
+            # attribute its storage. Airflow keeps a DAG's id, a run's state
+            # and, before 2.10, a task's try number that way.
+            if name.startswith("_"):
+                exposed = name.lstrip("_")
+                if (
+                    exposed
+                    and exposed not in data
+                    and _has_property(obj, exposed)
+                ):
+                    public[exposed] = _dump_property(obj, exposed, budget, nxt)
                 continue
             public[name] = dump(value, budget=budget, depth=nxt)
         # An empty mapping tells the receiver nothing; the object's own
@@ -185,6 +209,66 @@ def _dump_container(obj: Any, budget: _Budget, depth: int) -> Any:
         if public:
             return public
     return _describe(obj)
+
+
+def _dump_mapping(obj: Dict[Any, Any], budget: _Budget, depth: int) -> Any:
+    """
+    Walk one mapping.
+
+    :param obj: the mapping being walked
+    :param budget: remaining size allowance
+    :param depth: depth for the values
+    :return: a JSON-encodable mapping keyed by strings
+    """
+    out = {}
+    for key, value in list(obj.items())[:_MAX_ITEMS]:
+        # Keys are whatever the tool used; JSON wants strings. A Great
+        # Expectations checkpoint keys its results by identifier objects.
+        name = key if isinstance(key, str) else _describe(key)
+        if name.lower() in _SKIP_NAMES:
+            continue
+        out[name] = dump(value, budget=budget, depth=depth)
+    return out
+
+
+def _is_namedtuple(obj: Any) -> bool:
+    """
+    Tell a namedtuple from a tuple.
+
+    :param obj: the value being walked
+    :return: whether it carries field names worth keeping
+    """
+    return isinstance(obj, tuple) and hasattr(obj, "_fields")
+
+
+def _has_property(obj: Any, name: str) -> bool:
+    """
+    Tell whether the object's class exposes `name` as a property.
+
+    :param obj: the object being walked
+    :param name: the attribute name
+    :return: whether reading it runs the class's own code
+    """
+    return isinstance(getattr(type(obj), name, None), property)
+
+
+def _dump_property(obj: Any, name: str, budget: _Budget, depth: int) -> Any:
+    """
+    Read one property, describing the object if the read raises.
+
+    :param obj: the object being walked
+    :param name: the property name
+    :param budget: remaining size allowance
+    :param depth: depth for the value
+    :return: the property's value, dumped
+    """
+    try:
+        value = getattr(obj, name)
+    except Exception:  # pylint: disable=broad-exception-caught
+        # A property that needs a live session or a lock is the tool's
+        # business; the rest of the object is still worth having.
+        return f"<{name}: unreadable>"
+    return dump(value, budget=budget, depth=depth)
 
 
 def _describe(obj: Any) -> str:
@@ -214,7 +298,7 @@ def _try_dump_methods(obj: Any, budget: _Budget, depth: int) -> Any:
 
     :param obj: the object to try
     :param budget: remaining size allowance
-    :param depth: recursion depth to pass on
+    :param depth: the object's own depth; its mapping is walked at it
     :return: the dumped value, or `_UNSET` if no method worked
     """
     for attr in _DUMP_METHODS:
@@ -222,9 +306,12 @@ def _try_dump_methods(obj: Any, budget: _Budget, depth: int) -> Any:
         if not callable(method):
             continue
         try:
-            return dump(method(), budget=budget, depth=depth)
+            described = method()
         except Exception:  # pylint: disable=broad-exception-caught
             # A tool's own serialiser failing is not our problem to solve;
             # fall through and describe the object some other way.
             break
+        if isinstance(described, dict):
+            return _dump_mapping(described, budget, depth + 1)
+        return dump(described, budget=budget, depth=depth)
     return _UNSET

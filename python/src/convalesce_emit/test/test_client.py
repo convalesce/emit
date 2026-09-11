@@ -262,3 +262,48 @@ class Test_emitter_modes1(_ServerCase):
         self.assertEqual(_Recorder.received, [])
         self.assertIn("dry-run", "\n".join(logs.output))
         self.assertIn('"x": 1', "\n".join(logs.output))
+
+
+# #############################################################################
+# Test_emitter_body_size1
+# #############################################################################
+
+
+class Test_emitter_body_size1(_ServerCase):
+    """
+    Test that a batch is closed by size as well as by count.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that observations are split across requests by encoded size.
+
+        The receiver refuses a body above its limit whole and the refusal is
+        not retried, so fifty Spark plan events used to be dropped together.
+        """
+        payload = {"plan": "x" * 4000}
+        with self._emitter(batch_size=50, max_body_bytes=10_000) as emitter:
+            for _ in range(6):
+                emitter.emit(tool="spark", event="e", payload=payload)
+        self.assertGreater(len(_Recorder.received), 1)
+        for request in _Recorder.received:
+            body = json.dumps(request, separators=(",", ":"))
+            self.assertLessEqual(len(body), 10_000)
+        self.assertEqual(len(self._sent()), 6)
+
+    def test2(self) -> None:
+        """
+        Test that one oversized observation goes alone, not with the others.
+        """
+        with self._emitter(batch_size=50, max_body_bytes=4000) as emitter:
+            emitter.emit(tool="spark", event="small", payload={"a": 1})
+            emitter.emit(
+                tool="spark", event="huge", payload={"plan": "x" * 8000}
+            )
+            emitter.emit(tool="spark", event="small", payload={"b": 2})
+        requests = [
+            [obs["event"] for obs in request["observations"]]
+            for request in _Recorder.received
+        ]
+        self.assertIn(["huge"], requests)
+        self.assertEqual(len(self._sent()), 3)
