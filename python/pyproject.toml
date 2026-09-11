@@ -13,9 +13,9 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-# Deliberately wider than helper/platform/bot, which pin >=3.12,<3.13. This one
-# installs into a customer's Airflow or Dagster, so it has to meet their
-# interpreter rather than ask them to meet ours.
+# Deliberately wider than the other Convalesce Python repositories, which pin
+# >=3.12,<3.13. This one installs into a customer's Airflow or Dagster, so it
+# has to meet their interpreter rather than ask them to meet ours.
 requires-python = ">=3.9"
 # No dependencies, on purpose: it must never disturb a resolution that already
 # works in someone else's pipeline. Transport is urllib from the stdlib.

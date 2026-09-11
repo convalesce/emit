@@ -24,8 +24,8 @@ jobs:
         with:
           python-version: "3.12"
       # The lint configuration is deliberately not committed, so CI writes
-      # the same files a developer keeps locally. Copied from helper, which
-      # is where the house standard lives.
+      # the same files a developer keeps locally: the house standard shared
+      # by every Convalesce Python repository.
       - name: Write lint configuration
         working-directory: python
         run: |
