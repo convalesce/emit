@@ -48,7 +48,20 @@ jobs:
   pypi:
     needs: check-version
     runs-on: ubuntu-latest
-    environment: ${{ inputs.rehearse && 'testpypi' || 'pypi' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One GitHub environment per package, because PyPI allows one
+          # pending publisher per owner, repository, workflow and
+          # environment: five packages cannot share `pypi` until they exist.
+          - { package: convalesce-emit, dir: ".", env: "" }
+          - { package: convalesce-emit-airflow, dir: plugins/airflow, env: "-airflow" }
+          - { package: convalesce-emit-dagster, dir: plugins/dagster, env: "-dagster" }
+          - { package: convalesce-emit-prefect, dir: plugins/prefect, env: "-prefect" }
+          - { package: convalesce-emit-gx, dir: plugins/gx, env: "-gx" }
+    name: ${{ matrix.package }}
+    environment: ${{ inputs.rehearse && 'testpypi' || 'pypi' }}${{ matrix.env }}
     permissions:
       id-token: write
     steps:
@@ -57,16 +70,12 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install build twine
-      - name: Build every distribution
+      - name: Build the distribution
         working-directory: python
         run: |
-          for d in . plugins/airflow plugins/dagster plugins/prefect plugins/gx; do
-            python -m build --outdir ../dist "$d"
-          done
+          python -m build --outdir ../dist "${{ matrix.dir }}"
           twine check ../dist/*
           ls -l ../dist
-      # The core first: a plugin's install resolves `convalesce-emit` on the
-      # index, and PyPI serves a new upload within seconds.
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/

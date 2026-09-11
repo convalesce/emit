@@ -40,11 +40,13 @@ Central job notices the missing secrets and stops instead of failing.
 
 Trusted publishing, so no API token exists to leak or rotate.
 
-- Create the `pypi` environment in the repository settings.
-- On PyPI, add a *pending publisher* for each of the five names
-  (`convalesce-emit`, `convalesce-emit-airflow`, `-dagster`, `-prefect`,
-  `-gx`): owner `convalesce`, repository `emit`, workflow `publish.yml`,
-  environment `pypi`. The first upload claims the name.
+- One GitHub environment per package, because PyPI allows a single pending
+  publisher per owner, repository, workflow and environment: `pypi` for
+  `convalesce-emit`, then `pypi-airflow`, `pypi-dagster`, `pypi-prefect` and
+  `pypi-gx`. The rehearsal uses the same names with `testpypi` in front.
+- On PyPI, add a *pending publisher* for each of the five names: owner
+  `convalesce`, repository `emit`, workflow `publish.yml`, and that package's
+  environment. The first upload claims the name.
 
 ### Maven Central
 
