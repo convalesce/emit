@@ -32,17 +32,22 @@ def compose_env(version: str) -> Dict[str, str]:
 
 
 def _wait_for_dag(stack: harness.Stack, dag_id: str, timeout: float = 240) -> None:
+    """Unpause the DAG once the scheduler has written it to the database.
+
+    `dags list` parses the file itself and shows the DAG before the row
+    exists, which made `unpause` fail on a slower runner. `unpause` reads
+    the row, so polling it is the honest check, and it is idempotent.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        result = stack.exec("airflow", "airflow", "dags", "list", check=False)
-        if result.returncode == 0 and dag_id in result.stdout:
+        result = stack.exec("airflow", "airflow", "dags", "unpause", dag_id, check=False)
+        if result.returncode == 0:
             return
         time.sleep(3)
-    raise AssertionError(f"{dag_id} never appeared in `airflow dags list`\n{stack.logs('airflow')[-4000:]}")
+    raise AssertionError(f"{dag_id} never reached the scheduler's database\n{stack.logs('airflow')[-4000:]}")
 
 
 def _trigger(stack: harness.Stack, dag_id: str) -> None:
-    stack.exec("airflow", "airflow", "dags", "unpause", dag_id)
     stack.exec("airflow", "airflow", "dags", "trigger", dag_id)
 
 
