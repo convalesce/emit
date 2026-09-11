@@ -83,6 +83,8 @@ class Test_airflow1(e2eharn.StackCase):
             )
             self.assert_envelopes(observations, "airflow")
             self.assertIn(DAG_ID, e2eharn.wire(observations))
+            self._assert_run_is_named(observations)
+            self._assert_session_absent(observations)
             if e2eharn.find_version_parts(self.version) >= (2, 10):
                 self._assert_failure_forwarded(observations)
             observations = self.stack.wait_for(
@@ -141,6 +143,51 @@ class Test_airflow1(e2eharn.StackCase):
         raise AssertionError(
             f"timed out after {timeout:.0f}s waiting for {what}"
         )
+
+    def _assert_run_is_named(
+        self, observations: List[e2eharn.Observation]
+    ) -> None:
+        """
+        Check a task event names its DAG and the run it belongs to.
+
+        A receiver builds the job from the DAG and the run from the dag run.
+        On Airflow 3 the task instance carries neither: the DAG sits behind a
+        property on the task and the run on the context the API server sent.
+
+        :param observations: what the receiver recorded
+        :return: nothing
+        """
+        for observation in observations:
+            if not observation["event"].startswith("on_task_instance"):
+                continue
+            task_instance = observation["payload"]["task_instance"]
+            self.assertIsInstance(task_instance, dict, observation["payload"])
+            dag_run = task_instance.get("dag_run")
+            self.assertIsInstance(
+                dag_run, dict, f"no dag run on {observation['event']}"
+            )
+            self.assertTrue(dag_run.get("run_id"), dag_run)
+            dag = (task_instance.get("task") or {}).get("dag") or dag_run.get(
+                "dag"
+            )
+            self.assertIsInstance(dag, dict, f"no dag on {observation['event']}")
+            self.assertEqual(dag.get("dag_id"), DAG_ID, dag)
+
+    def _assert_session_absent(
+        self, observations: List[e2eharn.Observation]
+    ) -> None:
+        """
+        Check the ORM session is not on the wire.
+
+        Airflow 2 passes the scheduler's SQLAlchemy session to every task
+        hook. It says nothing about the run and cost a few hundred values of
+        machinery per event.
+
+        :param observations: what the receiver recorded
+        :return: nothing
+        """
+        for observation in observations:
+            self.assertNotIn("session", observation["payload"])
 
     def _assert_failure_forwarded(
         self, observations: List[e2eharn.Observation]
