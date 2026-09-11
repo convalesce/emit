@@ -87,9 +87,31 @@ subprojects {
     }
   }
 
+  publishing.repositories {
+    // Maven Central's compatibility endpoint for plain maven-publish. A
+    // deployment lands in a staging bucket the portal shows; releasing it is
+    // one click there, or the `manual` flag below flipped to `automatic`.
+    // Credentials are a Central portal user token, never a login.
+    maven {
+      name = 'central'
+      url = 'https://ossrh-staging-api.central.sonatype.com/service/local/staging/deploy/maven2/'
+      credentials {
+        username = findProperty('centralUsername') ?: System.getenv('CENTRAL_USERNAME')
+        password = findProperty('centralPassword') ?: System.getenv('CENTRAL_PASSWORD')
+      }
+    }
+  }
+
   signing {
     // Only when a key is configured, so a local build never asks for one.
     required { gradle.taskGraph.hasTask('publish') }
+    // An armoured private key from the environment, which is how CI holds
+    // one; a keyring on disk is the default when these are unset.
+    def signingKey = findProperty('signingKey') ?: System.getenv('SIGNING_KEY')
+    def signingPassword = findProperty('signingPassword') ?: System.getenv('SIGNING_PASSWORD')
+    if (signingKey) {
+      useInMemoryPgpKeys(signingKey, signingPassword)
+    }
     sign publishing.publications.maven
   }
 }

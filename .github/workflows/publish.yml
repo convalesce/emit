@@ -1,0 +1,95 @@
+# The release. A tag `vX.Y.Z` on main publishes the five Python packages to
+# PyPI and the two jars to Maven Central, after the tag is checked against
+# every version the tree declares: a tag that disagrees with a package
+# publishes nothing.
+#
+# PyPI uses trusted publishing: the `pypi` environment here is registered
+# with PyPI as this workflow's publisher, so there is no token to rotate.
+# Maven Central needs a portal user token and a signing key, held as
+# secrets on the `maven-central` environment. See docs/releasing.md.
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Every declared version must equal the tag
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          bad=0
+          for f in python/src/convalesce_emit/_version.py python/plugins/*/src/*/_version.py; do
+            have=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$f")
+            echo "$f: $have"
+            [ "$have" = "$want" ] || bad=1
+          done
+          have=$(sed -n "s/^  version = '\(.*\)'/\1/p" java/build.gradle)
+          echo "java/build.gradle: $have"
+          [ "$have" = "$want" ] || bad=1
+          test "$bad" = 0
+
+  pypi:
+    needs: check-version
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - name: Build every distribution
+        working-directory: python
+        run: |
+          for d in . plugins/airflow plugins/dagster plugins/prefect plugins/gx; do
+            python -m build --outdir ../dist "$d"
+          done
+          twine check ../dist/*
+          ls -l ../dist
+      # The core first: a plugin's install resolves `convalesce-emit` on the
+      # index, and PyPI serves a new upload within seconds.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          verbose: true
+
+  maven-central:
+    needs: check-version
+    runs-on: ubuntu-latest
+    environment: maven-central
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build, check and publish the signed jars
+        working-directory: java
+        env:
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: ./gradlew build publish
+
+  github-release:
+    needs: [pypi, maven-central]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
