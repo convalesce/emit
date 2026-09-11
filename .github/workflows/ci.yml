@@ -38,7 +38,7 @@ jobs:
           EOF
           cat > .isort.cfg <<'EOF'
           [settings]
-          known_first_party=convalesce_emit,convalesce_emit_airflow,convalesce_emit_dagster,convalesce_emit_gx,convalesce_emit_prefect
+          known_first_party=convalesce_emit,convalesce_emit_airflow,convalesce_emit_dagster,convalesce_emit_gx,convalesce_emit_prefect,harness
           treat_all_comments_as_code=True
           line_length=81
           profile=black
@@ -76,14 +76,17 @@ jobs:
       # black and isort rewrite files. --check and --check-only make them
       # report instead, so a run cannot quietly pass by fixing what it was
       # meant to fail on.
+      # The e2e stacks are linted against this directory's configuration
+      # too, named explicitly because the tools otherwise look beside the
+      # files.
       - name: Lint
         working-directory: python
         run: |
-          isort --check-only src plugins
-          black --check src plugins
-          flake8 src plugins
-          mypy src plugins
-          pylint src/convalesce_emit plugins/*/src/convalesce_emit_*
+          isort --check-only --settings-path . src plugins ../e2e
+          black --check --config pyproject.toml src plugins ../e2e
+          flake8 --config .flake8 src plugins ../e2e
+          mypy --config-file mypy.ini src plugins ../e2e
+          pylint --rcfile .pylintrc src/convalesce_emit plugins/*/src/convalesce_emit_* $(find ../e2e -name '*.py')
 
   python-test:
     runs-on: ubuntu-latest

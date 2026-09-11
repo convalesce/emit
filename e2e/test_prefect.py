@@ -4,44 +4,84 @@ Real flows run against a real Prefect server, with the hooks attached.
 The probe calls one hook by hand. This lets Prefect itself call them, by
 keyword on 2.x and positionally on 3.x, for flows and tasks, on completion
 and on failure.
+
+Run with `EMIT_E2E_PREFECT=<version> pytest test_prefect.py`.
 """
 
-import os
-from typing import Dict
+import logging
+from typing import Dict, List
 
-import harness
+import harness as e2eharn
 
-TOOL = "prefect"
-
-
-def compose_env(version: str) -> Dict[str, str]:
-    major = int(version.split(".")[0])
-    python = "3.12" if major >= 3 else "3.11"
-    return {"EMIT_E2E_PREFECT_IMAGE": f"prefecthq/prefect:{version}-python{python}"}
+_LOG = logging.getLogger(__name__)
 
 
-def test_flow_and_task_hooks_reach_the_endpoint(stack: harness.Stack) -> None:
-    version = os.environ["EMIT_E2E_PREFECT"]
-    stack.up("receiver", "server")
-    stack.run("flows")
+# #############################################################################
+# Test_prefect1
+# #############################################################################
 
-    def all_four(obs):
-        wire = harness.dump(obs)
+
+class Test_prefect1(e2eharn.StackCase):
+    """
+    Test that flow and task hooks fire for both flows.
+    """
+
+    TOOL = "prefect"
+
+    @classmethod
+    def compose_env(cls, version: str) -> Dict[str, str]:
+        major, _ = e2eharn.find_version_parts(version)
+        python = "3.12" if major >= 3 else "3.11"
+        return {
+            "EMIT_E2E_PREFECT_IMAGE": f"prefecthq/prefect:{version}-python{python}"
+        }
+
+    def test1(self) -> None:
+        """
+        Test that a completed and a failed flow both arrive with their tasks.
+        """
+        with self.logs_on_failure():
+            self.stack.up("receiver", "server")
+            self.stack.run("flows")
+            observations = self.stack.wait_for(
+                self._all_four,
+                timeout=60,
+                what="flow and task hooks for both flows",
+            )
+            self.assert_envelopes(observations, "prefect")
+            states = self._flow_states(observations)
+            _LOG.info("flow states: %s", states)
+            self.assertTrue(any("COMPLETED" in s for s in states), states)
+            self.assertTrue(any("FAILED" in s for s in states), states)
+
+    @staticmethod
+    def _all_four(observations: List[e2eharn.Observation]) -> bool:
+        """
+        Whether both flows and both hook kinds have arrived.
+
+        :param observations: what the receiver recorded
+        :return: whether to stop waiting
+        """
+        text = e2eharn.wire(observations)
         return (
-            {"flow_run", "task_run"} <= set(harness.events(obs))
-            and "nightly_ok" in wire
-            and "nightly_broken" in wire
-            and "load failed on purpose" in wire
+            {"flow_run", "task_run"} <= set(e2eharn.events(observations))
+            and "nightly_ok" in text
+            and "nightly_broken" in text
+            and "load failed on purpose" in text
         )
 
-    observations = stack.wait_for(all_four, timeout=60, what="flow and task hooks for both flows")
+    @staticmethod
+    def _flow_states(observations: List[e2eharn.Observation]) -> List[str]:
+        """
+        The state each flow run ended in.
 
-    for obs in observations:
-        assert obs["tool"] == "prefect", obs
-        assert obs["tool_version"] == version, obs["tool_version"]
-    assert not stack.received()["rejected"], stack.received()["rejected"]
-    flow_runs = [o for o in observations if o["event"] == "flow_run"]
-    states = sorted(str(o["payload"]["state"].get("type") or o["payload"]["state"].get("name")) for o in flow_runs)
-    print("flow states:", states, "observations:", len(observations))
-    assert any("COMPLETED" in s.upper() for s in states), states
-    assert any("FAILED" in s.upper() for s in states), states
+        :param observations: what the receiver recorded
+        :return: upper-cased state names
+        """
+        states = []
+        for obs in observations:
+            if obs["event"] != "flow_run":
+                continue
+            state = obs["payload"]["state"]
+            states.append(str(state.get("type") or state.get("name")).upper())
+        return sorted(states)

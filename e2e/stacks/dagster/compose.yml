@@ -6,8 +6,8 @@ services:
 
   dagster:
     build:
-      context: ../..
-      dockerfile: e2e/dagster/Dockerfile
+      context: ../../..
+      dockerfile: e2e/stacks/dagster/Dockerfile
       args:
         DAGSTER_VERSION: ${EMIT_E2E_DAGSTER:?set EMIT_E2E_DAGSTER}
         PYTHON_IMAGE: ${EMIT_E2E_PYTHON_IMAGE:-python:3.11-slim}

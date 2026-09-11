@@ -6,8 +6,8 @@ services:
 
   airflow:
     build:
-      context: ../..
-      dockerfile: e2e/airflow/Dockerfile
+      context: ../../..
+      dockerfile: e2e/stacks/airflow/Dockerfile
       args:
         AIRFLOW_IMAGE: ${EMIT_E2E_AIRFLOW_IMAGE:?set EMIT_E2E_AIRFLOW_IMAGE}
     # Scheduler, web server and triggerer in one process, on SQLite: the

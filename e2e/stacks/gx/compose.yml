@@ -6,8 +6,8 @@ services:
 
   checkpoint:
     build:
-      context: ../..
-      dockerfile: e2e/gx/Dockerfile
+      context: ../../..
+      dockerfile: e2e/stacks/gx/Dockerfile
       args:
         GX_VERSION: ${EMIT_E2E_GX:?set EMIT_E2E_GX}
         PYTHON_IMAGE: ${EMIT_E2E_PYTHON_IMAGE:-python:3.11-slim}

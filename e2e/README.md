@@ -1,6 +1,6 @@
 # End-to-end stacks
 
-Each directory here is one tool running for real in Docker, with the plugin
+Each directory under `stacks/` is one tool running for real in Docker, with the plugin
 installed the way a customer installs it, an example workflow that has one
 step that works and one that fails, and a stand-in ingest endpoint that
 records what arrives.
@@ -46,6 +46,16 @@ test for inspection.
 
 ## Traps
 
+- **Let the scheduler parse the DAG before the CLI touches it.** On Airflow
+  2.9 and later `dags unpause` parses the file and writes the `dag` row
+  itself, and a row the CLI wrote before the scheduler's first parse left
+  every run unscheduled on a slow runner. The test waits for a scheduler
+  heartbeat (`airflow jobs check`) and for the DAG in `serialized_dag`,
+  which only the scheduler writes. `standalone`'s "Airflow is ready" line
+  is not a usable gate: it did not appear within five minutes here.
+- **The stack directories live under `stacks/`, not beside the tests.** A
+  directory named `airflow` next to `harness.py` becomes a namespace
+  package that shadows the real one under mypy.
 - **Prefect's arm64 image dies with an illegal instruction** on Apple
   silicon. The stack pins `linux/amd64`, which is native on CI and emulated
   locally.
@@ -53,6 +63,6 @@ test for inspection.
   the floor the packages declare. The test names the Python the CI matrix
   uses.
 - **A `$var` in a compose command is a compose variable.** Shell variables
-  in `spark/compose.yml` are written `$$var`.
+  in `stacks/spark/compose.yml` are written `$$var`.
 - **`compose run` does not rebuild.** The harness passes `--build`, or a
   version change silently reuses the previous version's image.

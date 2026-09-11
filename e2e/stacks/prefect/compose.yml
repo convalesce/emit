@@ -24,8 +24,8 @@ services:
   flows:
     platform: linux/amd64
     build:
-      context: ../..
-      dockerfile: e2e/prefect/Dockerfile
+      context: ../../..
+      dockerfile: e2e/stacks/prefect/Dockerfile
       args:
         PREFECT_IMAGE: ${EMIT_E2E_PREFECT_IMAGE}
     command: ["python", "/opt/flows/flows.py"]

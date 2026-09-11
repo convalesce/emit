@@ -3,91 +3,161 @@ A real Airflow runs the example DAG with the plugin installed.
 
 The in-process probe in CI proves the hookspecs match. This proves the rest:
 the plugin is discovered through the `airflow.plugins` entry point, fires in
-the scheduler's own task processes, and what it sends actually reaches the
-endpoint with the key.
+the scheduler's own task processes, and what it sends reaches the endpoint
+with the key.
+
+Run with `EMIT_E2E_AIRFLOW=<version> pytest test_airflow.py`.
 """
 
-import json
-import os
-import subprocess
+import logging
 import time
 from typing import Dict, List
 
-import harness
+import harness as e2eharn
 
-TOOL = "airflow"
+_LOG = logging.getLogger(__name__)
+
+DAG_ID = "convalesce_example"
+# Proves the scheduler has parsed the DAG itself. On Airflow 2.9 and later
+# the CLI's `unpause` parses the file and writes the row on its own, and a
+# row the CLI wrote before the scheduler's first parse left every run it
+# created unscheduled on a slow runner. Only the scheduler writes here.
+SERIALIZED_CHECK = (
+    "import sys; "
+    "from airflow.models.serialized_dag import SerializedDagModel as S; "
+    f"sys.exit(0 if S.has_dag({DAG_ID!r}) else 1)"
+)
+TASK_EVENTS = {
+    "on_task_instance_running",
+    "on_task_instance_success",
+    "on_task_instance_failed",
+}
 
 
-def compose_env(version: str) -> Dict[str, str]:
-    major, minor = (int(x) for x in version.split(".")[:2])
-    # The bare tag's Python moves with the release, and 2.5's is 3.7, below
-    # the floor the packages declare. Name the Python the CI matrix uses.
-    if (major, minor) >= (3, 0):
-        python = "3.12"
-    elif (major, minor) >= (2, 9):
-        python = "3.11"
-    else:
-        python = "3.10"
-    return {"EMIT_E2E_AIRFLOW_IMAGE": f"apache/airflow:{version}-python{python}"}
+# #############################################################################
+# Test_airflow1
+# #############################################################################
 
 
-def _wait_for_dag(stack: harness.Stack, dag_id: str, timeout: float = 240) -> None:
-    """Unpause the DAG once the scheduler has written it to the database.
-
-    `dags list` parses the file itself and shows the DAG before the row
-    exists, which made `unpause` fail on a slower runner. `unpause` reads
-    the row, so polling it is the honest check, and it is idempotent.
+class Test_airflow1(e2eharn.StackCase):
     """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        result = stack.exec("airflow", "airflow", "dags", "unpause", dag_id, check=False)
-        if result.returncode == 0:
-            return
-        time.sleep(3)
-    raise AssertionError(f"{dag_id} never reached the scheduler's database\n{stack.logs('airflow')[-4000:]}")
+    Test that the example DAG's events reach the endpoint.
+    """
 
+    TOOL = "airflow"
 
-def _trigger(stack: harness.Stack, dag_id: str) -> None:
-    stack.exec("airflow", "airflow", "dags", "trigger", dag_id)
+    @classmethod
+    def compose_env(cls, version: str) -> Dict[str, str]:
+        # The bare tag's Python moves with the release, and 2.5's is 3.7,
+        # below the floor the packages declare. Name the Python the CI
+        # matrix uses.
+        major_minor = e2eharn.find_version_parts(version)
+        if major_minor >= (3, 0):
+            python = "3.12"
+        elif major_minor >= (2, 9):
+            python = "3.11"
+        else:
+            python = "3.10"
+        image = f"apache/airflow:{version}-python{python}"
+        return {"EMIT_E2E_AIRFLOW_IMAGE": image}
 
+    def test1(self) -> None:
+        """
+        Test that task and dag-run events arrive from a real scheduler.
 
-def test_example_dag_reaches_the_endpoint(stack: harness.Stack) -> None:
-    version = os.environ["EMIT_E2E_AIRFLOW"]
-    stack.up()
-    _wait_for_dag(stack, "convalesce_example")
-    _trigger(stack, "convalesce_example")
+        The task hooks fire in the process Airflow forks per task, the
+        dag-run hooks in the scheduler itself; both must find their way
+        out. The failure message is checked only from 2.10, which is when
+        Airflow started passing it to listeners.
+        """
+        with self.logs_on_failure():
+            self.stack.up()
+            self._wait_until_scheduler_alive()
+            self._wait_until_serialized()
+            self.stack.exec("airflow", "airflow", "dags", "unpause", DAG_ID)
+            self.stack.exec("airflow", "airflow", "dags", "trigger", DAG_ID)
+            observations = self.stack.wait_for(
+                lambda obs: TASK_EVENTS <= set(e2eharn.events(obs)),
+                timeout=300,
+                what=f"task events {sorted(TASK_EVENTS)}",
+            )
+            self.assert_envelopes(observations, "airflow")
+            self.assertIn(DAG_ID, e2eharn.wire(observations))
+            if e2eharn.find_version_parts(self.version) >= (2, 10):
+                self._assert_failure_forwarded(observations)
+            observations = self.stack.wait_for(
+                lambda obs: "on_dag_run_failed" in e2eharn.events(obs),
+                timeout=120,
+                what="on_dag_run_failed from the scheduler",
+            )
+            _LOG.info("events: %s", e2eharn.events(observations))
 
-    wanted = {"on_task_instance_running", "on_task_instance_success", "on_task_instance_failed"}
-    observations = stack.wait_for(
-        lambda obs: wanted <= set(harness.events(obs)),
-        timeout=300,
-        what=f"task events {sorted(wanted)}",
-    )
+    def _wait_until_scheduler_alive(self, timeout: float = 300) -> None:
+        """
+        Wait for a scheduler heartbeat, the documented liveness check.
 
-    for obs in observations:
-        assert obs["tool"] == "airflow", obs
-        assert obs["tool_version"] == version, obs["tool_version"]
-        assert obs["client_version"], obs
-        assert "workspace" not in obs, obs
-    assert not stack.received()["rejected"], stack.received()["rejected"]
+        :param timeout: seconds to wait
+        :return: nothing
+        :raises AssertionError: if no scheduler ever heartbeats
+        """
+        self._poll(
+            ("airflow", "jobs", "check", "--job-type", "SchedulerJob"),
+            timeout,
+            "a scheduler heartbeat",
+        )
 
-    wire = harness.dump(observations)
-    assert "convalesce_example" in wire
+    def _wait_until_serialized(self, timeout: float = 240) -> None:
+        """
+        Wait until the scheduler's own parse has serialized the DAG.
 
-    # Airflow hands listeners the failure only from 2.10; before that the
-    # message is in the task log and nowhere a listener can reach.
-    major, minor = (int(x) for x in version.split(".")[:2])
-    failed = [o for o in observations if o["event"] == "on_task_instance_failed"]
-    if (major, minor) >= (2, 10):
-        assert any(o["payload"].get("error") for o in failed), "error was declared but arrived empty"
-        assert "load failed on purpose" in wire, "the failure message never reached the wire"
+        :param timeout: seconds to wait
+        :return: nothing
+        :raises AssertionError: if the DAG is never serialized
+        """
+        self._poll(
+            ("python", "-c", SERIALIZED_CHECK),
+            timeout,
+            f"{DAG_ID} in the serialized_dag table",
+        )
 
-    # The dag-run hooks fire in the scheduler, a different process from the
-    # task hooks; both must have found their way out.
-    observations = stack.wait_for(
-        lambda obs: "on_dag_run_failed" in harness.events(obs),
-        timeout=120,
-        what="on_dag_run_failed from the scheduler",
-    )
-    print("events:", harness.events(observations))
-    print("batches:", sorted({row["batch_size"] for row in stack.received()["observations"]}))
+    def _poll(
+        self, command: "tuple[str, ...]", timeout: float, what: str
+    ) -> None:
+        """
+        Run a command in the Airflow container until it exits zero.
+
+        :param command: what to run
+        :param timeout: seconds to keep trying
+        :param what: named in the failure
+        :return: nothing
+        :raises AssertionError: if the timeout passes first
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            result = self.stack.exec("airflow", *command, check=False)
+            if result.returncode == 0:
+                return
+            time.sleep(3)
+        raise AssertionError(
+            f"timed out after {timeout:.0f}s waiting for {what}"
+        )
+
+    def _assert_failure_forwarded(
+        self, observations: List[e2eharn.Observation]
+    ) -> None:
+        """
+        Check the failed task's error reached the wire.
+
+        :param observations: what the receiver recorded
+        :return: nothing
+        """
+        failed = [
+            obs
+            for obs in observations
+            if obs["event"] == "on_task_instance_failed"
+        ]
+        self.assertTrue(
+            any(obs["payload"].get("error") for obs in failed),
+            "error was declared but arrived empty",
+        )
+        self.assertIn("load failed on purpose", e2eharn.wire(observations))

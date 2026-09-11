@@ -14,9 +14,9 @@ services:
       CONVALESCE_ENDPOINT: http://receiver:8080
       CONVALESCE_INGEST_KEY: ${EMIT_E2E_KEY}
     volumes:
-      - ../../java/emit-core/build/libs:/opt/emit-core:ro
-      - ../../java/emit-spark/build/libs:/opt/emit-spark:ro
-      - ../../.github/scripts/probe_spark.py:/opt/probe.py:ro
+      - ../../../java/emit-core/build/libs:/opt/emit-core:ro
+      - ../../../java/emit-spark/build/libs:/opt/emit-spark:ro
+      - ../../../.github/scripts/probe_spark.py:/opt/probe.py:ro
     entrypoint: ["/bin/bash", "-c"]
     command:
       - >
