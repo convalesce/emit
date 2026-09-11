@@ -12,6 +12,14 @@ name: publish
 on:
   push:
     tags: ["v*"]
+  # A rehearsal: the same build, uploaded to TestPyPI, from any ref. Maven
+  # Central has no test index, so that job stays out of a rehearsal.
+  workflow_dispatch:
+    inputs:
+      rehearse:
+        description: "Upload to TestPyPI instead of PyPI"
+        type: boolean
+        default: true
 
 jobs:
   check-version:
@@ -23,6 +31,7 @@ jobs:
       - id: tag
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - name: Every declared version must equal the tag
+        if: github.event_name == 'push'
         run: |
           want="${GITHUB_REF_NAME#v}"
           bad=0
@@ -39,7 +48,7 @@ jobs:
   pypi:
     needs: check-version
     runs-on: ubuntu-latest
-    environment: pypi
+    environment: ${{ inputs.rehearse && 'testpypi' || 'pypi' }}
     permissions:
       id-token: write
     steps:
@@ -61,20 +70,40 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+          repository-url: ${{ inputs.rehearse && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
           verbose: true
 
   maven-central:
     needs: check-version
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: maven-central
     steps:
       - uses: actions/checkout@v4
+      # Central needs a verified namespace, a token and a signing key. Until
+      # those exist the Python packages can still ship; this job says so and
+      # stops rather than failing the release on a missing secret.
+      - name: Stop unless Central is configured
+        id: configured
+        env:
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          if [ -z "$CENTRAL_USERNAME" ] || [ -z "$SIGNING_KEY" ]; then
+            echo "::notice::Maven Central secrets are not set; skipping. See docs/releasing.md."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-java@v4
+        if: steps.configured.outputs.ready == 'true'
         with:
           distribution: temurin
           java-version: "17"
       - uses: gradle/actions/setup-gradle@v4
+        if: steps.configured.outputs.ready == 'true'
       - name: Build, check and publish the signed jars
+        if: steps.configured.outputs.ready == 'true'
         working-directory: java
         env:
           CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
@@ -85,6 +114,7 @@ jobs:
 
   github-release:
     needs: [pypi, maven-central]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write

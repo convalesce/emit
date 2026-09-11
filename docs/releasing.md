@@ -22,6 +22,18 @@ builds and uploads the five Python packages to PyPI, builds, signs and
 deploys the two jars to Maven Central's staging area, and creates the
 GitHub release with generated notes.
 
+## Rehearse first
+
+The workflow can be run by hand from the Actions tab with *Upload to
+TestPyPI* ticked. That builds and uploads the same five packages to
+https://test.pypi.org, from whatever ref is chosen, and touches nothing
+else. It needs the `testpypi` environment registered as a trusted publisher
+on TestPyPI the same way as below. Do this once before the first real tag,
+because the first upload to PyPI claims the names.
+
+Until Maven Central is configured, a tag still publishes to PyPI; the
+Central job notices the missing secrets and stops instead of failing.
+
 ## One-time setup
 
 ### PyPI
