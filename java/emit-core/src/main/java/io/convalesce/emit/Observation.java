@@ -8,13 +8,12 @@ import java.util.UUID;
 /**
  * One thing a job tells us, wrapped for transport.
  *
- * <p>The payload is the tool's own output and crosses untouched. Every other field exists so the
- * receiver knows what it is holding: which tool produced it, which callback fired, and when.
- * Nothing here parses or reshapes the payload, which is what lets us improve how it is understood
- * without a customer upgrading anything.
+ * <p>The payload is the tool's own output and crosses untouched. Every other field exists to say
+ * what it is: which tool produced it, which callback fired, and when. Who sent it is not among
+ * them; the ingest key carries that. Nothing here parses or reshapes the payload, which is what
+ * lets how it is understood improve without a customer upgrading anything.
  *
- * <p>The field names and their meanings match the Python client's envelope exactly, so one receiver
- * reads both.
+ * <p>The field names and their meanings match the Python client's envelope exactly.
  */
 public final class Observation {
 
@@ -25,7 +24,6 @@ public final class Observation {
   private final String event;
   private final String payloadJson;
   private final String toolVersion;
-  private final String workspace;
   private final String observationId;
   private final String emittedAt;
 
@@ -36,15 +34,12 @@ public final class Observation {
    * @param event which callback fired, such as {@code SparkListenerJobEnd}
    * @param payloadJson the tool's own output, already JSON, embedded verbatim
    * @param toolVersion the tool's version, where it could be read
-   * @param workspace which account this belongs to
    */
-  public Observation(
-      String tool, String event, String payloadJson, String toolVersion, String workspace) {
+  public Observation(String tool, String event, String payloadJson, String toolVersion) {
     this.tool = tool;
     this.event = event;
     this.payloadJson = payloadJson;
     this.toolVersion = toolVersion;
-    this.workspace = workspace;
     this.observationId = UUID.randomUUID().toString();
     this.emittedAt = nowUtc();
   }
@@ -63,7 +58,6 @@ public final class Observation {
     out.append(",\"tool_version\":").append(Json.quote(toolVersion));
     out.append(",\"event\":").append(Json.quote(event));
     out.append(",\"client_version\":").append(Json.quote(Version.VERSION));
-    out.append(",\"workspace\":").append(Json.quote(workspace));
     // Verbatim: this is the tool's own JSON, and re-encoding it would be the one thing this
     // package exists not to do.
     out.append(",\"payload\":").append(payloadJson == null ? "null" : payloadJson);

@@ -1,9 +1,8 @@
 // Java 8 bytecode on purpose.
 //
-// Collect's Spark agent pins Java 17, which rules out every Spark 3.x cluster still on Java 8 or
-// 11 -- and those are common. A dependency-free forwarder has no reason to impose a JVM floor, so
-// this targets the widest one and gives up records and `var` to do it. The dev-kb Java guide
-// assumes 17+; this is a deliberate exception, not an oversight.
+// Plenty of Spark 3.x clusters still run Java 8 or 11 -- EMR 6.x, Databricks 15.4 LTS and below,
+// older Glue. A dependency-free forwarder has no reason to impose a JVM floor on the job it is
+// watching, so this targets the widest one and gives up records and `var` to do it.
 subprojects {
   apply plugin: 'java-library'
   apply plugin: 'maven-publish'

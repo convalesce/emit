@@ -21,7 +21,7 @@ spark-submit \
 ```
 
 Configure it with the same environment variables the Python client uses:
-`CONVALESCE_INGEST_KEY`, `CONVALESCE_WORKSPACE`, `CONVALESCE_ENDPOINT`,
+`CONVALESCE_INGEST_KEY`, `CONVALESCE_ENDPOINT`,
 `CONVALESCE_DRY_RUN`, `CONVALESCE_ENABLED`, `CONVALESCE_BATCH_SIZE`,
 `CONVALESCE_MAX_RETRIES`, `CONVALESCE_TIMEOUT`.
 
@@ -32,17 +32,18 @@ Python client uses. Nothing here reads a field off an event.
 
 ## Why it is small
 
-Collect's Spark integration is 5,484 lines because it maps events into a metadata model. This
-forwards a string Spark already produced, so the mapping lives server side and improving it never
-asks a customer to upgrade a jar in their cluster.
+Spark already knows how to render its own events -- `JsonProtocol` is what writes the event log --
+so this forwards a string Spark produced rather than walking an object graph. A listener that
+mapped events into some other shape would have to be upgraded in your cluster every time that
+shape changed. This one does not.
 
 ## Constraints, and why
 
 - **No dependencies.** This jar loads into someone else's Spark driver; anything it brought could
   collide with what that cluster already runs. That is why the JSON is written by hand and the
   transport is `HttpURLConnection`.
-- **Java 8 bytecode.** Every Spark 3.x cluster can load it, including those still on Java 8 or 11.
-  Collect's agent pins Java 17, which rules those out.
+- **Java 8 bytecode.** Every Spark 3.x cluster can load it, including those still on Java 8 or 11:
+  EMR 6.x, Databricks 15.4 LTS and below, and older Glue.
 - **One jar for both Scala builds.** The only Spark API it touches takes and returns plain Java
   types, so there is no `_2.12` / `_2.13` split.
 - **Nothing escapes into the job.** Every callback wraps its body; a failure to emit is logged and

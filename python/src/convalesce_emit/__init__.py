@@ -3,7 +3,7 @@ Send a tool's own output to Convalesce, unchanged.
 
 This package connects and forwards. It does not parse, map or resolve
 anything: whatever the tool handed us goes across as-is, and every bit of
-interpretation happens server side. That is the point -- improving how a
+interpretation happens after it arrives. That is the point -- improving how a
 payload is understood never requires anyone to upgrade this package.
 
 The names below are re-exported for callers embedding the emitter directly.

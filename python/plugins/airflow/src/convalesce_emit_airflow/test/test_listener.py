@@ -114,9 +114,8 @@ class Test_listener_forwarding1(unittest.TestCase):
         """
         Test that a task instance crosses without being read for fields.
 
-        Upstream needs version-specific code because it reads named
-        attributes; forwarding the object whole means an Airflow rename
-        cannot break this.
+        Reading a named attribute would need a version branch per Airflow
+        rename; forwarding the object whole means a rename cannot break this.
         """
 
         class TaskInstance:

@@ -90,7 +90,6 @@ class Emitter:
             event=event,
             payload=payload,
             tool_version=tool_version,
-            workspace=self.config.workspace,
         )
         with self._lock:
             self._batch.append(observation)
@@ -166,13 +165,14 @@ class Emitter:
         :return: nothing
         :raises TransportError: on any HTTP or connection failure
         """
+        # The key is the only thing here that says who is calling. No
+        # header names an account: one that did would be an unauthenticated
+        # claim sitting next to the credential that actually proves it.
         headers: Dict[str, str] = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.config.ingest_key}",
             "User-Agent": f"convalesce-emit/{ceversio.__version__}",
         }
-        if self.config.workspace:
-            headers["X-Convalesce-Workspace"] = self.config.workspace
         # The endpoint is validated as http(s) in Config.validate.
         request = urllib.request.Request(  # nosec B310
             url, data=body, method="POST", headers=headers

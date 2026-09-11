@@ -13,7 +13,7 @@ of docs cover both.
 ## What they do
 
 Each one connects and sends. It does not parse, map, or resolve anything:
-whatever the tool handed the callback goes across as-is, and every bit of interpretation happens on our side. That is
+whatever the tool handed the callback goes across as-is, and every bit of interpretation happens after it arrives. That is
 the point. Improving how a payload is understood never requires anyone to
 upgrade a package inside their pipeline.
 
@@ -37,7 +37,6 @@ Set these on the worker; no code changes are needed.
 | Variable | Default | |
 | --- | --- | --- |
 | `CONVALESCE_INGEST_KEY` | none | required unless dry-running |
-| `CONVALESCE_WORKSPACE` | none | which account this is |
 | `CONVALESCE_ENDPOINT` | `https://api.convalesce.io` | |
 | `CONVALESCE_DRY_RUN` | `false` | build envelopes, log them, send nothing |
 | `CONVALESCE_ENABLED` | `true` | set `false` to switch off entirely |
@@ -53,12 +52,13 @@ Try it against a real pipeline before pointing it at an account:
 ```json
 { "envelope_version": 1, "observation_id": "…", "emitted_at": "…",
   "tool": "airflow", "event": "task_instance_failed", "tool_version": "2.9.1",
-  "client_version": "0.1.0", "workspace": "acme",
+  "client_version": "0.1.0",
   "payload": { "…the tool's own output, untouched…" } }
 ```
 
 Only the fields around `payload` are ours, and they exist so the receiver knows
-what it is holding.
+what it is holding. Nothing names an account: the ingest key carries that, so
+an observation cannot claim to be from an account it is not.
 
 ## Great Expectations and row values
 
@@ -82,8 +82,8 @@ One package per tool, no per-version build. Verified against real installs:
 | Spark | 3.3, 3.5, 4.0 |
 | Python | 3.9+ |
 
-Wider than collect's own plugins in every case: Airflow 2.5 to 3.0 in one release rather than
-three, Spark on Java 8 and 11 clusters, Great Expectations 0.x and 1.x behind one import.
+One release per tool covers its whole row: Airflow 2.5 to 3.0 in a single artifact, Spark on
+Java 8 and 11 clusters, Great Expectations 0.x and 1.x behind one import.
 
 Nothing here reads a field off a tool's object, so a renamed attribute is the
 receiver's problem rather than a reason to ship a second package. Where a

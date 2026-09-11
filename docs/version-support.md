@@ -5,27 +5,23 @@ executed, and the observation received over HTTP by a stand-in endpoint.
 
 ## What is supported
 
-| Tool | Versions verified | Collect's own plugin supports |
-| --- | --- | --- |
-| Airflow | 2.5.3, 2.6.3, 2.7.3, 2.8.4, 2.9.3, 2.10.5, 2.11.0, 3.0.3 | `>=3.0,<4.0` in its current release; older Airflow needs an older plugin release |
-| Dagster | 1.7.16, 1.9.13, 1.10.0, 1.13.21 | `>=1.10.0` |
-| Prefect | 2.20.26, 3.1.15, 3.8.5 | `>=3.0.0,<4.0.0` |
-| Great Expectations | 0.17.23, 0.18.22, 1.22.0 | `>=0.17.15,<1.0` and `>=1.0,<2.0`, as two separate extras |
-| Spark | 3.3.4, 3.5.3, 4.0.3 | 3.x and 4.x, but Java 8 and 11 runtimes explicitly unsupported |
-| Python | 3.9 (floor) through 3.12 | `>=3.10` |
+| Tool | Versions verified |
+| --- | --- |
+| Airflow | 2.5.3, 2.6.3, 2.7.3, 2.8.4, 2.9.3, 2.10.5, 2.11.0, 3.0.3 |
+| Dagster | 1.7.16, 1.9.13, 1.10.0, 1.13.21 |
+| Prefect | 2.20.26, 3.1.15, 3.8.5 |
+| Great Expectations | 0.17.23, 0.18.22, 1.22.0 |
+| Spark | 3.3.4, 3.5.3, 4.0.3 |
+| Python | 3.9 (floor) through 3.12 |
 
-Every range above is at least as wide as collect's, and several are wider:
+One release per tool covers every version in its row:
 
-- **Airflow in one release.** Collect's plugin currently declares `>=3.0,<4.0`, and its docs send
-  Airflow 2.5-2.6 users to plugin `<=1.1.0.4` and 2.7-2.10 users to `<=1.6.0`. This one covers 2.5
-  through 3.0 in a single artifact, because it generates its hooks from whatever hookspecs the
-  running Airflow declares instead of hard-coding them.
-- **Spark on Java 8 and 11.** Collect's agent pins Java 17 bytecode, which rules out EMR 6.x,
-  Databricks 15.4 LTS and below, and older Glue. This targets Java 8, so those clusters work.
-- **Great Expectations from one import.** Collect ships `action` for 0.x and `action_v1` for 1.x
-  and asks the customer to pick. Here `action.py` reads the installed version and re-exports the
-  right one, so a checkpoint lists the same path either way.
-- **Python 3.9.** Collect's plugins require 3.10.
+- **Airflow 2.5 through 3.0 in one artifact**, because the plugin generates its hooks from
+  whatever hookspecs the running Airflow declares rather than hard-coding them.
+- **Spark on Java 8 and 11 clusters**, which is what a Java 8 target buys: EMR 6.x, Databricks
+  15.4 LTS and below, and older Glue all load it.
+- **Great Expectations 0.x and 1.x behind one import.** `action.py` reads the installed version
+  and re-exports the class that major needs, so a checkpoint lists the same path either way.
 
 Two versions could not be exercised, both for reasons inside the tool:
 
@@ -98,8 +94,9 @@ The same jar also loads on Java 21 (Spark 4.0.3), which is what Java 8 bytecode 
 
 ## Why the payload is not read
 
-None of these plugins read a field off a tool object. Upstream's Airflow
-plugin needs a `_airflow_version_specific` module because it reads named
-attributes off a `TaskInstance`, and Airflow renames them between releases.
-Forwarding the object whole means a rename is the receiver's problem, and the
-receiver ships on our schedule.
+None of these plugins read a field off a tool object, and that is what keeps
+one release working across so many versions. A plugin that reaches for
+`task_instance.execution_date` breaks when Airflow renames it. Forwarding the
+object whole means a rename changes what arrives, not whether anything
+arrives, so a customer never has to upgrade a package inside their pipeline to
+keep up with their own tooling.

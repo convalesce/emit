@@ -1,9 +1,9 @@
 """
 Airflow listener that forwards each callback's payload.
 
-Upstream's plugin needs a `_airflow_version_specific` module because it reads
-named attributes off a TaskInstance, and Airflow renames them between
-releases. This one forwards the object whole, so a rename cannot break it.
+Nothing here reads a named attribute off a TaskInstance. Airflow renames those
+between releases, so a listener that reached for one would need a version
+branch per rename; forwarding the object whole means a rename cannot break it.
 
 The listener API itself is another matter, and three things about it were
 found only by registering with a real Airflow rather than by reading:

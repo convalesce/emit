@@ -55,11 +55,12 @@ class Observation:
     """
     One thing a pipeline tells us, wrapped for transport.
 
+    Who sent it is not among these fields; the ingest key carries that.
+
     :param tool: which tool produced this, such as "airflow"
     :param event: which callback fired, such as "task_instance_failed"
     :param payload: the tool's own output, untouched
     :param tool_version: the tool's version, where it could be read
-    :param workspace: which account this belongs to
     :param envelope_version: shape of this wrapper, not of the payload
     :param client_version: which release of this package sent it
     :param observation_id: unique per observation
@@ -70,7 +71,6 @@ class Observation:
     event: str
     payload: Any
     tool_version: Optional[str] = None
-    workspace: Optional[str] = None
     envelope_version: int = ENVELOPE_VERSION
     client_version: str = ceversio.__version__
     observation_id: str = dataclasses.field(default_factory=_new_id)
@@ -91,7 +91,6 @@ def build(
     event: str,
     payload: Any,
     tool_version: Optional[str] = None,
-    workspace: Optional[str] = None,
 ) -> Observation:
     """
     Wrap a tool's payload for transport.
@@ -100,7 +99,6 @@ def build(
     :param event: which callback fired
     :param payload: the tool's own output, untouched
     :param tool_version: the tool's version, where it could be read
-    :param workspace: which account this belongs to
     :return: the observation to send
     """
     return Observation(
@@ -108,5 +106,4 @@ def build(
         event=event,
         payload=payload,
         tool_version=tool_version,
-        workspace=workspace,
     )

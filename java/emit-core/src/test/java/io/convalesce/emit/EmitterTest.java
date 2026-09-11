@@ -60,7 +60,7 @@ public class EmitterTest {
   }
 
   private Emitter emitter(int batchSize, int maxRetries) {
-    return new Emitter(Config.of(url, "secret-key", "acme", batchSize, maxRetries));
+    return new Emitter(Config.of(url, "secret-key", batchSize, maxRetries));
   }
 
   @Test
@@ -71,7 +71,6 @@ public class EmitterTest {
     assertEquals(1, bodies.size());
     assertTrue(bodies.get(0).contains(payload));
     assertTrue(bodies.get(0).contains("\"tool\":\"spark\""));
-    assertTrue(bodies.get(0).contains("\"workspace\":\"acme\""));
   }
 
   @Test
@@ -109,7 +108,7 @@ public class EmitterTest {
 
   @Test
   public void unreachableEndpointNeverReachesTheCaller() {
-    Emitter emitter = new Emitter(Config.of("http://127.0.0.1:1", "k", "w", 1, 0));
+    Emitter emitter = new Emitter(Config.of("http://127.0.0.1:1", "k", 1, 0));
     emitter.emit("spark", "e", "{}", null);
   }
 
@@ -131,14 +130,14 @@ public class EmitterTest {
 
   @Test
   public void missingKeyIsReportedNotThrown() {
-    assertNotNull(Config.of(url, null, "w", 1, 0).validate());
-    new Emitter(Config.of(url, null, "w", 1, 0)).emit("spark", "e", "{}", null);
+    assertNotNull(Config.of(url, null, 1, 0).validate());
+    new Emitter(Config.of(url, null, 1, 0)).emit("spark", "e", "{}", null);
     assertEquals(0, bodies.size());
   }
 
   @Test
   public void usableConfigValidatesClean() {
-    assertNull(Config.of(url, "k", "w", 1, 0).validate());
+    assertNull(Config.of(url, "k", 1, 0).validate());
   }
 
   private static String read(InputStream in) throws java.io.IOException {

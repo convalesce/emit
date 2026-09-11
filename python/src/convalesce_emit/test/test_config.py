@@ -88,7 +88,7 @@ class Test_config_from_env1(unittest.TestCase):
         """
         Test that an explicit override beats the environment.
         """
-        env = {"CONVALESCE_WORKSPACE": "from-env"}
+        env = {"CONVALESCE_ENDPOINT": "https://from-env.example"}
         with unittest.mock.patch.dict(os.environ, env, clear=True):
-            config = ceconfig.Config.from_env(workspace="explicit")
-        self.assertEqual(config.workspace, "explicit")
+            config = ceconfig.Config.from_env(endpoint="https://explicit.example")
+        self.assertEqual(config.endpoint, "https://explicit.example")

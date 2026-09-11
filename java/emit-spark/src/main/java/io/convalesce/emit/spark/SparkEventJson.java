@@ -8,8 +8,8 @@ import java.util.logging.Logger;
  *
  * <p>This is what makes the plugin thin. Spark already knows how to render its events, and {@code
  * JsonProtocol} is what writes the event log, so nothing here walks an object graph or reads a
- * field. Collect's Spark integration is 5,484 lines because it maps events into a metadata model;
- * this forwards a string Spark produced.
+ * field. A listener that mapped events into some other shape would be far larger and would have to
+ * be upgraded in the cluster whenever that shape changed.
  *
  * <p>The method to call moved between releases, so it is resolved once by reflection:
  *

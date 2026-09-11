@@ -74,8 +74,7 @@ public final class Emitter {
     if (!usable || !config.enabled()) {
       return;
     }
-    Observation observation =
-        new Observation(tool, event, payloadJson, toolVersion, config.workspace());
+    Observation observation = new Observation(tool, event, payloadJson, toolVersion);
     boolean ready;
     synchronized (lock) {
       batch.add(observation);
@@ -152,12 +151,11 @@ public final class Emitter {
       connection.setDoOutput(true);
       connection.setConnectTimeout(config.timeoutMs());
       connection.setReadTimeout(config.timeoutMs());
+      // The key is the only thing here that says who is calling. No header
+      // names an account.
       connection.setRequestProperty("Content-Type", "application/json");
       connection.setRequestProperty("Authorization", "Bearer " + config.ingestKey());
       connection.setRequestProperty("User-Agent", "convalesce-emit-java/" + Version.VERSION);
-      if (config.workspace() != null && !config.workspace().isEmpty()) {
-        connection.setRequestProperty("X-Convalesce-Workspace", config.workspace());
-      }
       OutputStream out = connection.getOutputStream();
       try {
         out.write(body);

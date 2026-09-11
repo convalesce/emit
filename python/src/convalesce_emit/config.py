@@ -5,6 +5,11 @@ Read from the environment by default so a pipeline picks it up without
 editing code: an operator sets the variables once on the worker, and every
 DAG, flow or suite in that process emits without knowing this exists.
 
+There is no account or tenant setting, deliberately. The ingest key is what
+identifies the caller, and it is the only thing that does. A separate setting
+naming the account would be an unauthenticated claim sitting next to the
+credential that actually proves it, and the two could disagree.
+
 The ingest key is held as a plain string rather than a `pydantic.SecretStr`,
 which is the house rule elsewhere. This package has no dependencies on
 purpose -- it installs into a customer's Airflow and must not disturb a
@@ -48,7 +53,6 @@ class Config:
 
     :param endpoint: base URL to post observations to
     :param ingest_key: write-only key a pipeline presents; never logged
-    :param workspace: which account these observations belong to
     :param timeout: seconds to wait on a single request
     :param max_retries: attempts after the first, for transient failures
     :param batch_size: observations to hold before sending
@@ -58,7 +62,6 @@ class Config:
 
     endpoint: str = DEFAULT_ENDPOINT
     ingest_key: Optional[str] = None
-    workspace: Optional[str] = None
     timeout: float = DEFAULT_TIMEOUT
     max_retries: int = DEFAULT_MAX_RETRIES
     batch_size: int = DEFAULT_BATCH_SIZE
@@ -77,7 +80,6 @@ class Config:
         config = cls(
             endpoint=_read_str("CONVALESCE_ENDPOINT") or DEFAULT_ENDPOINT,
             ingest_key=_read_str("CONVALESCE_INGEST_KEY"),
-            workspace=_read_str("CONVALESCE_WORKSPACE"),
             timeout=_read_num("CONVALESCE_TIMEOUT", DEFAULT_TIMEOUT),
             max_retries=int(
                 _read_num("CONVALESCE_MAX_RETRIES", DEFAULT_MAX_RETRIES)

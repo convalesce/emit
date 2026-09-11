@@ -46,12 +46,10 @@ class Test_envelope1(unittest.TestCase):
             event="validation",
             payload={},
             tool_version="1.2",
-            workspace="acme",
         )
         self.assertEqual(observation.tool, "gx")
         self.assertEqual(observation.event, "validation")
         self.assertEqual(observation.tool_version, "1.2")
-        self.assertEqual(observation.workspace, "acme")
         self.assertEqual(observation.envelope_version, ceenvelo.ENVELOPE_VERSION)
 
     def test3(self) -> None:

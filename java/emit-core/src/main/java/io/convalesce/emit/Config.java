@@ -7,6 +7,11 @@ package io.convalesce.emit;
  * sets the variables once on the cluster, and every job in it emits without knowing this exists.
  * The variable names match the Python client's exactly, so one set of docs covers both.
  *
+ * <p>There is no account or tenant setting, deliberately. The ingest key is what identifies the
+ * caller, and it is the only thing that does. A separate setting naming the account would be an
+ * unauthenticated claim sitting next to the credential that actually proves it, and the two could
+ * disagree.
+ *
  * <p>The ingest key is held as a plain string. It is never logged and never placed in the envelope;
  * it appears only in the Authorization header.
  */
@@ -23,7 +28,6 @@ public final class Config {
 
   private final String endpoint;
   private final String ingestKey;
-  private final String workspace;
   private final int timeoutMs;
   private final int maxRetries;
   private final int batchSize;
@@ -33,7 +37,6 @@ public final class Config {
   private Config(
       String endpoint,
       String ingestKey,
-      String workspace,
       int timeoutMs,
       int maxRetries,
       int batchSize,
@@ -41,7 +44,6 @@ public final class Config {
       boolean enabled) {
     this.endpoint = endpoint;
     this.ingestKey = ingestKey;
-    this.workspace = workspace;
     this.timeoutMs = timeoutMs;
     this.maxRetries = maxRetries;
     this.batchSize = batchSize;
@@ -58,7 +60,6 @@ public final class Config {
     return new Config(
         orDefault(readString("CONVALESCE_ENDPOINT"), DEFAULT_ENDPOINT),
         readString("CONVALESCE_INGEST_KEY"),
-        readString("CONVALESCE_WORKSPACE"),
         readInt("CONVALESCE_TIMEOUT", DEFAULT_TIMEOUT_MS / 1000) * 1000,
         readInt("CONVALESCE_MAX_RETRIES", DEFAULT_MAX_RETRIES),
         readInt("CONVALESCE_BATCH_SIZE", DEFAULT_BATCH_SIZE),
@@ -71,15 +72,12 @@ public final class Config {
    *
    * @param endpoint base URL to post observations to
    * @param ingestKey write-only key a job presents; never logged
-   * @param workspace which account these observations belong to
    * @param batchSize observations to hold before sending
    * @param maxRetries attempts after the first, for transient failures
    * @return the configuration
    */
-  public static Config of(
-      String endpoint, String ingestKey, String workspace, int batchSize, int maxRetries) {
-    return new Config(
-        endpoint, ingestKey, workspace, DEFAULT_TIMEOUT_MS, maxRetries, batchSize, false, true);
+  public static Config of(String endpoint, String ingestKey, int batchSize, int maxRetries) {
+    return new Config(endpoint, ingestKey, DEFAULT_TIMEOUT_MS, maxRetries, batchSize, false, true);
   }
 
   /**
@@ -108,10 +106,6 @@ public final class Config {
 
   public String ingestKey() {
     return ingestKey;
-  }
-
-  public String workspace() {
-    return workspace;
   }
 
   public int timeoutMs() {

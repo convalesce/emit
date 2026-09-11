@@ -86,7 +86,6 @@ class _ServerCase(unittest.TestCase):
         config = ceconfig.Config(
             endpoint=self._url,
             ingest_key="secret-key",
-            workspace="acme",
             **kwargs,
         )
         return ceclient.Emitter(config)
@@ -131,7 +130,6 @@ class Test_emitter_wire1(_ServerCase):
         observation = self._sent()[0]
         self.assertEqual(observation["payload"], payload)
         self.assertEqual(observation["tool"], "airflow")
-        self.assertEqual(observation["workspace"], "acme")
 
     def test2(self) -> None:
         """
@@ -141,7 +139,9 @@ class Test_emitter_wire1(_ServerCase):
             emitter.emit(tool="airflow", event="e", payload={})
         headers = _Recorder.headers_seen[0]
         self.assertEqual(headers["Authorization"], "Bearer secret-key")
-        self.assertEqual(headers["X-Convalesce-Workspace"], "acme")
+        # No header may name an account: one that did would be an
+        # unauthenticated claim beside the credential that proves it.
+        self.assertNotIn("X-Convalesce-Workspace", headers)
         self.assertTrue(headers["User-Agent"].startswith("convalesce-emit/"))
         self.assertNotIn("secret-key", json.dumps(_Recorder.received))
 
