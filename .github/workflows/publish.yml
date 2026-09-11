@@ -126,6 +126,22 @@ jobs:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
           SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
         run: ./gradlew build publish
+      # The staging API holds an upload in a repository the portal cannot
+      # see until it is handed over. This moves it to the portal's
+      # Deployments page as a user-managed deployment: validated there,
+      # released by a click. `automatic` instead would release on its own.
+      - name: Hand the staged repository to the portal
+        if: steps.configured.outputs.ready == 'true'
+        env:
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+        run: |
+          token=$(printf '%s:%s' "$CENTRAL_USERNAME" "$CENTRAL_PASSWORD" | base64 -w0)
+          code=$(curl -s -o /tmp/upload.out -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $token" \
+            "https://ossrh-staging-api.central.sonatype.com/manual/upload/defaultRepository/io.convalesce?publishing_type=user_managed")
+          echo "portal answered HTTP $code"; cat /tmp/upload.out; echo
+          test "$code" = 200
 
   github-release:
     needs: [pypi, maven-central]
