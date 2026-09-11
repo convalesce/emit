@@ -1,14 +1,15 @@
 [project]
 name = "convalesce-emit-airflow"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Forward Airflow run and lineage events to Convalesce."
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "Convalesce" }]
 # The host tool is deliberately not a dependency: this installs into an
 # existing one, and pinning it would fight that environment's resolution.
 requires-python = ">=3.9"
-dependencies = ["convalesce-emit~=0.1"]
+dependencies = ["convalesce-emit>=0.1,<1"]
 
 [project.entry-points."airflow.plugins"]
 convalesce_emit = "convalesce_emit_airflow.plugin:ConvalescePlugin"
@@ -16,6 +17,14 @@ convalesce_emit = "convalesce_emit_airflow.plugin:ConvalescePlugin"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/convalesce_emit_airflow/_version.py"
+
+[tool.hatch.build.targets.sdist]
+# Only this package. Without it hatch ships everything under the
+# project directory, which for the core is every plugin and its tests.
+only-include = ["src/convalesce_emit_airflow"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/convalesce_emit_airflow"]

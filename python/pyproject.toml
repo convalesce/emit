@@ -1,9 +1,10 @@
 [project]
 name = "convalesce-emit"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Forward a data tool's own output to Convalesce, unchanged."
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "Convalesce" }]
 keywords = ["data observability", "lineage", "airflow", "dagster", "prefect"]
 classifiers = [
@@ -45,6 +46,14 @@ Source = "https://github.com/convalesce/emit"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/convalesce_emit/_version.py"
+
+[tool.hatch.build.targets.sdist]
+# Only this package. Without it hatch ships everything under the
+# project directory, which for the core is every plugin and its tests.
+only-include = ["src/convalesce_emit"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/convalesce_emit"]

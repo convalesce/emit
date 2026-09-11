@@ -1,0 +1,42 @@
+services:
+  receiver:
+    extends:
+      file: ../receiver/compose.yml
+      service: receiver
+
+  # amd64 on purpose: the arm64 build of the Prefect image dies with an illegal
+  # instruction on Apple silicon. CI runners are amd64, so there it is native.
+  server:
+    image: ${EMIT_E2E_PREFECT_IMAGE:?set EMIT_E2E_PREFECT_IMAGE}
+    platform: linux/amd64
+    command: ["prefect", "server", "start", "--host", "0.0.0.0", "--port", "4200"]
+    environment:
+      PREFECT_SERVER_ANALYTICS_ENABLED: "false"
+      PREFECT_API_URL: http://127.0.0.1:4200/api
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4200/api/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  # Runs the example flows against the server above. Started with `run`, so
+  # it exits when the flows do.
+  flows:
+    platform: linux/amd64
+    build:
+      context: ../../..
+      dockerfile: e2e/stacks/prefect/Dockerfile
+      args:
+        PREFECT_IMAGE: ${EMIT_E2E_PREFECT_IMAGE}
+    command: ["python", "/opt/flows/flows.py"]
+    environment:
+      PREFECT_API_URL: http://server:4200/api
+      CONVALESCE_ENDPOINT: http://receiver:8080
+      CONVALESCE_INGEST_KEY: ${EMIT_E2E_KEY}
+    volumes:
+      - ./flows.py:/opt/flows/flows.py:ro
+    depends_on:
+      receiver:
+        condition: service_healthy
+      server:
+        condition: service_healthy

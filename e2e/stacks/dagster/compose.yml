@@ -1,0 +1,30 @@
+services:
+  receiver:
+    extends:
+      file: ../receiver/compose.yml
+      service: receiver
+
+  dagster:
+    build:
+      context: ../../..
+      dockerfile: e2e/stacks/dagster/Dockerfile
+      args:
+        DAGSTER_VERSION: ${EMIT_E2E_DAGSTER:?set EMIT_E2E_DAGSTER}
+        PYTHON_IMAGE: ${EMIT_E2E_PYTHON_IMAGE:-python:3.11-slim}
+    # Web server, daemon and the code location in one process. The daemon is
+    # what ticks the run-status sensors, which is where the plugin fires.
+    command: ["dagster", "dev", "-w", "/opt/dagster/workspace.yaml", "-h", "0.0.0.0", "-p", "3000"]
+    working_dir: /opt/dagster
+    environment:
+      DAGSTER_HOME: /opt/dagster/home
+      CONVALESCE_ENDPOINT: http://receiver:8080
+      CONVALESCE_INGEST_KEY: ${EMIT_E2E_KEY}
+    ports:
+      - "${EMIT_E2E_DAGSTER_PORT:-13000}:3000"
+    volumes:
+      - ./workspace.yaml:/opt/dagster/workspace.yaml:ro
+      - ./definitions.py:/opt/dagster/definitions.py:ro
+      - ./dagster.yaml:/opt/dagster/home/dagster.yaml:ro
+    depends_on:
+      receiver:
+        condition: service_healthy

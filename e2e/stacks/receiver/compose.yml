@@ -1,0 +1,18 @@
+# The stand-in ingest endpoint every stack posts to. Included by each tool's
+# compose file through `extends`.
+services:
+  receiver:
+    image: python:3.12-alpine
+    command: ["python", "/receiver/receiver.py"]
+    environment:
+      RECEIVER_KEY: ${EMIT_E2E_KEY:?set EMIT_E2E_KEY}
+    volumes:
+      # Relative to the tool compose file that extends this one, not to this file.
+      - ../receiver/receiver.py:/receiver/receiver.py:ro
+    ports:
+      - "${EMIT_E2E_PORT:-18080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 15

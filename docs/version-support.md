@@ -92,6 +92,29 @@ hand-rolled fake would have proven nothing.
 
 The same jar also loads on Java 21 (Spark 4.0.3), which is what Java 8 bytecode buys.
 
+## What ran for real
+
+`e2e/` starts each tool in Docker at the versions in `.github/workflows/e2e.yml`,
+with the plugin installed the way a customer installs it, runs an example
+workflow with one step that fails, and reads what reached a stand-in endpoint
+over HTTP with the key. The first run found two things the in-process probes
+had not:
+
+- **The Airflow listener never sent anything at the default batch size.** Task
+  hooks fire in a process Airflow forks per task and exits without telling
+  the listener; with a batch of fifty, every task ended with its events still
+  queued. The listener now flushes after each event.
+- **The Dagster sensor forwarded the context wrapper**, whose state is private
+  and whose run and event are properties, so it arrived as a bare object
+  repr: no job name, no run id, no failure. The sensor now forwards
+  `dagster_run`, `dagster_event` and `sensor_name`. The probe had passed a
+  `DagsterRun` by hand, which is why it never saw this.
+
+Also confirmed there: Airflow 3.0 fires the task hooks from its task SDK
+subprocess with the plugin discovered through the entry point; the failure
+message reaches the wire from Airflow 2.10 and not before; a Spark driver
+flushes what it batched before exiting.
+
 ## Why the payload is not read
 
 None of these plugins read a field off a tool object, and that is what keeps

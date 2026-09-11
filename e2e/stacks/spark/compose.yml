@@ -1,0 +1,31 @@
+services:
+  receiver:
+    extends:
+      file: ../receiver/compose.yml
+      service: receiver
+
+  # The official image, our two jars mounted in, the listener named in the
+  # job's config. Started with `run`, so it exits when the job does.
+  spark:
+    image: apache/spark:${EMIT_E2E_SPARK:?set EMIT_E2E_SPARK}
+    user: root
+    environment:
+      HOME: /tmp
+      CONVALESCE_ENDPOINT: http://receiver:8080
+      CONVALESCE_INGEST_KEY: ${EMIT_E2E_KEY}
+    volumes:
+      - ../../../java/emit-core/build/libs:/opt/emit-core:ro
+      - ../../../java/emit-spark/build/libs:/opt/emit-spark:ro
+      - ../../../.github/scripts/probe_spark.py:/opt/probe.py:ro
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >
+        core=$$(ls /opt/emit-core/*.jar | grep -v -e sources -e javadoc | head -1) &&
+        spark=$$(ls /opt/emit-spark/*.jar | grep -v -e sources -e javadoc | head -1) &&
+        /opt/spark/bin/spark-submit --master "local[1]"
+        --jars "$$core,$$spark"
+        --conf spark.extraListeners=io.convalesce.emit.spark.ConvalesceSparkListener
+        /opt/probe.py
+    depends_on:
+      receiver:
+        condition: service_healthy
