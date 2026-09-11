@@ -1,0 +1,10 @@
+.git
+**/.venv
+**/venv
+**/build
+**/.gradle
+**/__pycache__
+**/.mypy_cache
+**/.pytest_cache
+**/*.egg-info
+e2e/dist

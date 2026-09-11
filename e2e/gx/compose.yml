@@ -1,0 +1,23 @@
+services:
+  receiver:
+    extends:
+      file: ../receiver/compose.yml
+      service: receiver
+
+  checkpoint:
+    build:
+      context: ../..
+      dockerfile: e2e/gx/Dockerfile
+      args:
+        GX_VERSION: ${EMIT_E2E_GX:?set EMIT_E2E_GX}
+        PYTHON_IMAGE: ${EMIT_E2E_PYTHON_IMAGE:-python:3.11-slim}
+    command: ["python", "/opt/gx/checkpoint.py"]
+    environment:
+      CONVALESCE_ENDPOINT: http://receiver:8080
+      CONVALESCE_INGEST_KEY: ${EMIT_E2E_KEY}
+      GX_ANALYTICS_ENABLED: "false"
+    volumes:
+      - ./checkpoint.py:/opt/gx/checkpoint.py:ro
+    depends_on:
+      receiver:
+        condition: service_healthy

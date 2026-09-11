@@ -1,0 +1,79 @@
+# The stacks. Everything in ci.yml calls a plugin's callback by hand inside
+# one Python process. This starts each tool for real, in its own container,
+# with the plugin installed the way a customer installs it, runs an example
+# workflow, and reads what reached a stand-in endpoint over HTTP.
+#
+# Two defects the in-process probes could not see were found on the first run
+# of these: the Airflow listener never flushed a partial batch, so a task
+# process exited with its events still queued; and the Dagster sensor
+# forwarded the context wrapper, which serialises to nothing but its repr.
+name: e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The same boundaries ci.yml probes, each now driven by the tool's
+          # own scheduler, daemon, server or runtime.
+          - { tool: airflow, version: "2.5.3" }
+          - { tool: airflow, version: "2.9.3" }
+          - { tool: airflow, version: "2.10.5" }
+          - { tool: airflow, version: "3.0.3" }
+          - { tool: dagster, version: "1.7.16" }
+          - { tool: dagster, version: "1.13.21" }
+          - { tool: prefect, version: "2.20.26" }
+          - { tool: prefect, version: "3.8.5" }
+          - { tool: gx, version: "0.18.22" }
+          - { tool: gx, version: "1.22.0" }
+    name: ${{ matrix.tool }} ${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest pytest-timeout
+      - name: Name the version for the stack
+        run: echo "EMIT_E2E_$(echo '${{ matrix.tool }}' | tr a-z A-Z)=${{ matrix.version }}" >> "$GITHUB_ENV"
+      - name: Run the example workflow and read what arrived
+        working-directory: e2e
+        run: python -m pytest test_${{ matrix.tool }}.py
+
+  spark:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        spark: ["3.4.4", "3.5.3", "4.0.3"]
+    name: spark ${{ matrix.spark }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build the jars
+        working-directory: java
+        run: ./gradlew build -x test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest pytest-timeout
+      - name: Run a job with the listener attached, sending for real
+        working-directory: e2e
+        env:
+          EMIT_E2E_SPARK: ${{ matrix.spark }}
+        run: python -m pytest test_spark.py

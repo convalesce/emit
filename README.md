@@ -85,6 +85,9 @@ One package per tool, no per-version build. Verified against real installs:
 One release per tool covers its whole row: Airflow 2.5 to 3.0 in a single artifact, Spark on
 Java 8 and 11 clusters, Great Expectations 0.x and 1.x behind one import.
 
+Each of those versions also runs for real in Docker, on its own scheduler, daemon or server,
+with an example workflow and a stand-in endpoint: see [`e2e/`](e2e).
+
 Nothing here reads a field off a tool's object, so a renamed attribute is the
 receiver's problem rather than a reason to ship a second package. Where a
 tool's own plugin API changed incompatibly -- Great Expectations between 0.x

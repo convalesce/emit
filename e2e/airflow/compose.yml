@@ -1,0 +1,33 @@
+services:
+  receiver:
+    extends:
+      file: ../receiver/compose.yml
+      service: receiver
+
+  airflow:
+    build:
+      context: ../..
+      dockerfile: e2e/airflow/Dockerfile
+      args:
+        AIRFLOW_IMAGE: ${EMIT_E2E_AIRFLOW_IMAGE:?set EMIT_E2E_AIRFLOW_IMAGE}
+    # Scheduler, web server and triggerer in one process, on SQLite: the
+    # smallest thing that is still a real Airflow running real task processes.
+    command: ["standalone"]
+    environment:
+      CONVALESCE_ENDPOINT: http://receiver:8080
+      CONVALESCE_INGEST_KEY: ${EMIT_E2E_KEY}
+      CONVALESCE_BATCH_SIZE: ${EMIT_E2E_BATCH_SIZE:-50}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "3"
+      AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "3"
+      AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "3"
+      AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+      # Airflow 3 refuses to boot without these and 2.x ignores them.
+      AIRFLOW__API_AUTH__JWT_SECRET: e2e-not-a-secret
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://localhost:8080/execution/
+    volumes:
+      - ./dags:/opt/airflow/dags:ro
+    depends_on:
+      receiver:
+        condition: service_healthy
