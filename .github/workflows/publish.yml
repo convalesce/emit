@@ -30,6 +30,17 @@ jobs:
       - uses: actions/checkout@v4
       - id: tag
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      # Releases come from `release`, never from `main`: a tag that is not on
+      # that branch, or a manual run from any other branch, stops here.
+      - name: The tag must be on the release branch
+        run: |
+          git fetch --no-tags --depth=200 origin release
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/release; then
+            echo "$GITHUB_SHA is on release"
+          else
+            echo "::error::$GITHUB_REF_NAME is not on the release branch; release from release, not main"
+            exit 1
+          fi
       - name: Every declared version must equal the tag
         if: github.event_name == 'push'
         run: |

@@ -3,18 +3,31 @@
 One tag publishes everything. The versions in the tree must already agree
 with it, or the workflow stops before uploading anything.
 
+## Branches
+
+`main` is where work lands, by pull request only. `release` is what gets
+published: it only ever receives merges from `main`, and every tag points
+at a commit on it. Three things enforce this, so a slip cannot publish:
+
+- the workflow stops if the tagged commit is not on `release`;
+- the `pypi*` and `maven-central` environments only deploy from `release`
+  and `v*` tags, so a run from any other branch gets no credentials;
+- rulesets block direct pushes, force pushes and deletion on both
+  branches, and only administrators can create or move a `v*` tag.
+
 ## Cut a release
 
-1. Set the version in all six places, identically:
+1. On `main`, set the version in all six places, identically:
    `python/src/convalesce_emit/_version.py`, the four
    `python/plugins/*/src/*/_version.py`, and `version` in
    `java/build.gradle`. Each `pyproject.toml` reads its `_version.py`, so
-   there is nothing else to edit.
-2. Merge to `main` with `ci` and `e2e` green.
-3. Tag and push:
+   there is nothing else to edit. Merge it with `ci` and `e2e` green.
+2. Open a pull request from `main` into `release` and merge it. Both
+   workflows run on `release` too.
+3. Tag the release branch and push the tag:
 
    ```sh
-   git tag v0.1.0 && git push origin v0.1.0
+   git fetch origin && git tag v0.1.0 origin/release && git push origin v0.1.0
    ```
 
 The `publish` workflow then checks the tag against every declared version,
@@ -68,6 +81,6 @@ Trusted publishing, so no API token exists to leak or rotate.
 
 ## What the workflow does not do
 
-It does not bump versions, and it does not publish from a branch. Both are
+It does not bump versions, and it does not publish from `main`. Both are
 deliberate: a release is a decision recorded in the tree, and the tag is
 the record.

@@ -64,6 +64,12 @@ is a good model. In short:
   `test2`, each with a docstring beginning `Test that`.
 - 81 columns. Black and isort enforce the rest.
 
+## Branches
+
+`main` takes pull requests only; nothing is pushed to it directly. Releases
+are cut from `release`, which only ever receives merges from `main`, and
+every published tag points at a commit on it. See `docs/releasing.md`.
+
 ## Commits and pull requests
 
 - One line per commit message: a subject, no body, no trailers. Write it as
