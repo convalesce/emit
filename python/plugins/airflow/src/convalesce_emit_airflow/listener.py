@@ -143,6 +143,12 @@ class _Base:
                 payload={k: cemit.dump(v) for k, v in payload.items()},
                 tool_version=self._version,
             )
+            # Sent now, not batched. Task hooks fire in a process Airflow
+            # forks per task and exits without telling the listener, so
+            # anything still queued when the task ends is lost. Found by
+            # running a real scheduler: with the default batch of fifty,
+            # nothing ever left the worker.
+            emitter.flush()
         except Exception as exc:  # pylint: disable=broad-exception-caught
             # A task must not fail because we could not report on it.
             _LOG.warning("convalesce: could not emit %s: %s", event, exc)

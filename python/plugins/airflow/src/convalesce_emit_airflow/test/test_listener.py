@@ -28,13 +28,15 @@ class _Recorder:
 
     def __init__(self) -> None:
         self.sent: List[Dict[str, Any]] = []
+        self.flushes = 0
 
     def emit(self, **kwargs: Any) -> None:
         """Record one observation."""
         self.sent.append(kwargs)
 
     def flush(self) -> None:
-        """Nothing is queued, so nothing to send."""
+        """Count the flush; nothing is queued, so nothing to send."""
+        self.flushes += 1
 
 
 # #############################################################################
@@ -109,6 +111,9 @@ class Test_listener_forwarding1(unittest.TestCase):
         payload = recorder.sent[0]["payload"]
         self.assertEqual(payload["error"], "boom: credentials expired")
         self.assertEqual(payload["previous_state"], "running")
+        # The task process exits right after the hook, without closing the
+        # listener; if the event is still queued at that point it is gone.
+        self.assertEqual(recorder.flushes, 1)
 
     def test2(self) -> None:
         """
