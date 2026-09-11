@@ -76,15 +76,21 @@ jobs:
           python -m build --outdir ../dist "${{ matrix.dir }}"
           twine check ../dist/*
           ls -l ../dist
+      # skip-existing makes a rerun of the whole workflow safe: a file PyPI
+      # already holds is skipped, not rejected, so the Maven job can be run
+      # again on its own after its secrets arrive.
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
           repository-url: ${{ inputs.rehearse && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+          skip-existing: true
           verbose: true
 
   maven-central:
     needs: check-version
-    if: github.event_name == 'push'
+    # On a tag, and on a manual run that is not a rehearsal: Central has no
+    # test index, so a rehearsal never touches it.
+    if: github.event_name == 'push' || !inputs.rehearse
     runs-on: ubuntu-latest
     environment: maven-central
     steps:
@@ -129,6 +135,6 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+      - run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}
