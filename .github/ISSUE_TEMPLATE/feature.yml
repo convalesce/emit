@@ -1,0 +1,15 @@
+name: Feature
+description: A change to the client or an existing plugin
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What you need
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What it lets you do that you cannot do today.

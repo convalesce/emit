@@ -1,0 +1,29 @@
+name: Bug
+description: Something a plugin sent, or failed to send
+labels: ["bug", "needs-triage"]
+body:
+  - type: input
+    id: tool
+    attributes:
+      label: Tool and version
+      placeholder: "Airflow 2.10.5"
+    validations:
+      required: true
+  - type: input
+    id: package
+    attributes:
+      label: Package and version
+      placeholder: "convalesce-emit-airflow 0.1.0"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What arrived, or the log line that says why nothing did. `CONVALESCE_DRY_RUN=true` prints every envelope.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected

@@ -1,5 +1,9 @@
 # convalesce-emit
 
+[![ci](https://github.com/convalesce/emit/actions/workflows/ci.yml/badge.svg)](https://github.com/convalesce/emit/actions/workflows/ci.yml)
+[![e2e](https://github.com/convalesce/emit/actions/workflows/e2e.yml/badge.svg)](https://github.com/convalesce/emit/actions/workflows/e2e.yml)
+[![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
+
 Client libraries that forward a data tool's own output to Convalesce, unchanged.
 
 | | |
@@ -101,3 +105,10 @@ only registering with a real Airflow would have found.
 Nothing here raises into your pipeline. If our endpoint is down, the
 observation is logged and dropped. A DAG must not go red because we had a bad
 minute: we are watching your pipeline, not standing in it.
+
+## Contributing
+
+Plugins for more tools are the most useful contribution, and the open
+[`tool-plugin` issues](https://github.com/convalesce/emit/issues?q=is%3Aissue+is%3Aopen+label%3Atool-plugin)
+list the ones with a known push mechanism. [CONTRIBUTING.md](CONTRIBUTING.md)
+has the gates, the style and the recipe for a new plugin.

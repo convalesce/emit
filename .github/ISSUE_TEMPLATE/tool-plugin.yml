@@ -1,0 +1,28 @@
+name: New tool
+description: A plugin for a tool that pushes events
+labels: ["tool-plugin", "needs-triage"]
+body:
+  - type: input
+    id: tool
+    attributes:
+      label: Tool
+      placeholder: "dbt Core"
+    validations:
+      required: true
+  - type: textarea
+    id: mechanism
+    attributes:
+      label: How the tool pushes
+      description: The listener, hook, callback or event API the tool calls when something happens, with a link to its docs.
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: Which versions you run, and any you know changed the callback API.
+  - type: textarea
+    id: events
+    attributes:
+      label: What should be forwarded
+      description: Which events matter, and what the tool hands the callback for each.
