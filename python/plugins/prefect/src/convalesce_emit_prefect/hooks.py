@@ -19,7 +19,9 @@ import convalesce_emit_prefect.hooks as cephooks
 """
 
 import logging
-from typing import Any, Dict, Optional
+import os
+import re
+from typing import Any, Dict, List, Optional
 
 import convalesce_emit as cemit
 
@@ -38,6 +40,26 @@ TOOL = "prefect"
 # expose `FlowRunContext.get()` with `flow` and `flow_run` on it.
 _FLOW_CONTEXT = "prefect.context"
 
+# One flag gates every API read below, default on: a customer whose Prefect
+# API is locked down to the process that owns it can turn this off and still
+# get everything the hook's own arguments carry.
+_API_READS_ENV = "CONVALESCE_PREFECT_API_READS"
+_FALSY = frozenset({"0", "false", "no", "off"})
+
+# How many task runs one page asks for, and how many pages a single event
+# will follow before stopping -- a backstop against a flow with an
+# unreasonable number of tasks, not a real limit on any run this was built
+# against.
+_TASK_RUN_PAGE_SIZE = 200
+_TASK_RUN_PAGE_BACKSTOP = 50
+
+# A Prefect Cloud API URL names the account and the workspace in its own
+# path; nothing about a run has to be read to find them.
+_CLOUD_URL_RE = re.compile(
+    r"^https://api\.prefect\.cloud/api/accounts/(?P<account>[^/]+)"
+    r"/workspaces/(?P<workspace>[^/]+)/?"
+)
+
 
 def _emit(
     event: str,
@@ -52,6 +74,7 @@ def _emit(
     :param emitter: emitter to send through
     :return: nothing
     """
+    payload = {**payload, **api_state(payload)}
     budget = cemit.new_budget()
     dumped = cemit.dump(payload, budget=budget)
     cemit.send_one(
@@ -62,6 +85,247 @@ def _emit(
         tool_version=cemit.version_of("prefect"),
         excluded=budget.excluded,
     )
+
+
+# #############################################################################
+# API reads
+# #############################################################################
+
+
+def api_reads_enabled() -> bool:
+    """
+    Whether the four API reads below run at all.
+
+    On by default; a customer with a locked-down Prefect API sets
+    `CONVALESCE_PREFECT_API_READS=false` and still gets everything the
+    hook's own arguments carry.
+
+    :return: whether this event should also read the API
+    """
+    raw = os.environ.get(_API_READS_ENV, "")
+    return raw.strip().lower() not in _FALSY
+
+
+def api_state(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Everything the four API reads add, named so nothing collides with what
+    the hook's own arguments already carry (`api_flow`, not `flow`).
+
+    Each read is independently guarded: a Prefect that moved a method, an
+    API that is unreachable, or Prefect being entirely absent all mean this
+    returns less, never that the event fails to send.
+
+    :param payload: the hook's own arguments, not yet dumped
+    :return: whatever could be read, empty when reads are off, Prefect is
+        absent, or nothing resolved
+    """
+    if not api_reads_enabled():
+        return {}
+    out: Dict[str, Any] = {}
+    workspace = cloud_workspace()
+    if workspace:
+        out["api_cloud_workspace"] = workspace
+    flow_run = payload.get("flow_run")
+    flow = payload.get("flow")
+    flow_run_id = _text_id(getattr(flow_run, "id", None))
+    flow_id = _text_id(getattr(flow, "id", None)) or _text_id(
+        getattr(flow_run, "flow_id", None)
+    )
+    if not flow_run_id and not flow_id:
+        return out
+    try:
+        # pylint: disable=import-outside-toplevel
+        from prefect.client.orchestration import get_client
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: prefect client unavailable: %s", exc)
+        return out
+    try:
+        with get_client(sync_client=True) as client:
+            if flow_id:
+                flow_record = _read_flow(client, flow_id)
+                if flow_record is not None:
+                    out["api_flow"] = flow_record
+            if flow_run_id:
+                flow_run_record = _call(client, "read_flow_run", flow_run_id)
+                if flow_run_record is not None:
+                    out["api_flow_run"] = flow_run_record
+                graph = _read_graph(client, flow_run_id)
+                if graph is not None:
+                    out["api_flow_run_graph"] = graph
+                task_runs = _read_task_runs(client, flow_run_id)
+                if task_runs:
+                    out["api_task_runs"] = task_runs
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # An API that is down or refuses the request is the customer's
+        # infrastructure, not a reason to lose the event itself.
+        _LOG.debug("convalesce: could not read the Prefect API: %s", exc)
+    return out
+
+
+def _text_id(value: Any) -> Optional[str]:
+    """
+    An id as text, whatever type Prefect gave it.
+
+    :param value: a `UUID`, a string, or nothing
+    :return: the text, or None
+    """
+    return str(value) if value else None
+
+
+def _call(client: Any, method_name: str, *args: Any) -> Any:
+    """
+    Call one client method if this Prefect still has it.
+
+    :param client: the sync API client
+    :param method_name: the method to call
+    :param args: positional arguments to call it with
+    :return: what it returned, or None when the method is missing or raised
+    """
+    method = getattr(client, method_name, None)
+    if not callable(method):
+        return None
+    try:
+        return method(*args)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: could not call %s: %s", method_name, exc)
+        return None
+
+
+def _read_flow(client: Any, flow_id: str) -> Any:
+    """
+    The flow record, by id.
+
+    `read_flow` is on the async client on every version this was checked
+    against, but missing from Prefect 2's *synchronous* client -- found by
+    reading the two versions' own source, not assumed from one of them. The
+    raw path is the fallback everywhere that method is absent.
+
+    :param client: the sync API client
+    :param flow_id: the flow's id
+    :return: the flow, forwarded whole; None when it could not be read
+    """
+    record = _call(client, "read_flow", flow_id)
+    if record is not None:
+        return record
+    return _get(client, f"/flows/{flow_id}")
+
+
+def _read_graph(client: Any, flow_run_id: str) -> Any:
+    """
+    The run's task-to-task graph -- the only source of per-node upstream
+    dependencies once a run has finished.
+
+    Neither supported major exposes a typed method for this endpoint, on
+    the sync client or the async one, so it is always the raw path.
+
+    :param client: the sync API client
+    :param flow_run_id: the flow run's id
+    :return: the graph, as the API returned it; None when it could not be
+        read
+    """
+    return _get(client, f"/flow_runs/{flow_run_id}/graph")
+
+
+def _get(client: Any, path: str) -> Any:
+    """
+    One raw `GET` against the client's own configured API, parsed as JSON.
+
+    `client.request` is the documented way to do this on the clients that
+    have it; where it is missing, the underlying HTTP client Prefect itself
+    builds is used directly, the same one every typed method already calls
+    through.
+
+    :param client: the sync API client
+    :param path: the path to request, relative to the API's base URL
+    :return: the parsed body; None on any failure
+    """
+    request = getattr(client, "request", None)
+    response = None
+    if callable(request):
+        try:
+            response = request("GET", path)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _LOG.debug("convalesce: GET %s failed: %s", path, exc)
+            response = None
+    if response is None:
+        http_client = getattr(client, "_client", None)
+        get = getattr(http_client, "get", None)
+        if not callable(get):
+            return None
+        try:
+            response = get(path)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _LOG.debug("convalesce: GET %s failed: %s", path, exc)
+            return None
+    try:
+        return response.json()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug(
+            "convalesce: could not parse the response for %s: %s", path, exc
+        )
+        return None
+
+
+def _read_task_runs(client: Any, flow_run_id: str) -> List[Any]:
+    """
+    Every task run belonging to the flow run, paged rather than capped at
+    whatever the API's own default page size is.
+
+    :param client: the sync API client
+    :param flow_run_id: the flow run's id
+    :return: the task runs, in the pages the API returned them; stops after
+        `_TASK_RUN_PAGE_BACKSTOP` pages, a safety net against an
+        unreasonable run rather than a real limit
+    """
+    method = getattr(client, "read_task_runs", None)
+    if not callable(method):
+        return []
+    try:
+        # pylint: disable=import-outside-toplevel
+        from prefect.client.schemas.filters import FlowRunFilter, FlowRunFilterId
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: prefect filters unavailable: %s", exc)
+        return []
+    flow_run_filter = FlowRunFilter(id=FlowRunFilterId(any_=[flow_run_id]))
+    out: List[Any] = []
+    for page in range(_TASK_RUN_PAGE_BACKSTOP):
+        try:
+            page_runs = method(
+                flow_run_filter=flow_run_filter,
+                limit=_TASK_RUN_PAGE_SIZE,
+                offset=page * _TASK_RUN_PAGE_SIZE,
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _LOG.debug("convalesce: could not read task runs: %s", exc)
+            break
+        if not page_runs:
+            break
+        out.extend(page_runs)
+        if len(page_runs) < _TASK_RUN_PAGE_SIZE:
+            break
+    return out
+
+
+def cloud_workspace() -> Dict[str, str]:
+    """
+    The Cloud account and workspace this process is configured to talk to.
+
+    Read from `PREFECT_API_URL` itself, which names both in its own path on
+    Prefect Cloud (`.../accounts/<id>/workspaces/<id>`) -- nothing about a
+    run has to be read to find them, and a self-hosted server's URL simply
+    does not match.
+
+    :return: `account_id` and `workspace_id`, or empty when this process is
+        not talking to Prefect Cloud
+    """
+    url = os.environ.get("PREFECT_API_URL", "")
+    match = _CLOUD_URL_RE.match(url)
+    if not match:
+        return {}
+    return {
+        "account_id": match.group("account"),
+        "workspace_id": match.group("workspace"),
+    }
 
 
 def emit_flow_run(
