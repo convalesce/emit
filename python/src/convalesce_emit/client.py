@@ -77,6 +77,7 @@ class Emitter:
         event: str,
         payload: Any,
         tool_version: Optional[str] = None,
+        excluded: Optional[List[Dict[str, str]]] = None,
     ) -> None:
         """
         Queue one observation, sending the batch when it is full.
@@ -90,6 +91,8 @@ class Emitter:
         :param event: which callback fired
         :param payload: the tool's own output, untouched
         :param tool_version: the tool's version, where it could be read
+        :param excluded: everything in `payload` that did not cross whole,
+            by path and reason
         :return: nothing
         """
         if not self.config.enabled:
@@ -99,6 +102,7 @@ class Emitter:
             event=event,
             payload=payload,
             tool_version=tool_version,
+            excluded=excluded,
         )
         size = len(_encode(observation))
         if size + _BODY_OVERHEAD > self.config.max_body_bytes:
@@ -255,6 +259,7 @@ def send_one(
     payload: Any,
     emitter: Optional[ceproto.EmitterLike] = None,
     tool_version: Optional[str] = None,
+    excluded: Optional[List[Dict[str, str]]] = None,
 ) -> None:
     """
     Send a single observation and flush, swallowing any failure.
@@ -268,12 +273,18 @@ def send_one(
     :param emitter: emitter to send through; built from the environment when
         not given
     :param tool_version: the tool's version, where it could be read
+    :param excluded: everything in `payload` that did not cross whole, by
+        path and reason
     :return: nothing
     """
     try:
         target = emitter or Emitter()
         target.emit(
-            tool=tool, event=event, payload=payload, tool_version=tool_version
+            tool=tool,
+            event=event,
+            payload=payload,
+            tool_version=tool_version,
+            excluded=excluded,
         )
         target.flush()
     except Exception as exc:  # pylint: disable=broad-exception-caught

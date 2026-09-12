@@ -73,3 +73,41 @@ class Test_envelope1(unittest.TestCase):
         as_dict = observation.to_dict()
         self.assertEqual(as_dict["payload"], {"a": 1})
         self.assertEqual(as_dict["tool"], "t")
+
+    def test5(self) -> None:
+        """
+        Test that an observation with nothing left out declares an empty
+        list, never a missing field.
+        """
+        observation = ceenvelo.build(tool="t", event="e", payload={})
+        self.assertEqual(observation.excluded, [])
+
+    def test6(self) -> None:
+        """
+        Test that what was left out of the payload rides along, unmodified.
+        """
+        excluded = [{"path": "task.logger", "reason": "excluded by name"}]
+        observation = ceenvelo.build(
+            tool="t", event="e", payload={}, excluded=excluded
+        )
+        self.assertEqual(observation.excluded, excluded)
+        self.assertIsNot(observation.excluded, excluded)
+
+
+# #############################################################################
+# Test_envelope_version1
+# #############################################################################
+
+
+class Test_envelope_version1(unittest.TestCase):
+    """
+    Test that this package writes envelope version 2.
+    """
+
+    def test1(self) -> None:
+        """
+        Test the version bump itself: collect must keep reading version 1,
+        so this is the one line that decides which shim path a receiver
+        takes.
+        """
+        self.assertEqual(ceenvelo.ENVELOPE_VERSION, 2)

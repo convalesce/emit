@@ -153,6 +153,15 @@ class Budget:
     :param summarise: field names to name rather than walk into
     :param skip: names and dotted paths to drop entirely
     :param excluded: every path dropped, summarised or capped, and why
+    :param keepalive: a strong reference to every object registered in
+        `seen`, held for the budget's whole lifetime. `seen` is keyed by
+        `id(obj)`, which CPython reuses once `obj` is garbage collected; a
+        plugin building an object inline and dumping it in the same
+        expression (`dump(Task(dag), ...)`, with nothing else holding the
+        `Task`) leaves it eligible for collection the moment `dump()`
+        returns, and a later, unrelated object could then land at the same
+        address and be mistaken for a repeat. Found by this package's own
+        test suite failing intermittently, not by reasoning about it first.
     """
 
     nodes: int = _NODE_BACKSTOP
@@ -165,6 +174,7 @@ class Budget:
     summarise: FrozenSet[str] = frozenset()
     skip: FrozenSet[str] = DEFAULT_SKIP
     excluded: List[Dict[str, str]] = dataclasses.field(default_factory=list)
+    keepalive: List[Any] = dataclasses.field(default_factory=list)
 
     def spend(self) -> bool:
         """
@@ -386,6 +396,9 @@ def _dump_ref(obj: Any, budget: Budget, depth: int, path: str) -> Any:
     ref = budget.next_ref
     budget.next_ref += 1
     budget.seen[id(obj)] = ref
+    # Keep `obj` alive for as long as `seen` remembers its id -- see the
+    # docstring on `Budget.keepalive`.
+    budget.keepalive.append(obj)
     budget.in_progress.add(id(obj))
     try:
         value = _dump_container(obj, budget, depth, path)

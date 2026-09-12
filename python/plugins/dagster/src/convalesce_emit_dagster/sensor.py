@@ -72,12 +72,15 @@ def emit_dagster_event(
         not given
     :return: nothing
     """
+    budget = cemit.new_budget()
+    dumped = cemit.dump(payload, budget=budget)
     cemit.send_one(
         tool=TOOL,
         event=event,
-        payload=cemit.dump(payload),
+        payload=dumped,
         emitter=emitter,
         tool_version=cemit.version_of("dagster"),
+        excluded=budget.excluded,
     )
 
 
@@ -107,7 +110,8 @@ def convalesce_sensor(
     if run is not None:
         parts.update(reach_instance(context, run))
     payload = {**parts, **kwargs} if parts else {"context": context, **kwargs}
-    body = cemit.dump(payload)
+    budget = cemit.new_budget()
+    body = cemit.dump(payload, budget=budget)
     if isinstance(body, dict) and "job_snapshot" in body:
         body["job_snapshot"] = prune_snapshot(body["job_snapshot"])
     cemit.send_one(
@@ -116,6 +120,7 @@ def convalesce_sensor(
         payload=body,
         emitter=target,
         tool_version=cemit.version_of("dagster"),
+        excluded=budget.excluded,
     )
     target.flush()
 

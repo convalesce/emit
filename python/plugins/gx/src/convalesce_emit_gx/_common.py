@@ -102,9 +102,12 @@ def forward(
     :return: whether the observation was emitted, and whether it was redacted
     """
     redact = not send_samples()
-    body = cemit.dump(shape(payload))
+    budget = cemit.new_budget()
+    body = cemit.dump(shape(payload), budget=budget)
+    excluded = budget.excluded
     if redact:
-        body = cemit.redact_samples(body)
+        body, redacted = cemit.redact_samples(body)
+        excluded = excluded + redacted
     try:
         target = emitter or cemit.Emitter()
         target.emit(
@@ -112,6 +115,7 @@ def forward(
             event="validation_result",
             payload=body,
             tool_version=cemit.version_of("great_expectations"),
+            excluded=excluded,
         )
         target.flush()
     except Exception as exc:  # pylint: disable=broad-exception-caught

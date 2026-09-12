@@ -52,12 +52,15 @@ def _emit(
     :param emitter: emitter to send through
     :return: nothing
     """
+    budget = cemit.new_budget()
+    dumped = cemit.dump(payload, budget=budget)
     cemit.send_one(
         tool=TOOL,
         event=event,
-        payload=cemit.dump(payload),
+        payload=dumped,
         emitter=emitter,
         tool_version=cemit.version_of("prefect"),
+        excluded=budget.excluded,
     )
 
 

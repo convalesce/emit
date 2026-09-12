@@ -172,11 +172,13 @@ class _Base:
         if emitter is None:
             return
         try:
+            shaped, excluded = shape(payload)
             emitter.emit(
                 tool=TOOL,
                 event=event,
-                payload=shape(payload),
+                payload=shaped,
                 tool_version=self._version,
+                excluded=excluded,
             )
             # Sent now, not batched. Task hooks fire in a process Airflow
             # forks per task and exits without telling the listener, so
@@ -201,7 +203,9 @@ class _Base:
             self._emitter.flush()
 
 
-def shape(payload: Mapping[str, Any]) -> Dict[str, Any]:
+def shape(
+    payload: Mapping[str, Any],
+) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
     """
     Dump what a hook was handed, minus plumbing, plus the dag run.
 
@@ -213,7 +217,7 @@ def shape(payload: Mapping[str, Any]) -> Dict[str, Any]:
     `$ref` instead of sending the DAG twice.
 
     :param payload: the hook's own arguments
-    :return: what to send
+    :return: what to send, and everything left out of it, by path and reason
     """
     budget = cemit.new_budget(summarise=_SUMMARISE)
     out = {
@@ -224,14 +228,14 @@ def shape(payload: Mapping[str, Any]) -> Dict[str, Any]:
     task_instance = payload.get("task_instance")
     dumped = out.get("task_instance")
     if task_instance is None or not isinstance(dumped, dict):
-        return out
+        return out, budget.excluded
     if dumped.get("dag_run") is None:
         dag_run = find_dag_run(task_instance)
         if dag_run is not None:
             dumped["dag_run"] = cemit.dump(
                 dag_run, budget=budget, path="task_instance.dag_run"
             )
-    return out
+    return out, budget.excluded
 
 
 def find_dag_run(task_instance: Any) -> Any:

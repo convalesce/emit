@@ -280,7 +280,7 @@ class Test_listener_dag_run1(unittest.TestCase):
                     "run_type": "scheduled",
                 }
 
-        payload = cealist.shape({"task_instance": TaskInstance()})
+        payload, _ = cealist.shape({"task_instance": TaskInstance()})
         self.assertEqual(
             payload["task_instance"]["dag_run"],
             {"run_id": "scheduled__2", "run_type": "scheduled"},
@@ -290,7 +290,9 @@ class Test_listener_dag_run1(unittest.TestCase):
         """
         Test that a task instance exposing no run at all is still sent.
         """
-        payload = cealist.shape({"task_instance": "TI", "previous_state": None})
+        payload, _ = cealist.shape(
+            {"task_instance": "TI", "previous_state": None}
+        )
         self.assertEqual(payload["task_instance"], "TI")
 
     def test5(self) -> None:
@@ -339,7 +341,7 @@ class Test_listener_dag_run1(unittest.TestCase):
                 self.task = Task()
                 self._ti_context_from_server = ServerContext()
 
-        payload = cealist.shape({"task_instance": RuntimeTaskInstance()})
+        payload, _ = cealist.shape({"task_instance": RuntimeTaskInstance()})
         task = payload["task_instance"]["task"]
         dag_run = payload["task_instance"]["dag_run"]
         self.assertEqual(task["dag"]["dag_id"], "demo_pipeline")
