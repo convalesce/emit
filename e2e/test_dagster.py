@@ -69,11 +69,13 @@ class Test_dagster1(e2eharn.StackCase):
             selector = self._wait_for_code_location()
             self._launch(selector, "nightly_ok")
             self._launch(selector, "nightly_broken")
+            self._launch(selector, "materialize_orders")
             observations = self.stack.wait_for(
                 lambda obs: "nightly_ok" in e2eharn.wire(obs)
-                and "nightly_broken" in e2eharn.wire(obs),
+                and "nightly_broken" in e2eharn.wire(obs)
+                and "materialize_orders" in e2eharn.wire(obs),
                 timeout=240,
-                what="run_status for both jobs",
+                what="run_status for all three jobs",
             )
             self.assert_envelopes(observations, "dagster")
             for observation in observations:

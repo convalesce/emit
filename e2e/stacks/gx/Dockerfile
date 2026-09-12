@@ -4,6 +4,6 @@
 ARG PYTHON_IMAGE=python:3.11-slim
 FROM ${PYTHON_IMAGE}
 ARG GX_VERSION
-RUN pip install --no-cache-dir "great-expectations==${GX_VERSION}" pandas
+RUN pip install --no-cache-dir "great-expectations==${GX_VERSION}" pandas sqlalchemy
 COPY python /tmp/emit
 RUN pip install --no-cache-dir /tmp/emit /tmp/emit/plugins/gx

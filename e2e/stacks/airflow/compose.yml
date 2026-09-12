@@ -26,6 +26,12 @@ services:
       # Airflow 3 refuses to boot without these and 2.x ignores them.
       AIRFLOW__API_AUTH__JWT_SECRET: e2e-not-a-secret
       AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://localhost:8080/execution/
+      # The SQL task's connection, as an env var so a parse-time DB or API
+      # write is never needed: works the same on Airflow 2's scheduler and
+      # Airflow 3's HTTP-only dag-processor. JSON rather than a URI: the
+      # sqlite hook reads the connection's `host` as the file path, and a
+      # URI's netloc can never hold an absolute path, only its schema does.
+      AIRFLOW_CONN_CONVALESCE_SQLITE: '{"conn_type":"sqlite","host":"/opt/airflow/convalesce_example.db"}'
     volumes:
       - ./dags:/opt/airflow/dags:ro
     depends_on:

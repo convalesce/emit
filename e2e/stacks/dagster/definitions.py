@@ -43,6 +43,20 @@ def nightly_broken() -> None:
     load(extract())
 
 
+@dagster.asset
+def orders() -> dagster.MaterializeResult:
+    """Materialise with metadata, so the event log carries a real asset
+    fact rather than only op-level step stats."""
+    return dagster.MaterializeResult(
+        metadata={"row_count": 42, "size_in_bytes": 1024}
+    )
+
+
+materialize_orders = dagster.define_asset_job(
+    "materialize_orders", selection=[orders]
+)
+
+
 # Started rather than waiting to be switched on in the UI, and ticking
 # every two seconds rather than thirty, so the test is not a wait.
 @run_status_sensor(
@@ -66,6 +80,7 @@ def convalesce_on_failure(context: Any) -> None:
 
 
 defs = dagster.Definitions(
-    jobs=[nightly_ok, nightly_broken],
+    jobs=[nightly_ok, nightly_broken, materialize_orders],
+    assets=[orders],
     sensors=[convalesce_on_success, convalesce_on_failure],
 )

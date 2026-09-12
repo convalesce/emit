@@ -22,6 +22,13 @@ def load(rows: int) -> None:
     raise RuntimeError(f"load failed on purpose after extracting {rows} rows")
 
 
+@task(on_completion=[emit_task_run], on_failure=[emit_task_run])
+def transform(rows: int) -> int:
+    """Pass the count through, so the run graph has an edge even when
+    nothing fails."""
+    return rows * 2
+
+
 @flow(
     name="nightly_ok",
     on_completion=[emit_flow_run],
@@ -29,7 +36,7 @@ def load(rows: int) -> None:
 )
 def nightly_ok() -> None:
     """The flow that succeeds."""
-    extract()
+    transform(extract())
 
 
 @flow(
