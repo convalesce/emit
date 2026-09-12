@@ -41,9 +41,12 @@ GitHub release with generated notes.
 ## Rehearse first
 
 The workflow can be run by hand from the Actions tab with *Upload to
-TestPyPI* ticked. That builds and uploads the same five packages to
+TestPyPI* ticked, or with `gh workflow run publish.yml --ref <branch> -f
+rehearse=true`. That builds and uploads the same five packages to
 https://test.pypi.org, from whatever ref is chosen, and touches nothing
-else. It needs the `testpypi` environment registered as a trusted publisher
+else: the tag and branch checks are for a tag push, and a rehearsal can only
+claim the `testpypi*` environments, so it has no way to reach PyPI or
+Central. It needs the `testpypi` environment registered as a trusted publisher
 on TestPyPI the same way as below. Do this once before the first real tag,
 because the first upload to PyPI claims the names.
 
