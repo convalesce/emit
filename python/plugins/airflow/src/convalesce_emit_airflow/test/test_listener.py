@@ -12,7 +12,10 @@ Run with `make test`.
 # pylint: disable=duplicate-code
 
 import logging
+import sys
+import types
 import unittest
+import unittest.mock
 from typing import Any, Dict, List
 
 import convalesce_emit_airflow.listener as cealist
@@ -471,3 +474,260 @@ class Test_listener_task_group1(unittest.TestCase):
         # collapses to a $ref pointing at the task's copy.
         dag_run = recorder.sent[0]["payload"]["task_instance"]["dag_run"]
         self.assertEqual(dag_run["dag"], {"$ref": task["dag"]["$id"]})
+
+
+# #############################################################################
+# Test_connection_coordinates1
+# #############################################################################
+
+
+class Test_connection_coordinates1(unittest.TestCase):
+    """
+    Test that a task's connection ids resolve to coordinates, never secrets.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that every `*_conn_id` attribute is resolved, and only the
+        four allowed fields cross -- never `password`, never `extra`.
+        """
+
+        class Connection:
+            """Stands in for Airflow's own Connection model."""
+
+            def __init__(self) -> None:
+                self.conn_type = "sqlite"
+                self.host = "/tmp/convalesce.db"
+                self.port = None
+                self.schema = None
+                self.password = "s3cret"
+                self.extra = '{"private_key": "s3cret"}'
+
+        class Task:
+            """Stands in for a SQL operator."""
+
+            def __init__(self) -> None:
+                self.sqlite_conn_id = "convalesce_sqlite"
+                self.task_id = "load"
+
+        with unittest.mock.patch.object(
+            cealist, "_get_connection", return_value=Connection()
+        ) as get:
+            coords = cealist.connection_coordinates(Task())
+        get.assert_called_once_with("convalesce_sqlite")
+        self.assertEqual(
+            coords,
+            {
+                "convalesce_sqlite": {
+                    "conn_id": "convalesce_sqlite",
+                    "conn_type": "sqlite",
+                    "host": "/tmp/convalesce.db",
+                    "port": None,
+                    "schema": None,
+                }
+            },
+        )
+        self.assertNotIn("password", str(coords))
+        self.assertNotIn("s3cret", str(coords))
+
+    def test2(self) -> None:
+        """
+        Test that a connection id that does not resolve is dropped, not
+        raised -- a deleted or unseeded connection is Airflow's business.
+        """
+
+        class Task:
+            """Stands in for an operator naming a connection that is gone."""
+
+            def __init__(self) -> None:
+                self.conn_id = "missing"
+
+        with unittest.mock.patch.object(
+            cealist, "_get_connection", side_effect=Exception("no such conn")
+        ):
+            coords = cealist.connection_coordinates(Task())
+        self.assertEqual(coords, {})
+
+    def test3(self) -> None:
+        """
+        Test that connection coordinates ride along on the dumped task.
+        """
+
+        class Connection:
+            """Stands in for Airflow's own Connection model."""
+
+            def __init__(self) -> None:
+                self.conn_type = "postgres"
+                self.host = "warehouse.internal"
+                self.port = 5432
+                self.schema = "public"
+
+        class Task:
+            """Stands in for a SQL operator."""
+
+            def __init__(self) -> None:
+                self.postgres_conn_id = "warehouse"
+                self.task_id = "load"
+
+        class TaskInstance:
+            """Stands in for the task instance Airflow passes."""
+
+            def __init__(self) -> None:
+                self.task_id = "load"
+                self.task = Task()
+
+        with unittest.mock.patch.object(
+            cealist, "_get_connection", return_value=Connection()
+        ):
+            payload, _ = cealist.shape({"task_instance": TaskInstance()})
+        connections = payload["task_instance"]["task"]["connections"]
+        self.assertEqual(connections["warehouse"]["conn_type"], "postgres")
+
+
+# #############################################################################
+# Test_asset_aliases1
+# #############################################################################
+
+
+class Test_asset_aliases1(unittest.TestCase):
+    """
+    Test that runtime-resolved asset aliases are forwarded, and only when
+    something actually resolved.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that an alias with a resolved event is read off the template
+        context's `OutletEventAccessors`.
+        """
+
+        class Accessor:
+            """Stands in for one `OutletEventAccessor`."""
+
+            def __init__(self, events: List[Any]) -> None:
+                self.asset_alias_events = events
+
+        class Accessors:
+            """Stands in for `OutletEventAccessors`."""
+
+            def __init__(self, mapping: Dict[str, Accessor]) -> None:
+                self._mapping = mapping
+
+            def items(self) -> Any:
+                """Return the accessors, the same shape as the real class."""
+                return self._mapping.items()
+
+        class Context(dict):
+            """Stands in for the template context."""
+
+        resolved = {"source_alias_name": "daily", "dest_asset_key": "orders"}
+        context = Context(
+            {"outlet_events": Accessors({"daily": Accessor([resolved])})}
+        )
+
+        class TaskInstance:
+            """Stands in for a task instance exposing its own context."""
+
+            def get_template_context(self) -> Any:
+                """Return the context the task ran with."""
+                return context
+
+        aliases = cealist.asset_aliases(TaskInstance())
+        self.assertEqual(aliases, [resolved])
+
+    def test2(self) -> None:
+        """
+        Test that an alias with nothing resolved is left out -- a direct
+        asset outlet is already sent and carries no alias.
+        """
+
+        class Accessor:
+            """Stands in for an accessor nothing wrote through."""
+
+            asset_alias_events: List[Any] = []
+
+        class Accessors:
+            """Stands in for `OutletEventAccessors`."""
+
+            def items(self) -> Any:
+                """Return one accessor, resolved to nothing."""
+                return [("unused", Accessor())]
+
+        class TaskInstance:
+            """Stands in for a task instance exposing its own context."""
+
+            def get_template_context(self) -> Any:
+                """Return the context the task ran with."""
+                return {"outlet_events": Accessors()}
+
+            dag_id = None
+
+        self.assertEqual(cealist.asset_aliases(TaskInstance()), [])
+
+    def test3(self) -> None:
+        """
+        Test that the `AssetEvent` fallback is used when the context has
+        nothing, and rows with empty `source_aliases` are skipped -- those
+        are direct assets, already sent.
+        """
+
+        class Row:
+            """Stands in for one `AssetEvent` row."""
+
+            def __init__(self, source_aliases: List[str]) -> None:
+                self.source_aliases = source_aliases
+
+        direct = Row([])
+        aliased = Row(["daily"])
+
+        class Query:
+            """Stands in for the SQLAlchemy query chain."""
+
+            def filter(self, *_args: Any) -> "Query":
+                """Ignore the filter clauses; return the same two rows."""
+                return self
+
+            def all(self) -> List[Row]:
+                """Return both rows, as an unfiltered stand-in would."""
+                return [direct, aliased]
+
+        class Session:
+            """Stands in for Airflow's ORM session."""
+
+            def query(self, *_args: Any) -> Query:
+                """Return the stand-in query, ignoring what was asked for."""
+                return Query()
+
+            def close(self) -> None:
+                """Do nothing; there is no real connection to release."""
+
+        class TaskInstance:
+            """Stands in for a task instance with no live context."""
+
+            dag_id = "orders"
+            run_id = "manual__1"
+            task_id = "load"
+
+        class FakeAssetEvent:
+            """Stands in for the `AssetEvent` model class, columns only."""
+
+            source_dag_id = None
+            source_run_id = None
+            source_task_id = None
+            source_map_index = None
+
+        def _session() -> Session:
+            """Build the stand-in session; called where `Session()` is."""
+            return Session()
+
+        module = types.SimpleNamespace(Session=_session)
+        asset_module = types.SimpleNamespace(AssetEvent=FakeAssetEvent)
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {
+                "airflow.settings": module,
+                "airflow.models.asset": asset_module,
+            },
+        ):
+            aliases = cealist.asset_aliases(TaskInstance())
+        self.assertEqual(aliases, [aliased])
