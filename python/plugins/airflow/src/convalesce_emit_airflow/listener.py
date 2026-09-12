@@ -31,6 +31,10 @@ than about reading a tool's state:
   is on the context the API server sent, and it is spliced in under the name
   Airflow 2 puts it at, so a receiver has one path for both.
 
+And one field is named rather than walked. A task belongs to a task group,
+and a task group holds its own copy of the whole DAG, so it was 40% of a
+task event and every byte of it appeared elsewhere already.
+
 Import as:
 
 import convalesce_emit_airflow.listener as cealist
@@ -92,6 +96,11 @@ WANTED = (
 # Declared to pluggy, because a hook missing a parameter Airflow passes is
 # rejected, and then left out of what is sent.
 _SKIP_ARGS = frozenset({"session"})
+
+# Fields whose contents are a copy of something the payload already carries.
+# A task group holds the DAG it belongs to, which arrives on the task and on
+# the dag run as well, plus the group bookkeeping Airflow's UI draws with.
+_SUMMARISE = frozenset({"task_group"})
 
 # Used when the spec modules cannot be read; the shape these have carried
 # since the listener API landed in Airflow 2.5.
@@ -200,7 +209,7 @@ def shape(payload: Mapping[str, Any]) -> Dict[str, Any]:
     :return: what to send
     """
     out = {
-        name: cemit.dump(value)
+        name: cemit.dump(value, summarise=_SUMMARISE)
         for name, value in payload.items()
         if name not in _SKIP_ARGS
     }
@@ -211,7 +220,7 @@ def shape(payload: Mapping[str, Any]) -> Dict[str, Any]:
     if dumped.get("dag_run") is None:
         dag_run = find_dag_run(task_instance)
         if dag_run is not None:
-            dumped["dag_run"] = cemit.dump(dag_run)
+            dumped["dag_run"] = cemit.dump(dag_run, summarise=_SUMMARISE)
     return out
 
 

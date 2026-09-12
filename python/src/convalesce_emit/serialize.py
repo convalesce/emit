@@ -25,7 +25,7 @@ import logging
 import math
 import threading
 import types
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, Optional, Set, Tuple
 
 _LOG = logging.getLogger(__name__)
 
@@ -106,10 +106,12 @@ class _Budget:
 
     :param nodes: values still allowed before the walk stops
     :param seen: ids already visited, so a cycle terminates
+    :param summarise: field names to name rather than walk into
     """
 
     nodes: int = _MAX_NODES
     seen: Set[int] = dataclasses.field(default_factory=set)
+    summarise: FrozenSet[str] = frozenset()
 
     def spend(self) -> bool:
         """
@@ -122,7 +124,11 @@ class _Budget:
 
 
 def dump(  # pylint: disable=too-many-return-statements
-    obj: Any, *, budget: Optional[_Budget] = None, depth: int = 0
+    obj: Any,
+    *,
+    budget: Optional[_Budget] = None,
+    depth: int = 0,
+    summarise: FrozenSet[str] = frozenset(),
 ) -> Any:
     """
     Convert a tool's object into something JSON can carry.
@@ -134,10 +140,12 @@ def dump(  # pylint: disable=too-many-return-statements
     :param obj: whatever the tool handed the callback
     :param budget: remaining size allowance, created on the first call
     :param depth: recursion depth
+    :param summarise: fields the tool knows are duplication, named rather
+        than walked; a plugin passes what its own tool duplicates
     :return: a JSON-encodable equivalent, truncated where a budget ran out
     """
     if budget is None:
-        budget = _Budget()
+        budget = _Budget(summarise=frozenset(name.lower() for name in summarise))
     if obj is None or isinstance(obj, (bool, int)):
         return obj
     if isinstance(obj, float):
@@ -221,6 +229,9 @@ def _dump_container(obj: Any, budget: _Budget, depth: int) -> Any:
                 ):
                     public[exposed] = _dump_property(obj, exposed, budget, nxt)
                 continue
+            if name.lower() in budget.summarise and not _is_scalar(value):
+                public[name] = _describe(value)
+                continue
             if name.lower() in _DATA_NAMES and not _is_scalar(value):
                 public[name] = _describe_bulk_data(value)
                 continue
@@ -249,6 +260,9 @@ def _dump_mapping(obj: Dict[Any, Any], budget: _Budget, depth: int) -> Any:
         lowered = name.lower()
         if lowered in _SKIP_NAMES:
             continue
+        if lowered in budget.summarise and not _is_scalar(value):
+            out[name] = _describe(value)
+            continue
         if lowered in _DATA_NAMES and not _is_scalar(value):
             out[name] = _describe_bulk_data(value)
             continue
@@ -276,6 +290,9 @@ def _dump_fields(obj: Any, budget: _Budget, depth: int) -> Any:
     out = {}
     for name in fields[:_MAX_ITEMS]:
         if not isinstance(name, str) or name.lower() in _SKIP_NAMES:
+            continue
+        if name.lower() in budget.summarise:
+            out[name] = _describe(getattr(obj, name, None))
             continue
         if name.lower() in _DATA_NAMES:
             out[name] = _describe_bulk_data(getattr(obj, name, None))

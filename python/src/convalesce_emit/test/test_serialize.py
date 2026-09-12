@@ -703,3 +703,97 @@ class Test_dump_fields1(unittest.TestCase):
         out = ceserial.dump(Record())
         self.assertEqual(out["step_key"], "load")
         self.assertIn("unreadable", out["materialization_events"])
+
+
+# #############################################################################
+# Test_dump_summarise1
+# #############################################################################
+
+
+class Test_dump_summarise1(unittest.TestCase):
+    """
+    Test that a field a tool knows is duplication is named, not walked.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the named field arrives as its description.
+
+        An Airflow task belongs to a task group, and a task group holds its
+        own copy of the whole DAG, which the payload already carries twice
+        over: 40% of a task event, every byte of it a repeat.
+        """
+
+        class Group:
+            """Stands in for an Airflow task group."""
+
+            def __init__(self, dag: Any) -> None:
+                self.dag = dag
+                self.children = {"extract": "...", "load": "..."}
+
+            def __str__(self) -> str:
+                return "<TaskGroup: nightly>"
+
+        class Task:
+            """Stands in for an operator."""
+
+            def __init__(self) -> None:
+                self.task_id = "load"
+                self.dag = {"dag_id": "nightly", "task_dict": {"load": "..."}}
+                self.task_group = Group(self.dag)
+
+        out = ceserial.dump(
+            {"task": Task()}, summarise=frozenset({"task_group"})
+        )
+        task = out["task"]
+        self.assertEqual(task["task_id"], "load")
+        self.assertEqual(task["dag"]["dag_id"], "nightly")
+        self.assertEqual(task["task_group"], "<TaskGroup: nightly>")
+
+    def test2(self) -> None:
+        """
+        Test that nothing is summarised unless a tool asks for it.
+        """
+
+        class Task:
+            """Stands in for an operator."""
+
+            def __init__(self) -> None:
+                self.task_group = {"children": ["extract"]}
+
+        out = ceserial.dump(Task())
+        self.assertEqual(out["task_group"], {"children": ["extract"]})
+
+    def test3(self) -> None:
+        """
+        Test that a scalar under a summarised name is left as it is.
+        """
+        out = ceserial.dump(
+            {"task_group": "nightly", "other": 1},
+            summarise=frozenset({"task_group"}),
+        )
+        self.assertEqual(out["task_group"], "nightly")
+
+    def test4(self) -> None:
+        """
+        Test that a record's own field is summarised too.
+        """
+
+        class Record:
+            """Stands in for a record that names its fields."""
+
+            _fields = ("name", "bulky")
+
+            @property
+            def name(self) -> str:
+                """What this is called."""
+                return "nightly"
+
+            @property
+            def bulky(self) -> Any:
+                """A copy of something the payload already has."""
+                return {"a": 1, "b": 2}
+
+        out = ceserial.dump(Record(), summarise=frozenset({"bulky"}))
+        self.assertEqual(out["name"], "nightly")
+        self.assertEqual(out["bulky"], "{'a': 1, 'b': 2}")
