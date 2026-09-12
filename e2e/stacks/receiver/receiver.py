@@ -11,6 +11,7 @@ this one file.
 Run as `python receiver.py` with `RECEIVER_KEY` set.
 """
 
+import gzip
 import json
 import logging
 import os
@@ -69,6 +70,12 @@ class Handler(BaseHTTPRequestHandler):
                 _REJECTED.append({"reason": "bad key", "header": auth[:12]})
             self._json(401, {"error": "bad key"})
             return
+        if self.headers.get("Content-Encoding", "") == "gzip":
+            try:
+                raw = gzip.decompress(raw)
+            except OSError:
+                self._json(400, {"error": "bad gzip"})
+                return
         try:
             body = json.loads(raw.decode("utf-8"))
         except ValueError:
