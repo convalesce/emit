@@ -11,13 +11,22 @@ Run with `EMIT_E2E_AIRFLOW=<version> pytest test_airflow.py`.
 
 import logging
 import time
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import harness as e2eharn
 
 _LOG = logging.getLogger(__name__)
 
 DAG_ID = "convalesce_example"
+# Where a DAG turns up, in the order it is preferred. Airflow 2 hangs it on
+# the task and on the dag run; Airflow 3's task instance carries neither, so
+# it comes off the task's own `dag` property. A task group holds a copy too,
+# and that is the last resort rather than the first.
+_DAG_PATHS = (
+    ("task", "dag"),
+    ("dag_run", "dag"),
+    ("task", "task_group", "dag"),
+)
 # Proves the scheduler has parsed the DAG itself. On Airflow 2.9 and later
 # the CLI's `unpause` parses the file and writes the row on its own, and a
 # row the CLI wrote before the scheduler's first parse left every run it
@@ -32,6 +41,22 @@ TASK_EVENTS = {
     "on_task_instance_success",
     "on_task_instance_failed",
 }
+
+
+def find_dag(task_instance: Dict[str, Any]) -> Any:
+    """
+    The DAG a task event names, wherever this Airflow put it.
+
+    :param task_instance: the dumped task instance
+    :return: the DAG as a mapping, or None when it named none
+    """
+    for path in _DAG_PATHS:
+        found: Any = task_instance
+        for name in path:
+            found = found.get(name) if isinstance(found, dict) else None
+        if isinstance(found, dict) and found.get("dag_id"):
+            return found
+    return None
 
 
 # #############################################################################
@@ -148,15 +173,22 @@ class Test_airflow1(e2eharn.StackCase):
         self, observations: List[e2eharn.Observation]
     ) -> None:
         """
-        Check a task event names its DAG and the run it belongs to.
+        Check a task event names the run it belongs to, and the DAG.
 
         A receiver builds the job from the DAG and the run from the dag run.
-        On Airflow 3 the task instance carries neither: the DAG sits behind a
-        property on the task and the run on the context the API server sent.
+        On Airflow 3 the task instance carries neither: the DAG sits behind
+        a property on the task and the run on the context the API server
+        sent.
+
+        Airflow 2.5 hands the failed hook a task instance with no task on it
+        at all, so there is no DAG to find on that one event. That is the
+        tool's own doing, so the DAG is required of every event that carries
+        a task, and of at least one event, rather than of every event.
 
         :param observations: what the receiver recorded
         :return: nothing
         """
+        named = 0
         for observation in observations:
             if not observation["event"].startswith("on_task_instance"):
                 continue
@@ -164,14 +196,30 @@ class Test_airflow1(e2eharn.StackCase):
             self.assertIsInstance(task_instance, dict, observation["payload"])
             dag_run = task_instance.get("dag_run")
             self.assertIsInstance(
-                dag_run, dict, f"no dag run on {observation['event']}"
+                dag_run,
+                dict,
+                f"no dag run on {observation['event']}; the task instance "
+                f"carried {sorted(task_instance)}",
             )
             self.assertTrue(dag_run.get("run_id"), dag_run)
-            dag = (task_instance.get("task") or {}).get("dag") or dag_run.get(
-                "dag"
+            task = task_instance.get("task")
+            if not isinstance(task, dict):
+                _LOG.info(
+                    "%s carried no task, so no dag either: %s",
+                    observation["event"],
+                    sorted(task_instance),
+                )
+                continue
+            dag = find_dag(task_instance)
+            self.assertIsInstance(
+                dag,
+                dict,
+                f"no dag on {observation['event']}; its task carried "
+                f"{sorted(task)}",
             )
-            self.assertIsInstance(dag, dict, f"no dag on {observation['event']}")
             self.assertEqual(dag.get("dag_id"), DAG_ID, dag)
+            named += 1
+        self.assertTrue(named, "no task event named the DAG")
 
     def _assert_session_absent(
         self, observations: List[e2eharn.Observation]
