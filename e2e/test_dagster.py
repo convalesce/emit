@@ -84,7 +84,41 @@ class Test_dagster1(e2eharn.StackCase):
                 self.assertIsInstance(
                     observation["payload"]["dagster_event"], dict
                 )
+                self._assert_instance_was_reached(observation)
             self.assertIn("load failed on purpose", e2eharn.wire(observations))
+
+    def _assert_instance_was_reached(
+        self, observation: e2eharn.Observation
+    ) -> None:
+        """
+        Check what the run points at arrived with it.
+
+        The run and the event say a job ran and how it ended. What the job
+        is made of, when each step ran and which step feeds which is on the
+        instance the sensor holds, one call away per piece.
+
+        :param observation: one envelope the receiver recorded
+        :return: nothing
+        """
+        payload = observation["payload"]
+        snapshot = payload.get("job_snapshot")
+        self.assertIsInstance(snapshot, dict, "no job snapshot")
+        self.assertTrue(snapshot.get("name"), snapshot)
+        self.assertIsInstance(
+            payload.get("execution_plan_snapshot"), dict, "no execution plan"
+        )
+        stats = payload.get("run_stats")
+        self.assertIsInstance(stats, dict, "no run stats")
+        self.assertTrue(stats.get("start_time"), stats)
+        steps = payload.get("step_stats")
+        self.assertIsInstance(steps, list, "no step stats")
+        self.assertTrue(steps, "step stats arrived empty")
+        self.assertTrue(
+            any(
+                step.get("step_key") for step in steps if isinstance(step, dict)
+            ),
+            steps,
+        )
 
     def _graphql(self, query: str, variables: Dict[str, Any]) -> Any:
         """
