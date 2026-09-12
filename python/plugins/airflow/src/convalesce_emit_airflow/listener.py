@@ -76,6 +76,8 @@ _SPEC_MODULES = (
     "airflow._shared.listeners.spec.taskinstance",
     "airflow._shared.listeners.spec.dagrun",
     "airflow.sdk._shared.listeners.spec.taskinstance",
+    # Airflow 3 only; the in-tool listener never implemented these.
+    "airflow.listeners.spec.asset",
 )
 
 
@@ -90,6 +92,8 @@ WANTED = (
     "on_dag_run_failed",
     # Airflow 3 only; absent from 2.x, which the spec read handles.
     "on_task_instance_skipped",
+    "on_asset_created",
+    "on_asset_changed",
 )
 
 # Hook arguments that are plumbing rather than anything about the run.

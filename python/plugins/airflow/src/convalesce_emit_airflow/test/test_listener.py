@@ -95,6 +95,71 @@ class Test_hook_generation1(unittest.TestCase):
 
 
 # #############################################################################
+# Test_hook_generation2
+# #############################################################################
+
+
+class Test_hook_generation2(unittest.TestCase):
+    """
+    Test that the hooks Phase 2 adds are wired the same generic way.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that both dag-run completion hooks build and forward.
+
+        `on_dag_run_success`/`on_dag_run_failed` were already in `WANTED`;
+        this is the confirmation the plan asked for, against a spec shaped
+        exactly like Airflow's own `airflow.listeners.spec.dagrun`
+        (`on_dag_run_success(dag_run, msg)`), not assumed.
+        """
+        specs = {
+            "on_dag_run_success": ("dag_run", "msg"),
+            "on_dag_run_failed": ("dag_run", "msg"),
+        }
+        recorder = _Recorder()
+        cls = cealist.build_listener_class(specs)
+        listener = cls(emitter=recorder)
+        for name in specs:
+            self.assertTrue(hasattr(listener, name))
+            getattr(listener, name)({"dag_id": "orders"}, "done")
+        events = [call["event"] for call in recorder.sent]
+        self.assertEqual(events, ["on_dag_run_success", "on_dag_run_failed"])
+        self.assertEqual(
+            recorder.sent[0]["payload"]["dag_run"], {"dag_id": "orders"}
+        )
+
+    def test2(self) -> None:
+        """
+        Test that an asset hook forwards the asset it was handed whole.
+
+        The in-tool listener's bodies for `on_asset_created` and
+        `on_asset_changed` are empty; here the payload is the asset.
+        """
+        specs = {"on_asset_created": ("asset",)}
+        recorder = _Recorder()
+        cls = cealist.build_listener_class(specs)
+        listener = cls(emitter=recorder)
+        hook = getattr(listener, "on_asset_created")
+        hook({"name": "orders", "uri": "s3://orders"})
+        payload = recorder.sent[0]["payload"]
+        self.assertEqual(payload["asset"]["uri"], "s3://orders")
+
+    def test3(self) -> None:
+        """
+        Test that reading specs never returns a partial asset pair.
+
+        Where Airflow is absent, as in this test environment, nothing
+        resolves and the fallback specs are used instead, which carry
+        neither hook -- never one without the other.
+        """
+        specs = cealist.read_specs()
+        self.assertEqual(
+            "on_asset_created" in specs, "on_asset_changed" in specs
+        )
+
+
+# #############################################################################
 # Test_listener_forwarding1
 # #############################################################################
 
