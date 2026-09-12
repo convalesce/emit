@@ -229,3 +229,99 @@ class Test_gx_runtime1(unittest.TestCase):
         payload = recorder.sent[0]["payload"]
         self.assertIn("checkpoint_result", payload["kwargs"])
         self.assertFalse(payload["kwargs"]["checkpoint_result"]["success"])
+
+
+# #############################################################################
+# Test_runtime_platform1
+# #############################################################################
+
+
+class _Dialect:
+    """Stands in for a SQLAlchemy dialect."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _SqlAlchemyEngine:
+    """Stands in for a live SQLAlchemy engine, credentials and all."""
+
+    def __init__(self, dialect_name: str) -> None:
+        self.dialect = _Dialect(dialect_name)
+        self.url = f"{dialect_name}://user:s3cret@warehouse/orders"
+
+
+class _SqlExecutionEngine:
+    """Stands in for GX's `SqlAlchemyExecutionEngine`."""
+
+    def __init__(self, dialect_name: str) -> None:
+        self.engine = _SqlAlchemyEngine(dialect_name)
+
+
+class Test_runtime_platform1(unittest.TestCase):
+    """
+    Test that the execution engine's identity is read before it is dropped,
+    and that only the dialect name crosses, never the engine's own URL.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a SQL execution engine's dialect names the platform.
+        """
+
+        class Validator:
+            """Stands in for the 0.x `data_asset`."""
+
+            def __init__(self) -> None:
+                self.execution_engine = _SqlExecutionEngine("sqlite")
+
+        recorder = _Recorder()
+        cegxcom.forward(
+            {
+                "args": [],
+                "kwargs": {
+                    "validation_result_suite": {"results": [_RESULT]},
+                    "data_asset": Validator(),
+                },
+            },
+            recorder,
+        )
+        payload = recorder.sent[0]["payload"]
+        self.assertEqual(payload["dialect_name"], "sqlite")
+        self.assertEqual(
+            payload["execution_engine_class"], "_SqlExecutionEngine"
+        )
+        self.assertNotIn("s3cret", json.dumps(payload))
+
+    def test2(self) -> None:
+        """
+        Test that a pandas execution engine, which owns no SQLAlchemy
+        engine, still names its own class with no dialect at all.
+        """
+        recorder = _Recorder()
+        cegxcom.forward(
+            {
+                "args": [],
+                "kwargs": {
+                    "validation_result_suite": {"results": [_RESULT]},
+                    "data_asset": _Validator(),
+                },
+            },
+            recorder,
+        )
+        payload = recorder.sent[0]["payload"]
+        self.assertEqual(payload["execution_engine_class"], "_Engine")
+        self.assertNotIn("dialect_name", payload)
+
+    def test3(self) -> None:
+        """
+        Test that a payload with nothing runtime in it adds neither field.
+        """
+        recorder = _Recorder()
+        cegxcom.forward(
+            {"args": [], "kwargs": {"checkpoint_result": {"success": True}}},
+            recorder,
+        )
+        payload = recorder.sent[0]["payload"]
+        self.assertNotIn("execution_engine_class", payload)
+        self.assertNotIn("dialect_name", payload)
