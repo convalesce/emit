@@ -242,10 +242,25 @@ def shape(
     task_dumped = dumped.get("task")
     task = getattr(task_instance, "task", None)
     if task is not None and isinstance(task_dumped, dict):
-        connections = connection_coordinates(task)
+        try:
+            connections = connection_coordinates(task)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            # A read here is not worth the run losing its task events over;
+            # see the same reasoning on the alias read just below.
+            _LOG.warning("convalesce: could not read connections: %s", exc)
+            connections = {}
         if connections:
             task_dumped["connections"] = connections
-    aliases = asset_aliases(task_instance)
+    try:
+        aliases = asset_aliases(task_instance)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # Both of `asset_aliases`'s own reads are already guarded; this is
+        # the last line of defence, not the first -- a live task process
+        # already lost an entire event to an unguarded read here once (a
+        # real Airflow 3 exposed it, not a hypothetical), and nothing about
+        # an alias is worth the run losing its task events over.
+        _LOG.warning("convalesce: could not read asset aliases: %s", exc)
+        aliases = []
     if aliases:
         dumped["asset_aliases"] = cemit.dump(
             aliases, budget=budget, path="task_instance.asset_aliases"
@@ -407,6 +422,15 @@ def _aliases_from_asset_events(task_instance: Any) -> List[Any]:
     """
     Fall back to the `AssetEvent` rows this task's own try produced.
 
+    A real, load-bearing failure mode, found only by running this in a real
+    Airflow 3 task process rather than by reading: Airflow 3 runs a task in
+    a sandboxed process that raises the instant *anything* touches the
+    metadata database's ORM directly -- not on import, but on
+    `Session()` itself, before a query is ever built. This fallback exists
+    for Airflow 2 (the primary path below, reading the live template
+    context, is what actually works on Airflow 3); on Airflow 3 it always
+    fails here, quietly, which is exactly what it should do.
+
     :param task_instance: whatever the hook was handed
     :return: rows whose `source_aliases` is non-empty; a direct asset
         outlet has none, so those rows are skipped -- they are already sent
@@ -420,11 +444,12 @@ def _aliases_from_asset_events(task_instance: Any) -> List[Any]:
         # pylint: disable=import-outside-toplevel
         from airflow.models.asset import AssetEvent
         from airflow.settings import Session
+
+        map_index = getattr(task_instance, "map_index", -1)
+        session = Session()
     except Exception as exc:  # pylint: disable=broad-exception-caught
         _LOG.debug("convalesce: asset events unavailable: %s", exc)
         return []
-    map_index = getattr(task_instance, "map_index", -1)
-    session = Session()
     try:
         rows = (
             session.query(AssetEvent)

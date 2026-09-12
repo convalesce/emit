@@ -731,3 +731,46 @@ class Test_asset_aliases1(unittest.TestCase):
         ):
             aliases = cealist.asset_aliases(TaskInstance())
         self.assertEqual(aliases, [aliased])
+
+    def test4(self) -> None:
+        """
+        Test that `Session()` itself raising -- what Airflow 3's sandboxed
+        task process actually does, found by running a real DAG rather than
+        by reading -- loses only the aliases, not the whole task event.
+
+        The first working version of this fallback called `Session()`
+        outside its own `try`, so this exact failure escaped
+        `asset_aliases()` entirely and took down `on_task_instance_running`
+        and `on_task_instance_success` for every task, not just the alias
+        read: "Direct database access via the ORM is not allowed in
+        Airflow 3.0", raised at construction, before a query was ever
+        built.
+        """
+
+        class TaskInstance:
+            """Stands in for a task instance with no live context."""
+
+            dag_id = "orders"
+            run_id = "manual__1"
+            task_id = "load"
+
+        class FakeAssetEvent:
+            """Stands in for the `AssetEvent` model class, columns only."""
+
+        def _forbidden_session() -> Any:
+            """Raise, the way Airflow 3's task sandbox actually does."""
+            raise RuntimeError(
+                "Direct database access via the ORM is not allowed in "
+                "Airflow 3.0"
+            )
+
+        module = types.SimpleNamespace(Session=_forbidden_session)
+        asset_module = types.SimpleNamespace(AssetEvent=FakeAssetEvent)
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {
+                "airflow.settings": module,
+                "airflow.models.asset": asset_module,
+            },
+        ):
+            self.assertEqual(cealist.asset_aliases(TaskInstance()), [])
