@@ -139,3 +139,149 @@ class Test_listener_forwarding1(unittest.TestCase):
         payload = recorder.sent[0]["payload"]["task_instance"]
         self.assertEqual(payload["dag_id"], "orders")
         self.assertNotIn("_private", payload)
+
+
+# #############################################################################
+# Test_listener_session1
+# #############################################################################
+
+
+class Test_listener_session1(unittest.TestCase):
+    """
+    Test that the ORM session is declared to pluggy and not forwarded.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the hook still takes `session`.
+
+        pluggy rejects a plugin whose hook is missing a parameter Airflow
+        passes, which takes the scheduler down at startup.
+        """
+        cls = cealist.build_listener_class(_FAILED_SPEC)
+        hook = getattr(cls, "on_task_instance_failed")
+        self.assertIn("session", cealist.inspect.signature(hook).parameters)
+
+    def test2(self) -> None:
+        """
+        Test that the session does not reach the wire.
+
+        It is a database connection, not anything about the run, and dumping
+        it cost every task event a few hundred values of SQLAlchemy.
+        """
+
+        class Session:
+            """Stands in for the scheduler's SQLAlchemy session."""
+
+            def __init__(self) -> None:
+                self.bind = "Engine(postgresql://localhost/airflow)"
+                self.identity_map = {"rows": "many"}
+
+        recorder = _Recorder()
+        cls = cealist.build_listener_class(_FAILED_SPEC)
+        listener = cls(emitter=recorder)
+        hook = getattr(listener, "on_task_instance_failed")
+        hook(None, "TI", None, Session())
+        payload = recorder.sent[0]["payload"]
+        self.assertNotIn("session", payload)
+        self.assertIn("task_instance", payload)
+
+
+# #############################################################################
+# Test_listener_dag_run1
+# #############################################################################
+
+
+class Test_listener_dag_run1(unittest.TestCase):
+    """
+    Test that a task event names the run it belongs to on Airflow 3.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the run is taken from the server context and spliced in.
+
+        Airflow 3 hands the hook a `RuntimeTaskInstance` with no dag run of
+        its own, so the run's type, data interval and logical date were
+        nowhere in the payload and the receiver could build nothing.
+        """
+
+        class DagRun:
+            """Stands in for the run the API server described."""
+
+            def __init__(self) -> None:
+                self.run_id = "manual__2026-09-11"
+                self.run_type = "manual"
+                self.logical_date = "2026-09-11T00:00:00+00:00"
+
+        class ServerContext:
+            """Stands in for a TIRunContext."""
+
+            def __init__(self) -> None:
+                self.dag_run = DagRun()
+
+        class RuntimeTaskInstance:
+            """Stands in for the Airflow 3 task instance."""
+
+            def __init__(self) -> None:
+                self.task_id = "load"
+                self.run_id = "manual__2026-09-11"
+                # Airflow 3 keeps this in `__pydantic_private__`; a plain
+                # private attribute is the same lookup.
+                self._ti_context_from_server = ServerContext()
+
+        recorder = _Recorder()
+        cls = cealist.build_listener_class(_FAILED_SPEC)
+        listener = cls(emitter=recorder)
+        hook = getattr(listener, "on_task_instance_failed")
+        hook(None, RuntimeTaskInstance(), None, None)
+        dag_run = recorder.sent[0]["payload"]["task_instance"]["dag_run"]
+        self.assertEqual(dag_run["run_type"], "manual")
+        self.assertEqual(dag_run["run_id"], "manual__2026-09-11")
+
+    def test2(self) -> None:
+        """
+        Test that a pydantic-style private attribute is found too.
+        """
+
+        class Held:
+            """Stands in for a pydantic model's private storage."""
+
+            def __init__(self, dag_run: Any) -> None:
+                self.__pydantic_private__ = {"_context": dag_run}
+
+        class Context:
+            """Stands in for the server context."""
+
+            dag_run = {"run_id": "scheduled__1"}
+
+        self.assertEqual(
+            cealist.find_dag_run(Held(Context())), {"run_id": "scheduled__1"}
+        )
+
+    def test3(self) -> None:
+        """
+        Test that Airflow 2's own dag run is left exactly as it was.
+        """
+
+        class TaskInstance:
+            """Stands in for the Airflow 2 task instance."""
+
+            def __init__(self) -> None:
+                self.dag_run = {
+                    "run_id": "scheduled__2",
+                    "run_type": "scheduled",
+                }
+
+        payload = cealist.shape({"task_instance": TaskInstance()})
+        self.assertEqual(
+            payload["task_instance"]["dag_run"],
+            {"run_id": "scheduled__2", "run_type": "scheduled"},
+        )
+
+    def test4(self) -> None:
+        """
+        Test that a task instance exposing no run at all is still sent.
+        """
+        payload = cealist.shape({"task_instance": "TI", "previous_state": None})
+        self.assertEqual(payload["task_instance"], "TI")
