@@ -302,8 +302,29 @@ class StackCase(unittest.TestCase):
             )
             self.assertTrue(observation["client_version"], observation)
             self.assertNotIn("workspace", observation)
+            self._assert_strict_json(observation)
         rejected = self.stack.received()["rejected"]
         self.assertEqual(rejected, [], "the receiver refused a key")
+
+    def _assert_strict_json(self, observation: Observation) -> None:
+        """
+        Check the observation is JSON a strict parser will take.
+
+        Python writes a non-finite float as the bare literal `NaN`,
+        `Infinity` or `-Infinity` and reads it back happily, so this
+        receiver would never notice. The real one is Java, and Jackson
+        refuses the request, which loses every observation in the batch.
+
+        :param observation: one envelope the receiver recorded
+        :return: nothing
+        """
+        try:
+            json.dumps(observation, allow_nan=False)
+        except ValueError as exc:
+            self.fail(
+                f"{observation.get('tool')}/{observation.get('event')} "
+                f"carries a number JSON cannot hold: {exc}"
+            )
 
 
 def events(observations: List[Observation]) -> List[str]:

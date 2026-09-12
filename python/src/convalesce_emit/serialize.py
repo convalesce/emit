@@ -22,6 +22,7 @@ import dataclasses
 import enum
 import io
 import logging
+import math
 import threading
 import types
 from typing import Any, Dict, Optional, Set, Tuple
@@ -69,6 +70,13 @@ _SKIP_NAMES = frozenset(
         "stream",
     }
 )
+
+# Names that mean a frame wherever they appear, for a frame this walker
+# cannot measure: no shape, no schema. Checked by name as well as by shape
+# because a frame's own `to_dict` returns every row and its `__str__` prints
+# them, so neither may be reached. Only unambiguous names belong here: a key
+# called `rows` is usually a row count.
+_DATA_NAMES = frozenset({"dataframe", "data_frame", "df"})
 
 # Values that are plumbing wherever they appear.
 _SKIP_TYPES: Tuple[type, ...] = (
@@ -130,8 +138,12 @@ def dump(  # pylint: disable=too-many-return-statements
     """
     if budget is None:
         budget = _Budget()
-    if obj is None or isinstance(obj, (bool, int, float)):
+    if obj is None or isinstance(obj, (bool, int)):
         return obj
+    if isinstance(obj, float):
+        # JSON has no NaN or Infinity. Python writes them anyway and a strict
+        # parser refuses the batch, which loses every observation in it.
+        return obj if math.isfinite(obj) else None
     if isinstance(obj, str):
         return (
             obj
@@ -143,6 +155,8 @@ def dump(  # pylint: disable=too-many-return-statements
         return dump(obj.value, budget=budget, depth=depth)
     if isinstance(obj, _SKIP_TYPES):
         return _describe(obj)
+    if _is_bulk_data(obj):
+        return _describe_bulk_data(obj)
     if not budget.spend():
         return "...(truncated: size limit)"
     if isinstance(obj, (list, tuple, set, frozenset)) and not _is_namedtuple(
@@ -203,6 +217,9 @@ def _dump_container(obj: Any, budget: _Budget, depth: int) -> Any:
                 ):
                     public[exposed] = _dump_property(obj, exposed, budget, nxt)
                 continue
+            if name.lower() in _DATA_NAMES and not _is_scalar(value):
+                public[name] = _describe_bulk_data(value)
+                continue
             public[name] = dump(value, budget=budget, depth=nxt)
         # An empty mapping tells the receiver nothing; the object's own
         # description at least names what it was.
@@ -225,7 +242,11 @@ def _dump_mapping(obj: Dict[Any, Any], budget: _Budget, depth: int) -> Any:
         # Keys are whatever the tool used; JSON wants strings. A Great
         # Expectations checkpoint keys its results by identifier objects.
         name = key if isinstance(key, str) else _describe(key)
-        if name.lower() in _SKIP_NAMES:
+        lowered = name.lower()
+        if lowered in _SKIP_NAMES:
+            continue
+        if lowered in _DATA_NAMES and not _is_scalar(value):
+            out[name] = _describe_bulk_data(value)
             continue
         out[name] = dump(value, budget=budget, depth=depth)
     return out
@@ -269,6 +290,50 @@ def _dump_property(obj: Any, name: str, budget: _Budget, depth: int) -> Any:
         # business; the rest of the object is still worth having.
         return f"<{name}: unreadable>"
     return dump(value, budget=budget, depth=depth)
+
+
+def _is_scalar(obj: Any) -> bool:
+    """
+    Tell a value that is already JSON from one that has to be walked.
+
+    :param obj: the value being walked
+    :return: whether it needs no walking
+    """
+    return obj is None or isinstance(obj, _SCALARS)
+
+
+def _is_bulk_data(obj: Any) -> bool:
+    """
+    Tell a table of the customer's data from metadata about one.
+
+    Array-like rather than by module, so pandas, polars, numpy, pyarrow and
+    Spark are all caught without importing any of them, and a pandas
+    timestamp or a numpy number is not.
+
+    :param obj: the value being walked
+    :return: whether it holds data values
+    """
+    shape = getattr(obj, "shape", None)
+    if isinstance(shape, tuple) and shape:
+        return all(isinstance(size, int) for size in shape)
+    # A Spark frame has no shape; it does have a schema.
+    return hasattr(obj, "columns") and hasattr(obj, "dtypes")
+
+
+def _describe_bulk_data(obj: Any) -> str:
+    """
+    Name a table without disclosing a single value of it.
+
+    Not `_describe`: a frame's `__str__` prints its rows.
+
+    :param obj: the frame, series, array or table
+    :return: its type and, where it has one, its shape
+    """
+    name = type(obj).__name__
+    shape = getattr(obj, "shape", None)
+    if isinstance(shape, tuple) and all(isinstance(size, int) for size in shape):
+        return f"<{name} {list(shape)}>"
+    return f"<{name}>"
 
 
 def _describe(obj: Any) -> str:

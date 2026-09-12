@@ -424,3 +424,155 @@ class Test_dump_keys1(unittest.TestCase):
 
         out = ceserial.dump({"result_format": Format.SUMMARY})
         self.assertEqual(out, {"result_format": "SUMMARY"})
+
+
+# #############################################################################
+# Test_dump_bulk_data1
+# #############################################################################
+
+
+class Test_dump_bulk_data1(unittest.TestCase):
+    """
+    Test that the customer's rows cannot reach the wire.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a frame is named by its shape, never opened.
+
+        A frame answers to `to_dict`, which returns every row, and its
+        `__str__` prints rows too. The Great Expectations 0.x action is
+        handed a validator, and the frame it validated is four objects away
+        through the data context.
+        """
+
+        class Frame:
+            """Stands in for a pandas DataFrame."""
+
+            shape = (4, 2)
+
+            def to_dict(self) -> Any:
+                """Return every row, the way pandas does."""
+                return {"email": {"0": "alice@example.com"}}
+
+            def __str__(self) -> str:
+                return "0  alice@example.com\\n1  bob@example.com"
+
+        class Engine:
+            """Stands in for an execution engine holding the batch."""
+
+            def __init__(self) -> None:
+                self.batch_cache = {"orders": {"data": Frame()}}
+
+        class Validator:
+            """Stands in for a GX validator."""
+
+            def __init__(self) -> None:
+                self.interactive_evaluation = True
+                self.execution_engine = Engine()
+
+        out = ceserial.dump({"data_asset": Validator()})
+        text = json.dumps(out)
+        self.assertNotIn("alice@example.com", text)
+        self.assertIn("Frame [4, 2]", text)
+
+    def test2(self) -> None:
+        """
+        Test that a frame under a telling name is named too.
+
+        A Spark or polars frame has no shape; the key it sits under says
+        what it is either way.
+        """
+
+        class Opaque:
+            """Stands in for a frame this walker cannot measure."""
+
+            def to_dict(self) -> Any:
+                """Return every row."""
+                return {"email": ["carol@example.com"]}
+
+        out = ceserial.dump({"dataframe": Opaque(), "df": Opaque()})
+        text = json.dumps(out)
+        self.assertNotIn("carol@example.com", text)
+        self.assertEqual(out["dataframe"], "<Opaque>")
+        self.assertEqual(out["df"], "<Opaque>")
+
+    def test2b(self) -> None:
+        """
+        Test that a row count is still a number.
+
+        Only a frame is a frame: a key that names one carrying a scalar is
+        a count, and blocking it would lose what detection reads.
+        """
+        out = ceserial.dump({"rows": 42, "df": None, "dataframe": "orders"})
+        self.assertEqual(out["rows"], 42)
+        self.assertIsNone(out["df"])
+        self.assertEqual(out["dataframe"], "orders")
+
+    def test3(self) -> None:
+        """
+        Test that a frame-shaped object with a schema is caught by it.
+        """
+
+        class SparkFrame:
+            """Stands in for a Spark DataFrame."""
+
+            columns = ["email", "amount"]
+            dtypes = [("email", "string"), ("amount", "int")]
+
+            def to_dict(self) -> Any:
+                """A Spark frame has no to_dict; a polars one does."""
+                return {"email": ["dave@example.com"]}
+
+        out = ceserial.dump({"batch": SparkFrame()})
+        self.assertEqual(out["batch"], "<SparkFrame>")
+
+    def test4(self) -> None:
+        """
+        Test that a zero-dimensional value is still a number.
+
+        A numpy scalar is what a count or an observed value arrives as.
+        """
+
+        class Count:
+            """Stands in for a numpy int64."""
+
+            shape = ()
+
+            def __init__(self, value: int) -> None:
+                self.value = value
+
+        out = ceserial.dump({"element_count": Count(4)})
+        self.assertEqual(out["element_count"], {"value": 4})
+
+
+# #############################################################################
+# Test_dump_non_finite1
+# #############################################################################
+
+
+class Test_dump_non_finite1(unittest.TestCase):
+    """
+    Test that a number JSON cannot carry becomes null.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that NaN and the infinities cross as null.
+
+        Python writes them as bare literals, which a strict parser refuses,
+        and the refusal loses every observation in the batch.
+        """
+        out = ceserial.dump(
+            {
+                "duration": float("nan"),
+                "percent": float("inf"),
+                "drift": float("-inf"),
+                "rows": 4.5,
+            }
+        )
+        self.assertIsNone(out["duration"])
+        self.assertIsNone(out["percent"])
+        self.assertIsNone(out["drift"])
+        self.assertEqual(out["rows"], 4.5)
+        self.assertNotIn("NaN", json.dumps(out))
