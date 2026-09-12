@@ -56,6 +56,9 @@ class Config:
 
     :param endpoint: base URL to post observations to
     :param ingest_key: write-only key a pipeline presents; never logged
+    :param api_key: the api-scoped key the gate endpoint requires; a
+        different key from `ingest_key`, never logged. Only the blocking
+        operator (`convalesce_emit.gate`) reads this
     :param timeout: seconds to wait on a single request
     :param max_retries: attempts after the first, for transient failures
     :param batch_size: observations to hold before sending
@@ -66,6 +69,7 @@ class Config:
 
     endpoint: str = DEFAULT_ENDPOINT
     ingest_key: Optional[str] = None
+    api_key: Optional[str] = None
     timeout: float = DEFAULT_TIMEOUT
     max_retries: int = DEFAULT_MAX_RETRIES
     batch_size: int = DEFAULT_BATCH_SIZE
@@ -85,6 +89,7 @@ class Config:
         config = cls(
             endpoint=_read_str("CONVALESCE_ENDPOINT") or DEFAULT_ENDPOINT,
             ingest_key=_read_str("CONVALESCE_INGEST_KEY"),
+            api_key=_read_str("CONVALESCE_API_KEY"),
             timeout=_read_num("CONVALESCE_TIMEOUT", DEFAULT_TIMEOUT),
             max_retries=int(
                 _read_num("CONVALESCE_MAX_RETRIES", DEFAULT_MAX_RETRIES)
