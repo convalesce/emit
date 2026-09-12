@@ -27,6 +27,19 @@ import org.apache.spark.scheduler.SparkListenerTaskEnd;
  * through 4.x and both Scala builds: the only Spark types touched are the event classes themselves
  * and {@code JsonProtocol}, and none of them are Scala-version-specific in signature.
  *
+ * <p>Two things are decided here rather than forwarded blindly.
+ *
+ * <p><b>Which events.</b> A run is described by the application, the jobs and the SQL executions
+ * starting and ending. Task and stage events describe the inside of a job: one per task, about 190
+ * values each, so a job with ten thousand tasks was ten thousand observations that no receiver
+ * read. Those, and the adaptive plan updates, are sent only when {@code CONVALESCE_SPARK_EVENTS}
+ * asks for them.
+ *
+ * <p><b>Which application.</b> Only the application-start event and a job's properties name the
+ * application, so a job end, an application end or a SQL execution said nothing about which driver
+ * it came from, and a receiver seeing two drivers at once had to guess. The id is remembered from
+ * whichever event names it and stamped on every event that does not.
+ *
  * <p>Nothing may escape into the customer's job. Every override wraps its body, and a failure to
  * emit is logged and dropped.
  */
@@ -37,6 +50,10 @@ public class ConvalesceSparkListener extends SparkListener {
 
   private final Emitter emitter;
   private final String sparkVersion;
+  private final SparkEvents events = SparkEvents.fromEnvironment();
+  // Written by the listener bus thread and read by it; volatile so a later event on another
+  // thread, which Spark does not promise against, still sees it.
+  private volatile String appId;
 
   /** Built by Spark when no constructor takes a SparkConf. */
   public ConvalesceSparkListener() {
@@ -102,6 +119,11 @@ public class ConvalesceSparkListener extends SparkListener {
     forward(event);
   }
 
+  /** The application this listener is reporting on, once anything has named it. */
+  String applicationId() {
+    return appId;
+  }
+
   /**
    * Everything Spark does not have a dedicated callback for.
    *
@@ -115,15 +137,34 @@ public class ConvalesceSparkListener extends SparkListener {
 
   private void forward(SparkListenerEvent event) {
     try {
+      String name = event.getClass().getSimpleName();
+      if (!events.wanted(name)) {
+        return;
+      }
       String json = SparkEventJson.toJson(event);
       if (json == null) {
         return;
       }
-      emitter.emit(TOOL, event.getClass().getSimpleName(), json, sparkVersion);
+      json = SparkEventJson.withAppId(json, remember(json));
+      emitter.emit(TOOL, name, json, sparkVersion);
     } catch (Throwable t) {
       // A job must not fail because we could not report on it.
       LOG.warning("convalesce: could not emit an event: " + t.getMessage());
     }
+  }
+
+  /**
+   * Keeps the application id from whichever event names it.
+   *
+   * @param json the event as Spark rendered it
+   * @return the id to stamp on this event, or null when none is known yet
+   */
+  private String remember(String json) {
+    String found = SparkEventJson.readAppId(json);
+    if (found != null) {
+      appId = found;
+    }
+    return appId;
   }
 
   private static String readSparkVersion() {

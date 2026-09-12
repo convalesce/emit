@@ -24,7 +24,8 @@ Set these on the worker; no code changes are needed.
 | `CONVALESCE_ENDPOINT` | `https://api.convalesce.io` | |
 | `CONVALESCE_DRY_RUN` | `false` | build envelopes, log them, send nothing |
 | `CONVALESCE_ENABLED` | `true` | set `false` to switch off entirely |
-| `CONVALESCE_BATCH_SIZE` | `50` | |
+| `CONVALESCE_BATCH_SIZE` | `50` | observations per request |
+| `CONVALESCE_MAX_BODY_BYTES` | `1000000` | a batch is sent before the body would pass this |
 | `CONVALESCE_MAX_RETRIES` | `3` | |
 | `CONVALESCE_TIMEOUT` | `10` | seconds |
 

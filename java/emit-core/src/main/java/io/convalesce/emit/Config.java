@@ -25,12 +25,16 @@ public final class Config {
   // Fifty keeps a busy driver to roughly one request a second while staying small enough that a
   // lost batch costs little.
   private static final int DEFAULT_BATCH_SIZE = 50;
+  // The receiver refuses a request body above one megabyte, and refuses it whole, so a batch is
+  // closed before it would reach that.
+  private static final int DEFAULT_MAX_BODY_BYTES = 1_000_000;
 
   private final String endpoint;
   private final String ingestKey;
   private final int timeoutMs;
   private final int maxRetries;
   private final int batchSize;
+  private final int maxBodyBytes;
   private final boolean dryRun;
   private final boolean enabled;
 
@@ -40,6 +44,7 @@ public final class Config {
       int timeoutMs,
       int maxRetries,
       int batchSize,
+      int maxBodyBytes,
       boolean dryRun,
       boolean enabled) {
     this.endpoint = endpoint;
@@ -47,6 +52,7 @@ public final class Config {
     this.timeoutMs = timeoutMs;
     this.maxRetries = maxRetries;
     this.batchSize = batchSize;
+    this.maxBodyBytes = maxBodyBytes;
     this.dryRun = dryRun;
     this.enabled = enabled;
   }
@@ -63,6 +69,7 @@ public final class Config {
         readInt("CONVALESCE_TIMEOUT", DEFAULT_TIMEOUT_MS / 1000) * 1000,
         readInt("CONVALESCE_MAX_RETRIES", DEFAULT_MAX_RETRIES),
         readInt("CONVALESCE_BATCH_SIZE", DEFAULT_BATCH_SIZE),
+        readInt("CONVALESCE_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
         readBoolean("CONVALESCE_DRY_RUN", false),
         readBoolean("CONVALESCE_ENABLED", true));
   }
@@ -77,7 +84,23 @@ public final class Config {
    * @return the configuration
    */
   public static Config of(String endpoint, String ingestKey, int batchSize, int maxRetries) {
-    return new Config(endpoint, ingestKey, DEFAULT_TIMEOUT_MS, maxRetries, batchSize, false, true);
+    return of(endpoint, ingestKey, batchSize, maxRetries, DEFAULT_MAX_BODY_BYTES);
+  }
+
+  /**
+   * Builds a configuration directly, naming the receiver's body limit too.
+   *
+   * @param endpoint base URL to post observations to
+   * @param ingestKey write-only key a job presents; never logged
+   * @param batchSize observations to hold before sending
+   * @param maxRetries attempts after the first, for transient failures
+   * @param maxBodyBytes encoded size a batch is sent before reaching
+   * @return the configuration
+   */
+  public static Config of(
+      String endpoint, String ingestKey, int batchSize, int maxRetries, int maxBodyBytes) {
+    return new Config(
+        endpoint, ingestKey, DEFAULT_TIMEOUT_MS, maxRetries, batchSize, maxBodyBytes, false, true);
   }
 
   /**
@@ -118,6 +141,10 @@ public final class Config {
 
   public int batchSize() {
     return batchSize;
+  }
+
+  public int maxBodyBytes() {
+    return maxBodyBytes;
   }
 
   public boolean dryRun() {

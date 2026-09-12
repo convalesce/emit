@@ -36,6 +36,9 @@ _LOG = logging.getLogger(__name__)
 RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 _OBSERVATIONS_PATH = "/v1/observations"
+# What wrapping a batch costs on the wire, beyond the observations and the
+# commas between them: `{"observations":[` and `]}`.
+_BODY_OVERHEAD = len(b'{"observations":[]}')
 # Caps the backoff so a long outage does not park a worker thread for
 # minutes at a time.
 _MAX_BACKOFF_SECONDS = 30
@@ -59,6 +62,7 @@ class Emitter:
         self.config.validate()
         self._lock = threading.Lock()
         self._batch: List[ceenvelo.Observation] = []
+        self._batch_bytes = 0
 
     def __enter__(self) -> "Emitter":
         return self
@@ -77,6 +81,11 @@ class Emitter:
         """
         Queue one observation, sending the batch when it is full.
 
+        Full by count or by size: the receiver refuses a body above its
+        limit whole, so an observation that would push the batch past it
+        goes into the next batch, and one that is over the limit on its own
+        is sent on its own, so at worst one is refused rather than fifty.
+
         :param tool: which tool produced this
         :param event: which callback fired
         :param payload: the tool's own output, untouched
@@ -91,9 +100,31 @@ class Emitter:
             payload=payload,
             tool_version=tool_version,
         )
+        size = len(_encode(observation))
+        if size + _BODY_OVERHEAD > self.config.max_body_bytes:
+            _LOG.warning(
+                "convalesce: %s/%s is %d bytes, above the receiver's limit "
+                "of %d; sending it alone and it may be refused",
+                tool,
+                event,
+                size,
+                self.config.max_body_bytes,
+            )
         with self._lock:
+            # A comma per observation joins them in the body.
+            projected = (
+                self._batch_bytes + size + len(self._batch) + _BODY_OVERHEAD
+            )
+            if self._batch and projected > self.config.max_body_bytes:
+                batch, self._batch = self._batch, []
+                self._batch_bytes = 0
+            else:
+                batch = []
             self._batch.append(observation)
+            self._batch_bytes += size
             ready = len(self._batch) >= self.config.batch_size
+        if batch:
+            self._send(batch)
         if ready:
             self.flush()
 
@@ -105,6 +136,16 @@ class Emitter:
         """
         with self._lock:
             batch, self._batch = self._batch, []
+            self._batch_bytes = 0
+        self._send(batch)
+
+    def _send(self, batch: List[ceenvelo.Observation]) -> None:
+        """
+        Send one batch, logging rather than raising on failure.
+
+        :param batch: observations to deliver; nothing is sent for none
+        :return: nothing
+        """
         if not batch:
             return
         if self.config.dry_run:
@@ -139,8 +180,11 @@ class Emitter:
         :return: nothing
         :raises TransportError: if every attempt failed
         """
-        payload = {"observations": [obs.to_dict() for obs in batch]}
-        body = json.dumps(payload, default=str).encode("utf-8")
+        body = (
+            b'{"observations":['
+            + b",".join(_encode(obs) for obs in batch)
+            + b"]}"
+        )
         url = self.config.endpoint.rstrip("/") + _OBSERVATIONS_PATH
         for attempt in range(self.config.max_retries + 1):
             try:
@@ -190,6 +234,18 @@ class Emitter:
             raise ceerrors.TransportError(
                 f"could not reach {url}: {exc.reason}"
             ) from exc
+
+
+def _encode(observation: ceenvelo.Observation) -> bytes:
+    """
+    Encode one observation the way it goes on the wire.
+
+    :param observation: the observation to encode
+    :return: its JSON, as bytes
+    """
+    return json.dumps(
+        observation.to_dict(), default=str, separators=(",", ":")
+    ).encode("utf-8")
 
 
 def send_one(

@@ -53,6 +53,42 @@ class Test_prefect1(e2eharn.StackCase):
             _LOG.info("flow states: %s", states)
             self.assertTrue(any("COMPLETED" in s for s in states), states)
             self.assertTrue(any("FAILED" in s for s in states), states)
+            self._assert_task_runs_name_their_flow(observations)
+
+    def _assert_task_runs_name_their_flow(
+        self, observations: List[e2eharn.Observation]
+    ) -> None:
+        """
+        Check a task event says which flow and which run it belongs to.
+
+        A task run names its flow run by id and nothing else, and the flow
+        hook that carries the name fires last, after every task hook, so a
+        receiver had to hold task runs back until the flow arrived.
+
+        :param observations: what the receiver recorded
+        :return: nothing
+        """
+        seen = 0
+        for observation in observations:
+            if observation["event"] != "task_run":
+                continue
+            payload = observation["payload"]
+            flow = payload.get("flow")
+            self.assertIsInstance(
+                flow, dict, f"no flow on a task run: {sorted(payload)}"
+            )
+            self.assertTrue(flow.get("name"), flow)
+            flow_run = payload.get("flow_run")
+            self.assertIsInstance(
+                flow_run, dict, f"no flow run on a task run: {sorted(payload)}"
+            )
+            self.assertTrue(flow_run.get("name"), flow_run)
+            # The run it names must be the one the task run points at.
+            self.assertEqual(
+                flow_run.get("id"), payload["task_run"].get("flow_run_id")
+            )
+            seen += 1
+        self.assertTrue(seen, "no task runs arrived")
 
     @staticmethod
     def _all_four(observations: List[e2eharn.Observation]) -> bool:
