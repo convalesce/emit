@@ -14,6 +14,7 @@ Import as:
 import convalesce_emit.client as ceclient
 """
 
+import gzip
 import json
 import logging
 import random
@@ -189,10 +190,15 @@ class Emitter:
             + b",".join(_encode(obs) for obs in batch)
             + b"]}"
         )
+        # Whole-payload forwarding means a batch is bigger than it used to
+        # be; gzip is what keeps the wire cost from growing at the same
+        # rate. The receiver decides its size cap against the decompressed
+        # bytes, not these, so the local batching above is unaffected.
+        compressed = gzip.compress(body)
         url = self.config.endpoint.rstrip("/") + _OBSERVATIONS_PATH
         for attempt in range(self.config.max_retries + 1):
             try:
-                self._attempt(url, body)
+                self._attempt(url, compressed)
                 return
             except ceerrors.TransportError as exc:
                 retryable = exc.status is None or exc.status in RETRYABLE_STATUS
@@ -209,7 +215,7 @@ class Emitter:
         Make one HTTP request.
 
         :param url: where to post
-        :param body: the encoded batch
+        :param body: the gzip-compressed batch
         :return: nothing
         :raises TransportError: on any HTTP or connection failure
         """
@@ -218,6 +224,7 @@ class Emitter:
         # claim sitting next to the credential that actually proves it.
         headers: Dict[str, str] = {
             "Content-Type": "application/json",
+            "Content-Encoding": "gzip",
             "Authorization": f"Bearer {self.config.ingest_key}",
             "User-Agent": f"convalesce-emit/{ceversio.__version__}",
         }

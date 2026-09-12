@@ -8,6 +8,7 @@ would test nothing.
 Run with `make test`.
 """
 
+import gzip
 import http.server
 import json
 import logging
@@ -39,12 +40,16 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
 
     received: List[Dict[str, Any]] = []
     headers_seen: List[Dict[str, str]] = []
+    raw_bodies: List[bytes] = []
     status = 200
 
     def do_POST(self) -> None:  # pylint: disable=invalid-name
         """Record one request and answer with the configured status."""
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
+        type(self).raw_bodies.append(body)
+        if self.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
         type(self).received.append(json.loads(body))
         type(self).headers_seen.append(dict(self.headers))
         self.send_response(type(self).status)
@@ -67,6 +72,7 @@ class _ServerCase(unittest.TestCase):
     def setUp(self) -> None:
         _Recorder.received = []
         _Recorder.headers_seen = []
+        _Recorder.raw_bodies = []
         _Recorder.status = 200
         self._httpd = http.server.HTTPServer(("127.0.0.1", 0), _Recorder)
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
@@ -163,6 +169,26 @@ class Test_emitter_wire1(_ServerCase):
         emitter.emit(tool="airflow", event="e", payload={})
         emitter.close()
         self.assertEqual(len(self._sent()), 1)
+
+    def test5(self) -> None:
+        """
+        Test that the request body is actually gzip-compressed on the wire.
+
+        Whole-payload forwarding makes a batch bigger than it used to be;
+        gzip is what keeps that from costing the same on the wire. The
+        header alone would not prove it -- the bytes must actually be
+        smaller and actually be gzip.
+        """
+        payload = {"sql": "select * from orders " * 200}
+        with self._emitter() as emitter:
+            emitter.emit(tool="airflow", event="e", payload=payload)
+        self.assertEqual(_Recorder.headers_seen[0]["Content-Encoding"], "gzip")
+        raw = _Recorder.raw_bodies[0]
+        uncompressed = json.dumps(self._sent()).encode("utf-8")
+        self.assertLess(len(raw), len(uncompressed))
+        # gzip.decompress in do_POST already proved these bytes are valid
+        # gzip; this is the same check made explicit at the test level.
+        self.assertEqual(raw[:2], b"\x1f\x8b")
 
 
 # #############################################################################
