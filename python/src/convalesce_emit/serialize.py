@@ -216,6 +216,7 @@ def _dump_container(obj: Any, budget: _Budget, depth: int) -> Any:
                 if (
                     exposed
                     and exposed not in data
+                    and exposed.lower() not in _SKIP_NAMES
                     and _has_property(obj, exposed)
                 ):
                     public[exposed] = _dump_property(obj, exposed, budget, nxt)

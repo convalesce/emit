@@ -347,6 +347,37 @@ class Test_dump_property1(unittest.TestCase):
 
     def test2(self) -> None:
         """
+        Test that a skipped name stays skipped when it is a property.
+
+        Airflow's task instance keeps its logger in `_log` behind a `log`
+        property, and reading the property put a live logger back into the
+        payload that the skip list exists to keep out.
+        """
+
+        class TaskInstance:
+            """Stands in for an Airflow task instance."""
+
+            def __init__(self) -> None:
+                self._log = logging.getLogger("airflow.task")
+                self._state = "failed"
+
+            @property
+            def log(self) -> Any:
+                """The task's logger."""
+                return self._log
+
+            @property
+            def state(self) -> str:
+                """The task's state."""
+                return self._state
+
+        out = ceserial.dump(TaskInstance())
+        self.assertEqual(out["state"], "failed")
+        self.assertNotIn("log", out)
+        self.assertNotIn("_log", out)
+
+    def test3(self) -> None:
+        """
         Test that a property that raises does not stop the object.
         """
 
