@@ -20,7 +20,7 @@ import convalesce_emit.redact as ceredact
 """
 
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, FrozenSet, List, Tuple
 
 _LOG = logging.getLogger(__name__)
 
@@ -44,7 +44,10 @@ SAMPLE_KEYS = frozenset(
 
 
 def redact_samples(
-    payload: Any, *, path: str = ""
+    payload: Any,
+    *,
+    path: str = "",
+    extra_keys: FrozenSet[str] = frozenset(),
 ) -> Tuple[Any, List[Dict[str, str]]]:
     """
     Replace sample data values with their counts.
@@ -56,20 +59,28 @@ def redact_samples(
     :param payload: the tool's output, possibly carrying row values
     :param path: dotted path of `payload` from the envelope root, so a
         redaction made anywhere but the top can still be placed
+    :param extra_keys: names to redact on top of `SAMPLE_KEYS`, additive and
+        scoped to this call -- a caller with its own author-written free-text
+        surface (Dagster's materialisation metadata, say) names it here
+        rather than widening what every other caller redacts too
     :return: the same shape, with sample lists summarised, and what was
         redacted, by path and reason
     """
+    keys = SAMPLE_KEYS | extra_keys
     excluded: List[Dict[str, str]] = []
-    redacted = _walk(payload, path, excluded)
+    redacted = _walk(payload, path, keys, excluded)
     return redacted, excluded
 
 
-def _walk(payload: Any, path: str, excluded: List[Dict[str, str]]) -> Any:
+def _walk(
+    payload: Any, path: str, keys: FrozenSet[str], excluded: List[Dict[str, str]]
+) -> Any:
     """
     Recurse through one value, redacting sample keys as they are found.
 
     :param payload: the value being walked
     :param path: dotted path of `payload` from the envelope root
+    :param keys: names that mean a sample wherever they occur
     :param excluded: accumulator every redaction is appended to
     :return: the same shape, with sample lists summarised
     """
@@ -77,17 +88,17 @@ def _walk(payload: Any, path: str, excluded: List[Dict[str, str]]) -> Any:
         out: Dict[str, Any] = {}
         for key, value in payload.items():
             child_path = f"{path}.{key}" if path else str(key)
-            if key in SAMPLE_KEYS:
+            if key in keys:
                 out[key] = _summarise(value)
                 excluded.append(
                     {"path": child_path, "reason": "sample redacted"}
                 )
             else:
-                out[key] = _walk(value, child_path, excluded)
+                out[key] = _walk(value, child_path, keys, excluded)
         return out
     if isinstance(payload, list):
         return [
-            _walk(item, f"{path}[{i}]", excluded)
+            _walk(item, f"{path}[{i}]", keys, excluded)
             for i, item in enumerate(payload)
         ]
     return payload

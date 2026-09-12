@@ -125,3 +125,38 @@ class Test_redact_excluded1(unittest.TestCase):
             {entry["path"] for entry in excluded},
             {"unexpected_list", "unexpected_index_list"},
         )
+
+
+# #############################################################################
+# Test_redact_extra_keys1
+# #############################################################################
+
+
+class Test_redact_extra_keys1(unittest.TestCase):
+    """
+    Test that a caller can redact its own field names too, without widening
+    what every other caller redacts.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a name passed as `extra_keys` is redacted like a sample.
+        """
+        payload = {"metadata": {"note": "customer email: alice@x.com"}}
+        out, excluded = ceredact.redact_samples(
+            payload, extra_keys=frozenset({"metadata"})
+        )
+        self.assertEqual(out["metadata"], {"redacted": True, "count": 1})
+        self.assertEqual(
+            excluded, [{"path": "metadata", "reason": "sample redacted"}]
+        )
+
+    def test2(self) -> None:
+        """
+        Test that a name not passed as `extra_keys` is untouched -- the
+        default `SAMPLE_KEYS` set is not widened for every caller.
+        """
+        payload = {"metadata": {"row_count": 100}}
+        out, excluded = ceredact.redact_samples(payload)
+        self.assertEqual(out, payload)
+        self.assertEqual(excluded, [])
