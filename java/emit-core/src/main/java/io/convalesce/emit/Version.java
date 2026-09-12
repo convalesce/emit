@@ -4,7 +4,7 @@ package io.convalesce.emit;
 public final class Version {
 
   /** The released version of this artifact. */
-  public static final String VERSION = "0.1.0";
+  public static final String VERSION = "0.1.1";
 
   private Version() {}
 }

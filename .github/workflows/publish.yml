@@ -31,8 +31,12 @@ jobs:
       - id: tag
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       # Releases come from `release`, never from `main`: a tag that is not on
-      # that branch, or a manual run from any other branch, stops here.
+      # that branch stops here. A rehearsal is exempt, because its whole
+      # point is to build any ref and upload it to TestPyPI, and it cannot
+      # reach PyPI or Central: the `testpypi*` environments are the only
+      # ones it can claim credentials from.
       - name: The tag must be on the release branch
+        if: github.event_name == 'push'
         run: |
           git fetch --no-tags --depth=200 origin release
           if git merge-base --is-ancestor "$GITHUB_SHA" origin/release; then
@@ -53,6 +57,13 @@ jobs:
           done
           have=$(sed -n "s/^  version = '\(.*\)'/\1/p" java/build.gradle)
           echo "java/build.gradle: $have"
+          [ "$have" = "$want" ] || bad=1
+          # The jar reports this one on every observation it sends, as
+          # `client_version` and in the User-Agent, so a stale value here is
+          # a lie in the data rather than a mislabelled file.
+          java_version="java/emit-core/src/main/java/io/convalesce/emit/Version.java"
+          have=$(sed -n 's/.*String VERSION = "\(.*\)";/\1/p' "$java_version")
+          echo "$java_version: $have"
           [ "$have" = "$want" ] || bad=1
           test "$bad" = 0
 
