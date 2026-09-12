@@ -91,7 +91,9 @@ One release per tool covers its whole row: Airflow 2.5 to 3.0 in a single artifa
 Java 8 and 11 clusters, Great Expectations 0.x and 1.x behind one import.
 
 Each of those versions also runs for real in Docker, on its own scheduler, daemon or server,
-with an example workflow and a stand-in endpoint: see [`e2e/`](e2e).
+with an example workflow, against a real receiver: see
+[`collect/e2e-observe/`](../collect/e2e-observe) in the sibling `collect` checkout, which is
+where the integration tests live.
 
 Nothing here reads a field off a tool's object, so a renamed attribute is the
 receiver's problem rather than a reason to ship a second package. Where a
