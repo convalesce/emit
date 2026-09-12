@@ -196,6 +196,9 @@ def _dump_container(obj: Any, budget: _Budget, depth: int) -> Any:
     dumped = _try_dump_methods(obj, budget, depth)
     if dumped is not _UNSET:
         return dumped
+    fields = _dump_fields(obj, budget, nxt)
+    if fields is not _UNSET:
+        return fields
     data = getattr(obj, "__dict__", None)
     if isinstance(data, dict):
         public = {}
@@ -250,6 +253,40 @@ def _dump_mapping(obj: Dict[Any, Any], budget: _Budget, depth: int) -> Any:
             continue
         out[name] = dump(value, budget=budget, depth=depth)
     return out
+
+
+def _dump_fields(obj: Any, budget: _Budget, depth: int) -> Any:
+    """
+    Read an object that declares its own field names.
+
+    Namedtuples and Dagster's `@record` classes both carry `_fields`, and a
+    record keeps nothing in `__dict__`: a Dagster job snapshot walked by
+    attribute is empty, and its `_asdict` raises "Iteration is not allowed",
+    so without this the whole snapshot arrives as its repr.
+
+    :param obj: the object being walked
+    :param budget: remaining size allowance
+    :param depth: depth for the values
+    :return: the fields as a mapping, or `_UNSET` when there are none
+    """
+    fields = getattr(obj, "_fields", None)
+    if not isinstance(fields, tuple) or not fields:
+        return _UNSET
+    out = {}
+    for name in fields[:_MAX_ITEMS]:
+        if not isinstance(name, str) or name.lower() in _SKIP_NAMES:
+            continue
+        if name.lower() in _DATA_NAMES:
+            out[name] = _describe_bulk_data(getattr(obj, name, None))
+            continue
+        try:
+            value = getattr(obj, name)
+        except Exception:  # pylint: disable=broad-exception-caught
+            # A field that needs something the object no longer has.
+            out[name] = f"<{name}: unreadable>"
+            continue
+        out[name] = dump(value, budget=budget, depth=depth)
+    return out or _UNSET
 
 
 def _is_namedtuple(obj: Any) -> bool:
@@ -373,9 +410,10 @@ def _try_dump_methods(obj: Any, budget: _Budget, depth: int) -> Any:
         try:
             described = method()
         except Exception:  # pylint: disable=broad-exception-caught
-            # A tool's own serialiser failing is not our problem to solve;
-            # fall through and describe the object some other way.
-            break
+            # A tool's own serialiser failing is not ours to fix, and it is
+            # not a reason to stop trying: a Dagster record carries an
+            # `_asdict` that raises, and its fields are readable another way.
+            continue
         if isinstance(described, dict):
             return _dump_mapping(described, budget, depth + 1)
         return dump(described, budget=budget, depth=depth)
