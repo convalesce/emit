@@ -171,12 +171,16 @@ public final class Emitter {
       body.write(sending.get(i));
     }
     body.write(BODY_CLOSE.getBytes(UTF8));
-    byte[] bytes = body.toByteArray();
+    // Whole-payload forwarding means a batch is bigger than it used to be; gzip is what keeps the
+    // wire cost from growing at the same rate. The receiver decides its size cap against the
+    // decompressed bytes, so the batching above, sized off the uncompressed `bytes.length`, is
+    // unaffected.
+    byte[] compressed = gzip(body.toByteArray());
     String url = trimTrailingSlash(config.endpoint()) + OBSERVATIONS_PATH;
 
     for (int attempt = 0; attempt <= config.maxRetries(); attempt++) {
       try {
-        attempt(url, bytes);
+        attempt(url, compressed);
         return;
       } catch (TransportException e) {
         boolean retryable = e.status() == 0 || RETRYABLE_STATUS.contains(e.status());
@@ -201,6 +205,7 @@ public final class Emitter {
       // The key is the only thing here that says who is calling. No header
       // names an account.
       connection.setRequestProperty("Content-Type", "application/json");
+      connection.setRequestProperty("Content-Encoding", "gzip");
       connection.setRequestProperty("Authorization", "Bearer " + config.ingestKey());
       connection.setRequestProperty("User-Agent", "convalesce-emit-java/" + Version.VERSION);
       OutputStream out = connection.getOutputStream();
@@ -226,6 +231,17 @@ public final class Emitter {
 
   private static String trimTrailingSlash(String value) {
     return value.endsWith("/") ? value.substring(0, value.length() - 1) : value;
+  }
+
+  private static byte[] gzip(byte[] data) throws java.io.IOException {
+    java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(data.length);
+    java.util.zip.GZIPOutputStream zipped = new java.util.zip.GZIPOutputStream(out);
+    try {
+      zipped.write(data);
+    } finally {
+      zipped.close();
+    }
+    return out.toByteArray();
   }
 
   static {
