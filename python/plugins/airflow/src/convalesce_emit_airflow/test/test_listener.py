@@ -285,3 +285,61 @@ class Test_listener_dag_run1(unittest.TestCase):
         """
         payload = cealist.shape({"task_instance": "TI", "previous_state": None})
         self.assertEqual(payload["task_instance"], "TI")
+
+
+# #############################################################################
+# Test_listener_task_group1
+# #############################################################################
+
+
+class Test_listener_task_group1(unittest.TestCase):
+    """
+    Test that a task group is named rather than walked.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the group's copy of the DAG does not travel again.
+
+        A task group holds the DAG it belongs to, which the payload already
+        carries on the task and on the dag run, so it was 40% of a task
+        event and every byte of it a repeat.
+        """
+
+        class Group:
+            """Stands in for an Airflow task group."""
+
+            def __init__(self, dag: Any) -> None:
+                self.dag = dag
+                self.used_group_ids = ["extract", "load"]
+
+            def __str__(self) -> str:
+                return "<TaskGroup: demo_pipeline>"
+
+        class Task:
+            """Stands in for the operator the hook is about."""
+
+            def __init__(self) -> None:
+                self.task_id = "load"
+                self.dag = {"dag_id": "demo_pipeline", "description": "demo"}
+                self.task_group = Group(self.dag)
+
+        class TaskInstance:
+            """Stands in for the task instance Airflow passes."""
+
+            def __init__(self) -> None:
+                self.task_id = "load"
+                self.task = Task()
+                self.dag_run = {"run_id": "manual__1", "dag": self.task.dag}
+
+        recorder = _Recorder()
+        cls = cealist.build_listener_class(_FAILED_SPEC)
+        listener = cls(emitter=recorder)
+        hook = getattr(listener, "on_task_instance_failed")
+        hook(None, TaskInstance(), None, None)
+        task = recorder.sent[0]["payload"]["task_instance"]["task"]
+        self.assertEqual(task["task_group"], "<TaskGroup: demo_pipeline>")
+        # What the group held is still on the task and on the run.
+        self.assertEqual(task["dag"]["dag_id"], "demo_pipeline")
+        dag_run = recorder.sent[0]["payload"]["task_instance"]["dag_run"]
+        self.assertEqual(dag_run["dag"]["dag_id"], "demo_pipeline")
