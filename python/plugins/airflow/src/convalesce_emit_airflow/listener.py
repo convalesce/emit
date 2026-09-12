@@ -20,6 +20,17 @@ found only by registering with a real Airflow rather than by reading:
 So the implementations are generated from the hookspecs of the Airflow in
 this process: exactly the parameters it passes, forwarded whole.
 
+Two exceptions to "whole", both about what the hook's arguments are rather
+than about reading a tool's state:
+
+- Airflow 2 passes the ORM `session` the scheduler was using. It is a
+  database connection, not anything about the run, and dumping it costs
+  every task event a few hundred values of SQLAlchemy machinery.
+- Airflow 3 passes a task instance that carries no dag run, so the run's
+  type, data interval and logical date are nowhere in the payload. The run
+  is on the context the API server sent, and it is spliced in under the name
+  Airflow 2 puts it at, so a receiver has one path for both.
+
 Import as:
 
 import convalesce_emit_airflow.listener as cealist
@@ -29,7 +40,17 @@ import functools
 import importlib
 import inspect
 import logging
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Type
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+)
 
 import convalesce_emit as cemit
 
@@ -66,6 +87,11 @@ WANTED = (
     # Airflow 3 only; absent from 2.x, which the spec read handles.
     "on_task_instance_skipped",
 )
+
+# Hook arguments that are plumbing rather than anything about the run.
+# Declared to pluggy, because a hook missing a parameter Airflow passes is
+# rejected, and then left out of what is sent.
+_SKIP_ARGS = frozenset({"session"})
 
 # Used when the spec modules cannot be read; the shape these have carried
 # since the listener API landed in Airflow 2.5.
@@ -140,7 +166,7 @@ class _Base:
             emitter.emit(
                 tool=TOOL,
                 event=event,
-                payload={k: cemit.dump(v) for k, v in payload.items()},
+                payload=shape(payload),
                 tool_version=self._version,
             )
             # Sent now, not batched. Task hooks fire in a process Airflow
@@ -164,6 +190,69 @@ class _Base:
         """
         if self._emitter is not None:
             self._emitter.flush()
+
+
+def shape(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """
+    Dump what a hook was handed, minus plumbing, plus the dag run.
+
+    :param payload: the hook's own arguments
+    :return: what to send
+    """
+    out = {
+        name: cemit.dump(value)
+        for name, value in payload.items()
+        if name not in _SKIP_ARGS
+    }
+    task_instance = payload.get("task_instance")
+    dumped = out.get("task_instance")
+    if task_instance is None or not isinstance(dumped, dict):
+        return out
+    if dumped.get("dag_run") is None:
+        dag_run = find_dag_run(task_instance)
+        if dag_run is not None:
+            dumped["dag_run"] = cemit.dump(dag_run)
+    return out
+
+
+def find_dag_run(task_instance: Any) -> Any:
+    """
+    The dag run a task instance belongs to.
+
+    Airflow 2 hangs it on the task instance. Airflow 3 hands the hook a
+    `RuntimeTaskInstance`, which holds the context the API server sent in a
+    private attribute, and the run is on that. No attribute is named here
+    but `dag_run` itself: whichever private value exposes one is it, so a
+    rename inside Airflow cannot quietly drop the run.
+
+    :param task_instance: whatever the hook was handed
+    :return: the dag run, or None when the task instance exposes none
+    """
+    direct = getattr(task_instance, "dag_run", None)
+    if direct is not None:
+        return direct
+    for value in _private_values(task_instance):
+        dag_run = getattr(value, "dag_run", None)
+        if dag_run is not None:
+            return dag_run
+    return None
+
+
+def _private_values(obj: Any) -> List[Any]:
+    """
+    Everything the object keeps privately, pydantic models included.
+
+    :param obj: the object to look inside
+    :return: the private values, in no particular order
+    """
+    out: List[Any] = []
+    private = getattr(obj, "__pydantic_private__", None)
+    if isinstance(private, dict):
+        out.extend(private.values())
+    data = getattr(obj, "__dict__", None)
+    if isinstance(data, dict):
+        out.extend(value for name, value in data.items() if name.startswith("_"))
+    return out
 
 
 def read_specs() -> Dict[str, Tuple[str, ...]]:

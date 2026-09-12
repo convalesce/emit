@@ -36,6 +36,15 @@ Airflow 2.5.3 fires and registers correctly, checked by dispatching through its 
 manager; its `airflow dags test` command does not route through listeners, which is why the
 end-to-end DAG run shows nothing on that version alone.
 
+Two things a task event carries depend on the Airflow, and no plugin can supply them:
+
+- **The failure message** arrives from 2.10. Before that Airflow does not pass one to the
+  listener, so a failed task says that it failed and not why.
+- **The task, and so the DAG, is absent from the failed event on 2.5** (verified on 2.5.3, and
+  present on 2.9.3, 2.10.5 and 3.0.3). Airflow hands that hook a task instance with no task
+  attached. The run is still named, so a receiver can close it as failed; the job it belongs to
+  has to come from the running event for the same task.
+
 ## How one package covers every version
 
 **Airflow.** The plugin reads the hookspecs of the Airflow it is running in

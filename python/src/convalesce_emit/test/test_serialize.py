@@ -347,6 +347,37 @@ class Test_dump_property1(unittest.TestCase):
 
     def test2(self) -> None:
         """
+        Test that a skipped name stays skipped when it is a property.
+
+        Airflow's task instance keeps its logger in `_log` behind a `log`
+        property, and reading the property put a live logger back into the
+        payload that the skip list exists to keep out.
+        """
+
+        class TaskInstance:
+            """Stands in for an Airflow task instance."""
+
+            def __init__(self) -> None:
+                self._log = logging.getLogger("airflow.task")
+                self._state = "failed"
+
+            @property
+            def log(self) -> Any:
+                """The task's logger."""
+                return self._log
+
+            @property
+            def state(self) -> str:
+                """The task's state."""
+                return self._state
+
+        out = ceserial.dump(TaskInstance())
+        self.assertEqual(out["state"], "failed")
+        self.assertNotIn("log", out)
+        self.assertNotIn("_log", out)
+
+    def test3(self) -> None:
+        """
         Test that a property that raises does not stop the object.
         """
 
@@ -576,3 +607,99 @@ class Test_dump_non_finite1(unittest.TestCase):
         self.assertIsNone(out["drift"])
         self.assertEqual(out["rows"], 4.5)
         self.assertNotIn("NaN", json.dumps(out))
+
+
+# #############################################################################
+# Test_dump_fields1
+# #############################################################################
+
+
+class Test_dump_fields1(unittest.TestCase):
+    """
+    Test that an object declaring its own field names is read by them.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a record keeping nothing in `__dict__` still crosses.
+
+        Dagster's `@record` classes are this shape: `_fields` names them,
+        `vars()` is empty, and `_asdict` raises "Iteration is not allowed",
+        so a job snapshot arrived as its repr and the ops in it were lost.
+        """
+
+        class Record:
+            """Stands in for a Dagster JobSnap."""
+
+            _fields = ("name", "node_defs_snapshot")
+
+            def __init__(self) -> None:
+                # Nothing in __dict__: a record keeps its values elsewhere.
+                pass
+
+            def _asdict(self) -> Any:
+                """Raise, the way a record does."""
+                raise RuntimeError("Iteration is not allowed on `@record`")
+
+            @property
+            def name(self) -> str:
+                """The job's name."""
+                return "nightly"
+
+            @property
+            def node_defs_snapshot(self) -> Any:
+                """The ops the job is made of."""
+                return {"op_def_snaps": [{"name": "extract"}]}
+
+        out = ceserial.dump({"job_snapshot": Record()})
+        snapshot = out["job_snapshot"]
+        self.assertEqual(snapshot["name"], "nightly")
+        self.assertEqual(
+            snapshot["node_defs_snapshot"]["op_def_snaps"][0]["name"],
+            "extract",
+        )
+
+    def test2(self) -> None:
+        """
+        Test that a dump method raising does not abandon the rest.
+
+        A decoy `to_dict` used to end the search, leaving the object as its
+        repr even though a later method would have answered.
+        """
+
+        class Awkward:
+            """An object whose first serialiser is broken."""
+
+            def to_dict(self) -> Any:
+                """Fail, the way a half-built tool object does."""
+                raise RuntimeError("nope")
+
+            def _asdict(self) -> Any:
+                """Answer properly."""
+                return {"run_id": "abc"}
+
+        self.assertEqual(ceserial.dump(Awkward()), {"run_id": "abc"})
+
+    def test3(self) -> None:
+        """
+        Test that a field that cannot be read is noted, not fatal.
+        """
+
+        class Record:
+            """A record one of whose fields needs a live connection."""
+
+            _fields = ("step_key", "materialization_events")
+
+            @property
+            def step_key(self) -> str:
+                """The step this is about."""
+                return "load"
+
+            @property
+            def materialization_events(self) -> Any:
+                """Fail, the way a lazy field without storage does."""
+                raise RuntimeError("no storage")
+
+        out = ceserial.dump(Record())
+        self.assertEqual(out["step_key"], "load")
+        self.assertIn("unreadable", out["materialization_events"])
