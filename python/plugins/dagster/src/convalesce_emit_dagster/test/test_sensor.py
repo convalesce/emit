@@ -2,7 +2,11 @@
 Tests for the run-status sensor body.
 """
 
+import os
+import sys
+import types
 import unittest
+import unittest.mock
 from typing import Any, Dict, List
 
 import convalesce_emit_dagster.sensor as cedsens
@@ -213,3 +217,236 @@ class Test_reach_instance1(unittest.TestCase):
         payload = recorder.sent[0]["payload"]
         self.assertEqual(payload["dagster_run"]["job_name"], "nightly")
         self.assertNotIn("job_snapshot", payload)
+
+
+# #############################################################################
+# Test_event_log1
+# #############################################################################
+
+
+# The same five names the plan asks `_FROM_INSTANCE`'s event log read to
+# filter on -- restated here, not imported from the module under test, so
+# this stays a test of the public contract rather than the private constant.
+_EVENT_TYPE_NAMES = (
+    "ASSET_MATERIALIZATION",
+    "ASSET_OBSERVATION",
+    "HANDLED_OUTPUT",
+    "LOADED_INPUT",
+    "RESOURCE_INIT_SUCCESS",
+)
+
+
+def _fake_dagster_event_type() -> types.SimpleNamespace:
+    """A stand-in `DagsterEventType` carrying the five names this reads."""
+    return types.SimpleNamespace(**{name: name for name in _EVENT_TYPE_NAMES})
+
+
+class Test_event_log1(unittest.TestCase):
+    """
+    Test that the run's event log is read, filtered and forwarded, with its
+    author-written metadata redacted.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that matching records cross, and each one's `metadata` is
+        redacted rather than sent verbatim.
+
+        `all_logs`, the call the plan was written against, is gone on
+        Dagster 1.13; this is read through `get_records_for_run` instead,
+        which both supported versions carry.
+        """
+
+        class Instance(_Instance):
+            """An instance whose storage also answers for the event log."""
+
+            def get_records_for_run(
+                self, run_id: str, of_type: Any = None
+            ) -> types.SimpleNamespace:
+                """The event log, the shape `EventLogConnection` has."""
+                self.asked.append(run_id)
+                self.of_type = of_type
+                record = {
+                    "event_log_entry": {
+                        "dagster_event": {
+                            "event_specific_data": {
+                                "materialization": {
+                                    "asset_key": "orders",
+                                    "metadata": {
+                                        "row_count": 1000,
+                                        "sample": "alice@x.com",
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+                return types.SimpleNamespace(records=[record])
+
+        fake_module = types.SimpleNamespace(
+            DagsterEventType=_fake_dagster_event_type()
+        )
+        recorder = _Recorder()
+        with unittest.mock.patch.dict(sys.modules, {"dagster": fake_module}):
+            cedsens.convalesce_sensor(
+                _ReachableContext(Instance()), emitter=recorder
+            )
+        payload = recorder.sent[0]["payload"]
+        entry = payload["event_log"][0]
+        materialization = entry["event_log_entry"]["dagster_event"][
+            "event_specific_data"
+        ]["materialization"]
+        self.assertEqual(materialization["asset_key"], "orders")
+        self.assertEqual(
+            materialization["metadata"], {"redacted": True, "count": 2}
+        )
+        self.assertNotIn("alice@x.com", str(payload))
+        excluded = recorder.sent[0]["excluded"]
+        self.assertTrue(
+            any(entry["reason"] == "sample redacted" for entry in excluded)
+        )
+
+    def test2(self) -> None:
+        """
+        Test that an instance with no event-log storage is left out cleanly.
+        """
+
+        class Instance(_Instance):
+            """An instance that never learned `get_records_for_run`."""
+
+        fake_module = types.SimpleNamespace(
+            DagsterEventType=_fake_dagster_event_type()
+        )
+        recorder = _Recorder()
+        with unittest.mock.patch.dict(sys.modules, {"dagster": fake_module}):
+            cedsens.convalesce_sensor(
+                _ReachableContext(Instance()), emitter=recorder
+            )
+        payload = recorder.sent[0]["payload"]
+        self.assertNotIn("event_log", payload)
+
+    def test3(self) -> None:
+        """
+        Test that Dagster's absence -- no `DagsterEventType` to resolve --
+        is the same as nothing matching, not a raise.
+        """
+        recorder = _Recorder()
+        cedsens.convalesce_sensor(_ReachableContext(), emitter=recorder)
+        payload = recorder.sent[0]["payload"]
+        self.assertNotIn("event_log", payload)
+
+
+# #############################################################################
+# Test_asset_group_names1
+# #############################################################################
+
+
+class Test_asset_group_names1(unittest.TestCase):
+    """
+    Test that asset group names are read from the sensor's repository, not
+    from the run or its event log.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that every key a multi-asset definition owns gets its group,
+        read once per definition rather than once per key.
+        """
+
+        class Key:
+            """Stands in for an `AssetKey`."""
+
+            def __init__(self, *path: str) -> None:
+                self.path = list(path)
+
+        class AssetsDef:
+            """Stands in for one `AssetsDefinition`, multi-asset or not."""
+
+            def __init__(self, groups: Dict[Any, str]) -> None:
+                self.group_names_by_key = groups
+
+        raw_key = Key("orders")
+        agg_key = Key("daily", "totals")
+        combined = AssetsDef({raw_key: "core", agg_key: "core"})
+
+        class AssetGraph:
+            """Stands in for the repository's asset graph."""
+
+            assets_defs_by_key = {raw_key: combined, agg_key: combined}
+
+        class Repository:
+            """Stands in for the sensor's `RepositoryDefinition`."""
+
+            asset_graph = AssetGraph()
+
+        class Context:
+            """A context exposing only what this reads."""
+
+            repository_def = Repository()
+
+        groups = cedsens.asset_group_names(Context())
+        self.assertEqual(groups, {"orders": "core", "daily.totals": "core"})
+
+    def test2(self) -> None:
+        """
+        Test that a context with no repository yields nothing, not a raise.
+        """
+        self.assertEqual(cedsens.asset_group_names(_Context()), {})
+
+    def test3(self) -> None:
+        """
+        Test that an asset graph that cannot be read loses only the groups.
+        """
+
+        class Repository:
+            """A repository whose asset graph is unreadable."""
+
+            @property
+            def asset_graph(self) -> Any:
+                """Fail, the way an unloaded repository does."""
+                raise RuntimeError("not loaded")
+
+        class Context:
+            """A context exposing only what this reads."""
+
+            repository_def = Repository()
+
+        self.assertEqual(cedsens.asset_group_names(Context()), {})
+
+
+# #############################################################################
+# Test_cloud_environment1
+# #############################################################################
+
+
+class Test_cloud_environment1(unittest.TestCase):
+    """
+    Test that Dagster Cloud's own environment is forwarded, minus anything
+    that looks like a credential.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a documented Cloud variable crosses, and an unrelated one
+        does not.
+        """
+        env = {
+            "DAGSTER_CLOUD_DEPLOYMENT_NAME": "prod",
+            "DAGSTER_CLOUD_GIT_SHA": "abc123",
+            "OTHER_VAR": "ignored",
+        }
+        with unittest.mock.patch.dict(os.environ, env, clear=False):
+            out = cedsens.cloud_environment()
+        self.assertEqual(out.get("DAGSTER_CLOUD_DEPLOYMENT_NAME"), "prod")
+        self.assertEqual(out.get("DAGSTER_CLOUD_GIT_SHA"), "abc123")
+        self.assertNotIn("OTHER_VAR", out)
+
+    def test2(self) -> None:
+        """
+        Test that a variable whose name suggests a credential never crosses,
+        even though none of Dagster's own documented variables are one.
+        """
+        env = {"DAGSTER_CLOUD_API_TOKEN": "s3cret"}
+        with unittest.mock.patch.dict(os.environ, env, clear=False):
+            out = cedsens.cloud_environment()
+        self.assertNotIn("DAGSTER_CLOUD_API_TOKEN", out)
