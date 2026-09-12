@@ -28,6 +28,8 @@ public final class Emitter {
   private static final Logger LOG = Logger.getLogger(Emitter.class.getName());
   private static final Charset UTF8 = Charset.forName("UTF-8");
   private static final String OBSERVATIONS_PATH = "/v1/observations";
+  private static final String BODY_OPEN = "{\"observations\":[";
+  private static final String BODY_CLOSE = "]}";
 
   // Retry only what a retry can fix. A 400 means the receiver understood us and said no; sending
   // it again just spends the job's time.
@@ -40,6 +42,8 @@ public final class Emitter {
   private final Config config;
   private final Random random = new Random();
   private final List<Observation> batch = new ArrayList<Observation>();
+  private final List<byte[]> encoded = new ArrayList<byte[]>();
+  private int batchBytes = 0;
   private final Object lock = new Object();
   private final boolean usable;
 
@@ -65,6 +69,10 @@ public final class Emitter {
   /**
    * Queues one observation, sending the batch when it is full.
    *
+   * <p>Full by count or by size: the receiver refuses a body above its limit whole, so an
+   * observation that would push the batch past it goes into the next batch, and one that is over
+   * the limit on its own is sent on its own, so at worst one is refused rather than fifty.
+   *
    * @param tool which tool produced this
    * @param event which callback fired
    * @param payloadJson the tool's own output, already JSON
@@ -75,10 +83,38 @@ public final class Emitter {
       return;
     }
     Observation observation = new Observation(tool, event, payloadJson, toolVersion);
+    byte[] bytes = observation.toJson().getBytes(UTF8);
+    int overhead = BODY_OPEN.length() + BODY_CLOSE.length();
+    if (bytes.length + overhead > config.maxBodyBytes()) {
+      LOG.warning(
+          "convalesce: "
+              + tool
+              + "/"
+              + event
+              + " is "
+              + bytes.length
+              + " bytes, above the receiver's limit of "
+              + config.maxBodyBytes()
+              + "; sending it alone and it may be refused");
+    }
+    List<byte[]> closed = null;
     boolean ready;
     synchronized (lock) {
+      // A comma per observation joins them in the body.
+      int projected = batchBytes + bytes.length + encoded.size() + overhead;
+      if (!encoded.isEmpty() && projected > config.maxBodyBytes()) {
+        closed = new ArrayList<byte[]>(encoded);
+        encoded.clear();
+        batch.clear();
+        batchBytes = 0;
+      }
       batch.add(observation);
+      encoded.add(bytes);
+      batchBytes += bytes.length;
       ready = batch.size() >= config.batchSize();
+    }
+    if (closed != null) {
+      send(closed);
     }
     if (ready) {
       flush();
@@ -87,17 +123,23 @@ public final class Emitter {
 
   /** Sends whatever is queued, logging rather than throwing on failure. */
   public void flush() {
-    List<Observation> sending;
+    List<byte[]> sending;
     synchronized (lock) {
-      if (batch.isEmpty()) {
+      if (encoded.isEmpty()) {
         return;
       }
-      sending = new ArrayList<Observation>(batch);
+      sending = new ArrayList<byte[]>(encoded);
+      encoded.clear();
       batch.clear();
+      batchBytes = 0;
     }
+    send(sending);
+  }
+
+  private void send(List<byte[]> sending) {
     if (config.dryRun()) {
-      for (Observation observation : sending) {
-        LOG.info("convalesce dry-run: " + observation.toJson());
+      for (byte[] observation : sending) {
+        LOG.info("convalesce dry-run: " + new String(observation, UTF8));
       }
       return;
     }
@@ -115,21 +157,26 @@ public final class Emitter {
     flush();
   }
 
-  private void post(List<Observation> sending) throws Exception {
-    StringBuilder body = new StringBuilder("{\"observations\":[");
+  private void post(List<byte[]> sending) throws Exception {
+    int size = BODY_OPEN.length() + BODY_CLOSE.length() + sending.size();
+    for (byte[] observation : sending) {
+      size += observation.length;
+    }
+    java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream(size);
+    body.write(BODY_OPEN.getBytes(UTF8));
     for (int i = 0; i < sending.size(); i++) {
       if (i > 0) {
-        body.append(',');
+        body.write(',');
       }
-      body.append(sending.get(i).toJson());
+      body.write(sending.get(i));
     }
-    body.append("]}");
-    byte[] encoded = body.toString().getBytes(UTF8);
+    body.write(BODY_CLOSE.getBytes(UTF8));
+    byte[] bytes = body.toByteArray();
     String url = trimTrailingSlash(config.endpoint()) + OBSERVATIONS_PATH;
 
     for (int attempt = 0; attempt <= config.maxRetries(); attempt++) {
       try {
-        attempt(url, encoded);
+        attempt(url, bytes);
         return;
       } catch (TransportException e) {
         boolean retryable = e.status() == 0 || RETRYABLE_STATUS.contains(e.status());
