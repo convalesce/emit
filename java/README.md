@@ -7,7 +7,7 @@ Forwards Spark's own listener events to Convalesce, unchanged.
 Two lines of Spark config:
 
 ```
-spark.jars.packages   io.convalesce:convalesce-emit-spark:0.1.0
+spark.jars.packages   io.convalesce:convalesce-emit-spark:0.1.1
 spark.extraListeners  io.convalesce.emit.spark.ConvalesceSparkListener
 ```
 
@@ -15,7 +15,7 @@ Or on the command line:
 
 ```sh
 spark-submit \
-  --packages io.convalesce:convalesce-emit-spark:0.1.0 \
+  --packages io.convalesce:convalesce-emit-spark:0.1.1 \
   --conf spark.extraListeners=io.convalesce.emit.spark.ConvalesceSparkListener \
   your_job.py
 ```

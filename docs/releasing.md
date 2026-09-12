@@ -17,17 +17,20 @@ at a commit on it. Three things enforce this, so a slip cannot publish:
 
 ## Cut a release
 
-1. On `main`, set the version in all six places, identically:
+1. On `main`, set the version in all seven places, identically:
    `python/src/convalesce_emit/_version.py`, the four
-   `python/plugins/*/src/*/_version.py`, and `version` in
-   `java/build.gradle`. Each `pyproject.toml` reads its `_version.py`, so
-   there is nothing else to edit. Merge it with `ci` and `e2e` green.
+   `python/plugins/*/src/*/_version.py`, `version` in `java/build.gradle`,
+   and `VERSION` in `java/emit-core/.../emit/Version.java`. Each
+   `pyproject.toml` reads its `_version.py`, so there is nothing else to
+   edit. The workflow checks all seven against the tag, so a missed one
+   stops the release rather than shipping a wrong `client_version`. Merge it
+   with `ci` and `e2e` green.
 2. Open a pull request from `main` into `release` and merge it. Both
    workflows run on `release` too.
 3. Tag the release branch and push the tag:
 
    ```sh
-   git fetch origin && git tag v0.1.0 origin/release && git push origin v0.1.0
+   git fetch origin && git tag v0.1.1 origin/release && git push origin v0.1.1
    ```
 
 The `publish` workflow then checks the tag against every declared version,

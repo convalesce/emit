@@ -57,7 +57,7 @@ Try it against a real pipeline before pointing it at an account:
 ```json
 { "envelope_version": 1, "observation_id": "…", "emitted_at": "…",
   "tool": "airflow", "event": "task_instance_failed", "tool_version": "2.9.1",
-  "client_version": "0.1.0",
+  "client_version": "0.1.1",
   "payload": { "…the tool's own output, untouched…" } }
 ```
 

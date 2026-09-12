@@ -54,6 +54,13 @@ jobs:
           have=$(sed -n "s/^  version = '\(.*\)'/\1/p" java/build.gradle)
           echo "java/build.gradle: $have"
           [ "$have" = "$want" ] || bad=1
+          # The jar reports this one on every observation it sends, as
+          # `client_version` and in the User-Agent, so a stale value here is
+          # a lie in the data rather than a mislabelled file.
+          java_version="java/emit-core/src/main/java/io/convalesce/emit/Version.java"
+          have=$(sed -n 's/.*String VERSION = "\(.*\)";/\1/p' "$java_version")
+          echo "$java_version: $have"
+          [ "$have" = "$want" ] || bad=1
           test "$bad" = 0
 
   pypi:

@@ -10,7 +10,7 @@ subprojects {
   apply plugin: 'com.diffplug.spotless'
 
   group = 'io.convalesce'
-  version = '0.1.0'
+  version = '0.1.1'
   // Artifact ids carry the product name; the Gradle project names do not have to.
   base.archivesName = "convalesce-${project.name}"
 
