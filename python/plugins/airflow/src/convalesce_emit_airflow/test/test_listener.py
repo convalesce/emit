@@ -4,6 +4,13 @@ Tests for attaching to Airflow's listener API safely.
 Run with `make test`.
 """
 
+# The Dag/Task/DagRun stand-ins in Test_listener_dag_run1.test5 are the same
+# shape as serialize's own cross-call $ref test, deliberately: both prove the
+# same real scenario (emit issue #34) at a different layer, one against the
+# serializer directly and one against the listener that has to share a
+# budget across two `dump()` calls for it to matter.
+# pylint: disable=duplicate-code
+
 import logging
 import unittest
 from typing import Any, Dict, List
@@ -286,6 +293,58 @@ class Test_listener_dag_run1(unittest.TestCase):
         payload = cealist.shape({"task_instance": "TI", "previous_state": None})
         self.assertEqual(payload["task_instance"], "TI")
 
+    def test5(self) -> None:
+        """
+        Test that the Airflow 3 case -- the run found separately and dumped
+        in its own `dump()` call -- still collapses a DAG shared with the
+        task, exactly the shape emit issue #34 was about.
+
+        The run and the task instance are dumped in two different calls
+        inside `shape()`; only a budget shared across both catches this.
+        """
+
+        class Dag:
+            """Stands in for an Airflow DAG."""
+
+            def __init__(self) -> None:
+                self.dag_id = "demo_pipeline"
+
+        dag = Dag()
+
+        class Task:
+            """Stands in for the operator the hook is about."""
+
+            def __init__(self) -> None:
+                self.task_id = "load"
+                self.dag = dag
+
+        class DagRun:
+            """Stands in for the run the API server described."""
+
+            def __init__(self) -> None:
+                self.run_id = "manual__2026-09-11"
+                self.dag = dag
+
+        class ServerContext:
+            """Stands in for a TIRunContext."""
+
+            def __init__(self) -> None:
+                self.dag_run = DagRun()
+
+        class RuntimeTaskInstance:
+            """Stands in for the Airflow 3 task instance."""
+
+            def __init__(self) -> None:
+                self.task_id = "load"
+                self.task = Task()
+                self._ti_context_from_server = ServerContext()
+
+        payload = cealist.shape({"task_instance": RuntimeTaskInstance()})
+        task = payload["task_instance"]["task"]
+        dag_run = payload["task_instance"]["dag_run"]
+        self.assertEqual(task["dag"]["dag_id"], "demo_pipeline")
+        self.assertEqual(dag_run["dag"], {"$ref": task["dag"]["$id"]})
+
 
 # #############################################################################
 # Test_listener_task_group1
@@ -339,7 +398,9 @@ class Test_listener_task_group1(unittest.TestCase):
         hook(None, TaskInstance(), None, None)
         task = recorder.sent[0]["payload"]["task_instance"]["task"]
         self.assertEqual(task["task_group"], "<TaskGroup: demo_pipeline>")
-        # What the group held is still on the task and on the run.
+        # What the group held is still on the task, dumped in full.
         self.assertEqual(task["dag"]["dag_id"], "demo_pipeline")
+        # The dag run carries the same DAG object, not a second copy: it
+        # collapses to a $ref pointing at the task's copy.
         dag_run = recorder.sent[0]["payload"]["task_instance"]["dag_run"]
-        self.assertEqual(dag_run["dag"]["dag_id"], "demo_pipeline")
+        self.assertEqual(dag_run["dag"], {"$ref": task["dag"]["$id"]})

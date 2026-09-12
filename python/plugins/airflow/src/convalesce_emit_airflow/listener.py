@@ -205,11 +205,19 @@ def shape(payload: Mapping[str, Any]) -> Dict[str, Any]:
     """
     Dump what a hook was handed, minus plumbing, plus the dag run.
 
+    Every value here is dumped against one shared budget rather than a fresh
+    one per key. A task carries its DAG, and on Airflow 2 the task instance
+    already carries the dag run too, which carries the same DAG object again;
+    on Airflow 3 the run is found separately and dumped in a second call. A
+    shared budget is what lets either shape collapse the repeat into a
+    `$ref` instead of sending the DAG twice.
+
     :param payload: the hook's own arguments
     :return: what to send
     """
+    budget = cemit.new_budget(summarise=_SUMMARISE)
     out = {
-        name: cemit.dump(value, summarise=_SUMMARISE)
+        name: cemit.dump(value, budget=budget, path=name)
         for name, value in payload.items()
         if name not in _SKIP_ARGS
     }
@@ -220,7 +228,9 @@ def shape(payload: Mapping[str, Any]) -> Dict[str, Any]:
     if dumped.get("dag_run") is None:
         dag_run = find_dag_run(task_instance)
         if dag_run is not None:
-            dumped["dag_run"] = cemit.dump(dag_run, summarise=_SUMMARISE)
+            dumped["dag_run"] = cemit.dump(
+                dag_run, budget=budget, path="task_instance.dag_run"
+            )
     return out
 
 

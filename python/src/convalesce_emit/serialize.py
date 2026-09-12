@@ -7,25 +7,46 @@ Anything unserialisable is stringified rather than dropped, because a partial
 observation is worth more than none, and nothing here may raise into the
 customer's pipeline.
 
-The budgets below are not tidiness. A Prefect `Flow` reaches its task runner,
-then that runner's logger, then the logging manager, then every logger in the
-process with its handlers and streams: walking one real flow run produced a
-256 MB payload before these limits existed. A forwarder that can allocate
-that inside a customer's worker is worse than one that reports nothing.
+Envelope version 2: whole-payload forwarding. A repeated subtree -- the same
+object reached two ways, such as an Airflow task's DAG reached through the
+task and again through the dag run -- is dumped once and pointed at from
+everywhere else it occurs, rather than being dumped (or silently truncated)
+every time. The first dict-shaped value built for a given object is returned
+bare; only if something later points back at it does it get stamped
+`{"$id": n, ...}` in place, so a payload with nothing repeated in it pays no
+overhead for a mechanism it never needed. A later occurrence of the same
+object becomes `{"$ref": n}`, including a true cycle, which resolves to the
+`$id` its own ancestor is stamped with once that ancestor finishes.
+
+What used to be silent caps -- on depth, on node count, on list length, on
+string length -- are gone as truncation policy. Whole payload, no truncation
+is the point of this version. What is left of them are backstops: numbers
+high enough that no real tool object should ever reach them (the deepest
+thing these tools nest sits at eight; see below), kept only so a genuinely
+pathological object graph cannot allocate without bound inside a customer's
+worker or blow the Python recursion limit. Hitting one is never silent: it is
+recorded in the budget's `excluded` list, by path and reason, the same as the
+bulk-data guard and a per-plugin skip. A caller that wants those exclusions
+builds a `Budget` with `new_budget()`, passes it to every `dump()` call that
+should share it, and reads `budget.excluded` when done.
 
 Import as:
 
 import convalesce_emit.serialize as ceserial
 """
 
+import base64
 import dataclasses
+import datetime
+import decimal
 import enum
 import io
 import logging
 import math
 import threading
 import types
-from typing import Any, Dict, FrozenSet, Optional, Set, Tuple
+import uuid
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 _LOG = logging.getLogger(__name__)
 
@@ -35,28 +56,34 @@ _SCALARS = (bool, int, float, str)
 # fourth, and namedtuples to the last.
 _DUMP_METHODS = ("model_dump", "dict", "to_dict", "to_json_dict", "_asdict")
 
-# Levels of nesting walked before a value is described rather than opened.
-# One level is one mapping or object; a list is transparent, since it holds
-# more of the same thing rather than stepping into anything.
+# Backstops, not truncation policy. Envelope version 2 forwards the whole
+# payload; these exist only to protect the customer's process from a
+# genuinely pathological object graph, and hitting one is always recorded in
+# `excluded` rather than silently swallowed.
 #
-# Ten, because the deepest thing these tools nest sits at eight: a Great
+# Depth: kept low enough to stay well under Python's default recursion limit
+# (1000), since a `dump()` level costs several stack frames. A Great
 # Expectations checkpoint result arrives as a keyword argument (2), dumps to
 # a mapping of validation results (3, 4), each dumping to a list of
 # expectation results (5), each holding an expectation config (6) whose
-# kwargs (7) name the column (8). What keeps a payload bounded is the node
-# budget and the skip lists below, not this; depth only stops pathological
-# nesting from walking forever.
-_MAX_DEPTH = 10
-# Total values written. Caps breadth, which depth alone does not: one object
-# holding a registry of thousands is shallow and still enormous. Sized for a
-# real DAG: one Airflow task event carries the whole DAG, at about sixty
-# values per task, and this leaves room for a few hundred tasks.
-_MAX_NODES = 20_000
-_MAX_ITEMS = 1000
-_MAX_STRING = 4096
+# kwargs (7) name the column (8) -- eight, on the deepest real path. 150 is
+# thirty times that.
+_DEPTH_BACKSTOP = 150
+# Total dict/object-shaped values dumped. A real DAG event carries one task
+# at about sixty values each; this leaves room for tens of thousands of
+# tasks.
+_NODE_BACKSTOP = 500_000
+_STRING_BACKSTOP = 2_000_000
 
-# Attribute names that lead out of the tool's own state and into the runtime.
-_SKIP_NAMES = frozenset(
+# Names that are always plumbing, wherever they appear (matched bare,
+# lower-cased). A dotted, lower-cased path such as "task.dag.parent" matches
+# only that one location -- how a plugin excludes a specific known-runtime or
+# known-duplicate field without blacklisting a name a payload might also use
+# legitimately elsewhere. "parent" and "root" used to be in this default set
+# and are not any more, for exactly that reason: a payload key legitimately
+# called `parent` or `root` must not vanish just because some other tool's
+# object happens to keep a live back-reference under the same name.
+DEFAULT_SKIP = frozenset(
     {
         "filters",
         "handlers",
@@ -65,8 +92,6 @@ _SKIP_NAMES = frozenset(
         "logger",
         "loggerdict",
         "manager",
-        "parent",
-        "root",
         "stream",
     }
 )
@@ -95,23 +120,51 @@ _SKIP_TYPES: Tuple[type, ...] = (
 
 
 # #############################################################################
-# _Budget
+# Budget
 # #############################################################################
 
 
 @dataclasses.dataclass
-class _Budget:
+class Budget:
     """
-    How much of one payload is left to spend.
+    How much of one payload is left to spend, and what has been seen.
 
-    :param nodes: values still allowed before the walk stops
-    :param seen: ids already visited, so a cycle terminates
+    Shared across every `dump()` call that should collapse repeats against
+    each other -- one payload's worth, not one call's worth. A plugin that
+    dumps a dict's values one key at a time (Airflow's `shape()`, which dumps
+    the task instance and the dag run separately) must build one `Budget`
+    with `new_budget()` and pass it to every call, or a subtree repeated
+    across two keys will not collapse.
+
+    :param nodes: dict/object/list values still allowed before the node
+        backstop trips
+    :param seen: id(obj) of every dict/object subtree dumped so far, to the
+        ref number it was assigned
+    :param in_progress: id(obj) of every dict/object subtree currently being
+        built, so a true cycle is recognised before it recurses forever
+    :param dumped: ref number to the actual dumped dict for it, so a later
+        occurrence can stamp `$id` onto it in place
+    :param referenced: ref numbers actually pointed at by a `$ref`, so a
+        subtree that is never repeated is never stamped
+    :param list_active: id(obj) of every list-shaped value currently being
+        walked, cycle protection only -- lists are not ref-collapsed, since a
+        list cannot be stamped with `$id` after the fact the way a dict can
+    :param next_ref: the next ref number to hand out
     :param summarise: field names to name rather than walk into
+    :param skip: names and dotted paths to drop entirely
+    :param excluded: every path dropped, summarised or capped, and why
     """
 
-    nodes: int = _MAX_NODES
-    seen: Set[int] = dataclasses.field(default_factory=set)
+    nodes: int = _NODE_BACKSTOP
+    seen: Dict[int, int] = dataclasses.field(default_factory=dict)
+    in_progress: Set[int] = dataclasses.field(default_factory=set)
+    dumped: Dict[int, Dict[str, Any]] = dataclasses.field(default_factory=dict)
+    referenced: Set[int] = dataclasses.field(default_factory=set)
+    list_active: Set[int] = dataclasses.field(default_factory=set)
+    next_ref: int = 0
     summarise: FrozenSet[str] = frozenset()
+    skip: FrozenSet[str] = DEFAULT_SKIP
+    excluded: List[Dict[str, str]] = dataclasses.field(default_factory=list)
 
     def spend(self) -> bool:
         """
@@ -122,13 +175,47 @@ class _Budget:
         self.nodes -= 1
         return self.nodes > 0
 
+    def exclude(self, path: str, reason: str) -> None:
+        """
+        Record that something at `path` did not cross whole.
 
-def dump(  # pylint: disable=too-many-return-statements
+        :param path: dotted path of the value affected, empty for the root
+        :param reason: short, stable reason a receiver can key off
+        :return: nothing
+        """
+        self.excluded.append({"path": path or "$", "reason": reason})
+
+
+def new_budget(
+    *,
+    summarise: FrozenSet[str] = frozenset(),
+    skip: Optional[FrozenSet[str]] = None,
+) -> Budget:
+    """
+    Build one budget to share across a payload's `dump()` calls.
+
+    :param summarise: field names to name rather than walk into
+    :param skip: names and dotted paths to drop, on top of `DEFAULT_SKIP`
+        -- additive, not a replacement, so a plugin naming its own
+        known-duplicate paths does not have to re-list the plumbing names
+        every caller needs dropped too
+    :return: a fresh budget, nothing dumped yet
+    """
+    extra = frozenset(name.lower() for name in skip) if skip else frozenset()
+    return Budget(
+        summarise=frozenset(name.lower() for name in summarise),
+        skip=DEFAULT_SKIP | extra,
+    )
+
+
+def dump(
     obj: Any,
     *,
-    budget: Optional[_Budget] = None,
+    budget: Optional[Budget] = None,
     depth: int = 0,
     summarise: FrozenSet[str] = frozenset(),
+    skip: Optional[FrozenSet[str]] = None,
+    path: str = "",
 ) -> Any:
     """
     Convert a tool's object into something JSON can carry.
@@ -138,14 +225,49 @@ def dump(  # pylint: disable=too-many-return-statements
     that treats it as opaque.
 
     :param obj: whatever the tool handed the callback
-    :param budget: remaining size allowance, created on the first call
+    :param budget: shared budget, created from `summarise`/`skip` on the
+        first call when not given
     :param depth: recursion depth
     :param summarise: fields the tool knows are duplication, named rather
-        than walked; a plugin passes what its own tool duplicates
-    :return: a JSON-encodable equivalent, truncated where a budget ran out
+        than walked; a plugin passes what its own tool duplicates. Ignored
+        once `budget` is given -- the budget already carries it
+    :param skip: names and dotted paths to drop; ignored once `budget` is
+        given
+    :param path: dotted path of `obj` from the root of this payload, used
+        only to say where an exclusion happened
+    :return: a JSON-encodable equivalent
     """
-    if budget is None:
-        budget = _Budget(summarise=frozenset(name.lower() for name in summarise))
+    top_level = budget is None
+    active: Budget = (
+        budget
+        if budget is not None
+        else new_budget(summarise=summarise, skip=skip)
+    )
+    try:
+        return _dump(obj, active, depth, path)
+    except RecursionError:
+        # A non-repeating chain of genuinely distinct objects, deep enough to
+        # outrun even the depth backstop's stack-safety margin. Every real
+        # tool object graph this package has ever seen tops out at eight
+        # levels; this is the last-resort net under a shape none of them has.
+        if not top_level:
+            raise
+        active.exclude(path, "recursion backstop")
+        return "...(excluded: recursion backstop)"
+
+
+def _dump(  # pylint: disable=too-many-return-statements
+    obj: Any, budget: Budget, depth: int, path: str
+) -> Any:
+    """
+    Dispatch one value to the right leaf, list or ref handling.
+
+    :param obj: the value being walked
+    :param budget: remaining size allowance and what has been seen
+    :param depth: recursion depth
+    :param path: dotted path of `obj` from the payload root
+    :return: a JSON-encodable equivalent
+    """
     if obj is None or isinstance(obj, (bool, int)):
         return obj
     if isinstance(obj, float):
@@ -153,66 +275,158 @@ def dump(  # pylint: disable=too-many-return-statements
         # parser refuses the batch, which loses every observation in it.
         return obj if math.isfinite(obj) else None
     if isinstance(obj, str):
-        return (
-            obj
-            if len(obj) <= _MAX_STRING
-            else obj[:_MAX_STRING] + "...(truncated)"
-        )
+        if len(obj) <= _STRING_BACKSTOP:
+            return obj
+        budget.exclude(path, "string exceeds size backstop")
+        return obj[:_STRING_BACKSTOP] + "...(truncated)"
     if isinstance(obj, enum.Enum):
         # The member's value is the tool's state; its name is Python's.
-        return dump(obj.value, budget=budget, depth=depth)
+        return _dump(obj.value, budget, depth, path)
+    # datetime.datetime is a datetime.date, so this must come first.
+    if isinstance(obj, datetime.datetime):
+        return obj.isoformat()
+    if isinstance(obj, datetime.date):
+        return obj.isoformat()
+    if isinstance(obj, datetime.timedelta):
+        return obj.total_seconds()
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    if isinstance(obj, decimal.Decimal):
+        # Not float: a decimal is often an exact value, and float would lose
+        # that precision silently.
+        return str(obj)
+    if isinstance(obj, (bytes, bytearray)):
+        return base64.b64encode(bytes(obj)).decode("ascii")
     if isinstance(obj, _SKIP_TYPES):
         return _describe(obj)
     if _is_bulk_data(obj):
+        budget.exclude(path, "bulk data")
         return _describe_bulk_data(obj)
-    if not budget.spend():
-        return "...(truncated: size limit)"
     if isinstance(obj, (list, tuple, set, frozenset)) and not _is_namedtuple(
         obj
     ):
-        # Transparent: the items are at the same depth as the list.
-        return [
-            dump(v, budget=budget, depth=depth) for v in list(obj)[:_MAX_ITEMS]
-        ]
-    if depth >= _MAX_DEPTH:
-        return _describe(obj)
-    # Cycles are common once an object graph includes a parent pointer.
+        # Transparent: the items are at the same depth as the list. Not
+        # ref-collapsed -- lists cannot be stamped with `$id` after the fact
+        # the way a dict can, and a list reached two ways is not the shape
+        # issue #34 was about -- but still cycle-guarded, since a list
+        # holding itself is exactly as real a risk as an object holding
+        # itself.
+        return _dump_list(obj, budget, depth, path)
+    return _dump_ref(obj, budget, depth, path)
+
+
+def _dump_list(obj: Any, budget: Budget, depth: int, path: str) -> Any:
+    """
+    Walk a list-shaped value, guarding only against it containing itself.
+
+    :param obj: the list, tuple, set or frozenset being walked
+    :param budget: remaining size allowance
+    :param depth: recursion depth, unchanged for the items
+    :param path: dotted path of `obj` from the payload root
+    :return: a JSON list
+    """
     marker = id(obj)
-    if marker in budget.seen:
+    if marker in budget.list_active:
         return "...(cycle)"
-    budget.seen.add(marker)
+    if not budget.spend():
+        budget.exclude(path, "node backstop")
+        return "...(truncated: size limit)"
+    budget.list_active.add(marker)
     try:
-        return _dump_container(obj, budget, depth)
+        return [
+            dump(v, budget=budget, depth=depth, path=f"{path}[{i}]")
+            for i, v in enumerate(obj)
+        ]
     finally:
-        budget.seen.discard(marker)
+        budget.list_active.discard(marker)
 
 
-def _dump_container(obj: Any, budget: _Budget, depth: int) -> Any:
+def _dump_ref(obj: Any, budget: Budget, depth: int, path: str) -> Any:
+    """
+    Walk a dict- or object-shaped value, collapsing a repeat into `$ref`.
+
+    The first occurrence is dumped in full and registered under an integer
+    id. A later occurrence -- reached through a different path, or the same
+    object referencing itself -- becomes `{"$ref": n}` instead of being
+    walked again. The occurrence being pointed at is stamped `{"$id": n,
+    ...}` in place only once something actually points at it, so a subtree
+    that never repeats carries no overhead for a mechanism it never needed.
+
+    :param obj: the dict, namedtuple or other object being walked
+    :param budget: remaining size allowance and what has been seen
+    :param depth: recursion depth
+    :param path: dotted path of `obj` from the payload root
+    :return: a JSON-encodable equivalent, or a `$ref`/`$id` pointer
+    """
+    existing_ref = budget.seen.get(id(obj))
+    if existing_ref is not None:
+        if id(obj) in budget.in_progress:
+            # A true cycle: the ancestor that owns this ref is still being
+            # built further up the call stack. It will be stamped once that
+            # frame returns, because `existing_ref` is now in `referenced`.
+            budget.referenced.add(existing_ref)
+            return {"$ref": existing_ref}
+        target = budget.dumped.get(existing_ref)
+        if target is not None:
+            target["$id"] = existing_ref
+            budget.referenced.add(existing_ref)
+            return {"$ref": existing_ref}
+        # The first dump of this object was not dict-shaped (its own dump
+        # method returned something else, or it had nothing to describe
+        # itself with beyond a repr), so there is nothing to point at. Rare
+        # enough, and cheap enough when it happens, to just redo the work
+        # rather than carry a second cache for it.
+        return _dump_container(obj, budget, depth, path)
+    if not budget.spend():
+        budget.exclude(path, "node backstop")
+        return "...(truncated: size limit)"
+    if depth >= _DEPTH_BACKSTOP:
+        budget.exclude(path, "depth backstop")
+        return _describe(obj)
+    ref = budget.next_ref
+    budget.next_ref += 1
+    budget.seen[id(obj)] = ref
+    budget.in_progress.add(id(obj))
+    try:
+        value = _dump_container(obj, budget, depth, path)
+    finally:
+        budget.in_progress.discard(id(obj))
+    if isinstance(value, dict):
+        budget.dumped[ref] = value
+        if ref in budget.referenced:
+            value["$id"] = ref
+    return value
+
+
+def _dump_container(obj: Any, budget: Budget, depth: int, path: str) -> Any:
     """
     Walk one level of a container or object.
 
     :param obj: the value being walked
     :param budget: remaining size allowance
     :param depth: current recursion depth
+    :param path: dotted path of `obj` from the payload root
     :return: a JSON-encodable equivalent
     """
     nxt = depth + 1
     if isinstance(obj, dict):
-        return _dump_mapping(obj, budget, nxt)
+        return _dump_mapping(obj, budget, nxt, path)
     # An object and the mapping it dumps to are one level, not two: the
     # mapping is the object, described by the tool's own method.
-    dumped = _try_dump_methods(obj, budget, depth)
+    dumped = _try_dump_methods(obj, budget, depth, path)
     if dumped is not _UNSET:
         return dumped
-    fields = _dump_fields(obj, budget, nxt)
+    fields = _dump_fields(obj, budget, nxt, path)
     if fields is not _UNSET:
         return fields
     data = getattr(obj, "__dict__", None)
     if isinstance(data, dict):
         public = {}
-        for key, value in list(data.items())[:_MAX_ITEMS]:
+        for key, value in data.items():
             name = str(key)
-            if name.lower() in _SKIP_NAMES:
+            child_path = f"{path}.{name}" if path else name
+            if _is_skipped(name, path, budget.skip):
+                budget.exclude(child_path, "excluded by name")
                 continue
             # Leading underscores are the tool's internals, not its state,
             # unless the class reads one back through a property of the
@@ -224,18 +438,22 @@ def _dump_container(obj: Any, budget: _Budget, depth: int) -> Any:
                 if (
                     exposed
                     and exposed not in data
-                    and exposed.lower() not in _SKIP_NAMES
+                    and not _is_skipped(exposed, path, budget.skip)
                     and _has_property(obj, exposed)
                 ):
-                    public[exposed] = _dump_property(obj, exposed, budget, nxt)
+                    exposed_path = f"{path}.{exposed}" if path else exposed
+                    public[exposed] = _dump_property(
+                        obj, exposed, budget, nxt, exposed_path
+                    )
                 continue
             if name.lower() in budget.summarise and not _is_scalar(value):
                 public[name] = _describe(value)
                 continue
             if name.lower() in _DATA_NAMES and not _is_scalar(value):
+                budget.exclude(child_path, "bulk data")
                 public[name] = _describe_bulk_data(value)
                 continue
-            public[name] = dump(value, budget=budget, depth=nxt)
+            public[name] = dump(value, budget=budget, depth=nxt, path=child_path)
         # An empty mapping tells the receiver nothing; the object's own
         # description at least names what it was.
         if public:
@@ -243,34 +461,39 @@ def _dump_container(obj: Any, budget: _Budget, depth: int) -> Any:
     return _describe(obj)
 
 
-def _dump_mapping(obj: Dict[Any, Any], budget: _Budget, depth: int) -> Any:
+def _dump_mapping(
+    obj: Dict[Any, Any], budget: Budget, depth: int, path: str
+) -> Any:
     """
     Walk one mapping.
 
     :param obj: the mapping being walked
     :param budget: remaining size allowance
     :param depth: depth for the values
+    :param path: dotted path of `obj` from the payload root
     :return: a JSON-encodable mapping keyed by strings
     """
     out = {}
-    for key, value in list(obj.items())[:_MAX_ITEMS]:
+    for key, value in obj.items():
         # Keys are whatever the tool used; JSON wants strings. A Great
         # Expectations checkpoint keys its results by identifier objects.
         name = key if isinstance(key, str) else _describe(key)
-        lowered = name.lower()
-        if lowered in _SKIP_NAMES:
+        child_path = f"{path}.{name}" if path else name
+        if _is_skipped(name, path, budget.skip):
+            budget.exclude(child_path, "excluded by name")
             continue
-        if lowered in budget.summarise and not _is_scalar(value):
+        if name.lower() in budget.summarise and not _is_scalar(value):
             out[name] = _describe(value)
             continue
-        if lowered in _DATA_NAMES and not _is_scalar(value):
+        if name.lower() in _DATA_NAMES and not _is_scalar(value):
+            budget.exclude(child_path, "bulk data")
             out[name] = _describe_bulk_data(value)
             continue
-        out[name] = dump(value, budget=budget, depth=depth)
+        out[name] = dump(value, budget=budget, depth=depth, path=child_path)
     return out
 
 
-def _dump_fields(obj: Any, budget: _Budget, depth: int) -> Any:
+def _dump_fields(obj: Any, budget: Budget, depth: int, path: str) -> Any:
     """
     Read an object that declares its own field names.
 
@@ -282,19 +505,25 @@ def _dump_fields(obj: Any, budget: _Budget, depth: int) -> Any:
     :param obj: the object being walked
     :param budget: remaining size allowance
     :param depth: depth for the values
+    :param path: dotted path of `obj` from the payload root
     :return: the fields as a mapping, or `_UNSET` when there are none
     """
     fields = getattr(obj, "_fields", None)
     if not isinstance(fields, tuple) or not fields:
         return _UNSET
     out = {}
-    for name in fields[:_MAX_ITEMS]:
-        if not isinstance(name, str) or name.lower() in _SKIP_NAMES:
+    for name in fields:
+        if not isinstance(name, str):
+            continue
+        child_path = f"{path}.{name}" if path else name
+        if _is_skipped(name, path, budget.skip):
+            budget.exclude(child_path, "excluded by name")
             continue
         if name.lower() in budget.summarise:
             out[name] = _describe(getattr(obj, name, None))
             continue
         if name.lower() in _DATA_NAMES:
+            budget.exclude(child_path, "bulk data")
             out[name] = _describe_bulk_data(getattr(obj, name, None))
             continue
         try:
@@ -303,8 +532,30 @@ def _dump_fields(obj: Any, budget: _Budget, depth: int) -> Any:
             # A field that needs something the object no longer has.
             out[name] = f"<{name}: unreadable>"
             continue
-        out[name] = dump(value, budget=budget, depth=depth)
+        out[name] = dump(value, budget=budget, depth=depth, path=child_path)
     return out or _UNSET
+
+
+def _is_skipped(name: str, path: str, skip: FrozenSet[str]) -> bool:
+    """
+    Tell whether `name` at `path` is one of the caller's skip entries.
+
+    A bare, lower-cased name matches wherever it occurs, the way the old
+    global `_SKIP_NAMES` did. A dotted, lower-cased path matches only that
+    exact location, which is how a caller excludes one specific known-runtime
+    or known-duplicate field without blacklisting a name the payload might
+    also use legitimately somewhere else.
+
+    :param name: the attribute or key name being considered
+    :param path: dotted path of the value the name is on, not including name
+    :param skip: names and dotted paths to drop
+    :return: whether this occurrence should be dropped
+    """
+    lowered = name.lower()
+    if lowered in skip:
+        return True
+    full = f"{path}.{lowered}" if path else lowered
+    return full in skip
 
 
 def _is_namedtuple(obj: Any) -> bool:
@@ -328,7 +579,9 @@ def _has_property(obj: Any, name: str) -> bool:
     return isinstance(getattr(type(obj), name, None), property)
 
 
-def _dump_property(obj: Any, name: str, budget: _Budget, depth: int) -> Any:
+def _dump_property(
+    obj: Any, name: str, budget: Budget, depth: int, path: str
+) -> Any:
     """
     Read one property, describing the object if the read raises.
 
@@ -336,6 +589,7 @@ def _dump_property(obj: Any, name: str, budget: _Budget, depth: int) -> Any:
     :param name: the property name
     :param budget: remaining size allowance
     :param depth: depth for the value
+    :param path: dotted path the property's value is at
     :return: the property's value, dumped
     """
     try:
@@ -344,7 +598,7 @@ def _dump_property(obj: Any, name: str, budget: _Budget, depth: int) -> Any:
         # A property that needs a live session or a lock is the tool's
         # business; the rest of the object is still worth having.
         return f"<{name}: unreadable>"
-    return dump(value, budget=budget, depth=depth)
+    return dump(value, budget=budget, depth=depth, path=path)
 
 
 def _is_scalar(obj: Any) -> bool:
@@ -403,8 +657,8 @@ def _describe(obj: Any) -> str:
     except Exception:  # pylint: disable=broad-exception-caught
         # An object whose __str__ raises still has a type.
         return f"<{type(obj).__name__}>"
-    if len(text) > _MAX_STRING:
-        text = text[:_MAX_STRING] + "...(truncated)"
+    if len(text) > _STRING_BACKSTOP:
+        text = text[:_STRING_BACKSTOP] + "...(truncated)"
     return text
 
 
@@ -412,13 +666,14 @@ def _describe(obj: Any) -> str:
 _UNSET = object()
 
 
-def _try_dump_methods(obj: Any, budget: _Budget, depth: int) -> Any:
+def _try_dump_methods(obj: Any, budget: Budget, depth: int, path: str) -> Any:
     """
     Ask the object to describe itself.
 
     :param obj: the object to try
     :param budget: remaining size allowance
     :param depth: the object's own depth; its mapping is walked at it
+    :param path: dotted path of `obj` from the payload root
     :return: the dumped value, or `_UNSET` if no method worked
     """
     for attr in _DUMP_METHODS:
@@ -433,6 +688,6 @@ def _try_dump_methods(obj: Any, budget: _Budget, depth: int) -> Any:
             # `_asdict` that raises, and its fields are readable another way.
             continue
         if isinstance(described, dict):
-            return _dump_mapping(described, budget, depth + 1)
-        return dump(described, budget=budget, depth=depth)
+            return _dump_mapping(described, budget, depth + 1, path)
+        return dump(described, budget=budget, depth=depth, path=path)
     return _UNSET

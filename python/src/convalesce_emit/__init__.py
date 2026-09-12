@@ -23,13 +23,15 @@ from convalesce_emit.envelope import ENVELOPE_VERSION, Observation, build
 from convalesce_emit.errors import ConfigError, EmitError, TransportError
 from convalesce_emit.protocols import EmitterLike
 from convalesce_emit.redact import redact_samples
-from convalesce_emit.serialize import dump
+from convalesce_emit.serialize import DEFAULT_SKIP, Budget, dump, new_budget
 from convalesce_emit.toolinfo import version_of
 
 _LOG = logging.getLogger(__name__)
 
 __all__ = [
+    "DEFAULT_SKIP",
     "ENVELOPE_VERSION",
+    "Budget",
     "Config",
     "ConfigError",
     "EmitError",
@@ -40,6 +42,7 @@ __all__ = [
     "__version__",
     "build",
     "dump",
+    "new_budget",
     "redact_samples",
     "send_one",
     "version_of",
