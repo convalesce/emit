@@ -35,6 +35,14 @@ And one field is named rather than walked. A task belongs to a task group,
 and a task group holds its own copy of the whole DAG, so it was 40% of a
 task event and every byte of it appeared elsewhere already.
 
+`on_asset_event_emitted` does not exist before Airflow 3.2.0 (confirmed
+against the real hookspec source: absent at 3.0.x and 3.1.x, present from
+3.2.0). Below 3.2, an alias's resolved asset is only ever recoverable the
+way `asset_aliases()` above already does it -- read off the task's own
+outlet events, per task instance, never as its own event. Airflow 3.0/3.1
+carrying no alias-resolution *event* is an accepted gap, not a bug: nothing
+in this listener can manufacture a hook Airflow itself does not fire.
+
 Import as:
 
 import convalesce_emit_airflow.listener as cealist
@@ -94,6 +102,11 @@ WANTED = (
     "on_task_instance_skipped",
     "on_asset_created",
     "on_asset_changed",
+    # Airflow 3.2+ only; absent from 3.0 and 3.1, which the spec read
+    # handles the same way. This is the only hook that carries a resolved
+    # alias->asset edge directly, rather than requiring the per-task-event
+    # reconstruction `asset_aliases()` above already does.
+    "on_asset_event_emitted",
 )
 
 # Hook arguments that are plumbing rather than anything about the run.

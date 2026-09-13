@@ -1033,6 +1033,47 @@ class Test_dump_fields1(unittest.TestCase):
         self.assertEqual(out["step_key"], "load")
         self.assertIn("unreadable", out["materialization_events"])
 
+    def test4(self) -> None:
+        """
+        Test that an `attrs.define`-slotted object is read by its fields.
+
+        `attrs.define` defaults to `slots=True`: no `__dict__`, and no
+        `_fields` either -- `__attrs_attrs__`, attrs' own marker, sits on
+        the class instead. Airflow 3.2's `on_asset_event_emitted` hands the
+        listener exactly this shape; a real `attrs` dependency is not
+        needed to prove the introspection, just its class-level marker.
+        """
+
+        class _Attribute:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        class AssetEvent:
+            """Stands in for Airflow 3.2's attrs-slotted `AssetEvent`."""
+
+            __slots__ = ("source_dag_id", "source_task_id")
+            __attrs_attrs__ = (
+                _Attribute("source_dag_id"),
+                _Attribute("source_task_id"),
+            )
+
+            def __init__(self, source_dag_id: str, source_task_id: str) -> None:
+                self.source_dag_id = source_dag_id
+                self.source_task_id = source_task_id
+
+        event = AssetEvent(
+            source_dag_id="convalesce_example", source_task_id="publish"
+        )
+        self.assertFalse(hasattr(event, "__dict__"))
+        out = ceserial.dump({"asset_event": event})
+        self.assertEqual(
+            out["asset_event"],
+            {
+                "source_dag_id": "convalesce_example",
+                "source_task_id": "publish",
+            },
+        )
+
 
 # #############################################################################
 # Test_dump_summarise1

@@ -515,6 +515,13 @@ def _dump_fields(obj: Any, budget: Budget, depth: int, path: str) -> Any:
     attribute is empty, and its `_asdict` raises "Iteration is not allowed",
     so without this the whole snapshot arrives as its repr.
 
+    Airflow 3.2's `on_asset_event_emitted` hands the listener an
+    `attrs.define`-decorated `AssetEvent`, and `attrs.define` defaults to
+    `slots=True`: no `__dict__` either, and no `_fields` -- attrs' own
+    marker is `__attrs_attrs__`, on the class rather than the instance.
+    Found by dumping a real one and getting its repr back instead of a
+    payload, not by reading attrs' docs first.
+
     :param obj: the object being walked
     :param budget: remaining size allowance
     :param depth: depth for the values
@@ -522,6 +529,8 @@ def _dump_fields(obj: Any, budget: Budget, depth: int, path: str) -> Any:
     :return: the fields as a mapping, or `_UNSET` when there are none
     """
     fields = getattr(obj, "_fields", None)
+    if not isinstance(fields, tuple) or not fields:
+        fields = _attrs_field_names(obj)
     if not isinstance(fields, tuple) or not fields:
         return _UNSET
     out = {}
@@ -547,6 +556,29 @@ def _dump_fields(obj: Any, budget: Budget, depth: int, path: str) -> Any:
             continue
         out[name] = dump(value, budget=budget, depth=depth, path=child_path)
     return out or _UNSET
+
+
+def _attrs_field_names(obj: Any) -> Optional[Tuple[str, ...]]:
+    """
+    Field names for an `attrs`-decorated object, without depending on attrs.
+
+    `__attrs_attrs__` is a tuple of `Attribute` objects, each carrying the
+    field's name; reading it by attribute means this works whether or not
+    the `attrs` package itself is importable in this process.
+
+    :param obj: the object being walked
+    :return: the field names, or None when the object is not attrs-decorated
+    """
+    declared = getattr(type(obj), "__attrs_attrs__", None)
+    if not isinstance(declared, tuple) or not declared:
+        return None
+    names: List[str] = []
+    for field in declared:
+        name = getattr(field, "name", None)
+        if not isinstance(name, str):
+            return None
+        names.append(name)
+    return tuple(names)
 
 
 def _is_skipped(name: str, path: str, skip: FrozenSet[str]) -> bool:
