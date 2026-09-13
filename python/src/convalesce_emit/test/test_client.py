@@ -319,7 +319,9 @@ class Test_emitter_body_size1(_ServerCase):
 
     def test2(self) -> None:
         """
-        Test that one oversized observation goes alone, not with the others.
+        Test that one oversized observation goes alone, not with the others,
+        when its payload cannot be split any smaller -- one key holding one
+        giant string, nothing to group and nothing to recurse into.
         """
         with self._emitter(batch_size=50, max_body_bytes=4000) as emitter:
             emitter.emit(tool="spark", event="small", payload={"a": 1})
@@ -333,3 +335,65 @@ class Test_emitter_body_size1(_ServerCase):
         ]
         self.assertIn(["huge"], requests)
         self.assertEqual(len(self._sent()), 3)
+
+
+# #############################################################################
+# Test_emitter_chunking1
+# #############################################################################
+
+
+class Test_emitter_chunking1(_ServerCase):
+    """
+    Test that a payload too big for one observation is split into chunks
+    that ride the existing wire path.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that an oversized payload with several keys arrives as several
+        observations sharing one `observation_id`, each under the limit,
+        that reassemble to the original payload.
+        """
+        payload = {f"k{i}": "x" * 300 for i in range(10)}
+        with self._emitter(batch_size=50, max_body_bytes=1000) as emitter:
+            emitter.emit(tool="airflow", event="huge", payload=payload)
+        sent = self._sent()
+        self.assertGreater(len(sent), 1)
+        ids = {obs["observation_id"] for obs in sent}
+        self.assertEqual(len(ids), 1)
+        for obs in sent:
+            self.assertEqual(obs["chunk_count"], len(sent))
+            body = json.dumps(obs, separators=(",", ":"))
+            self.assertLessEqual(len(body), 1000)
+        indices = sorted(obs["chunk_index"] for obs in sent)
+        self.assertEqual(indices, list(range(len(sent))))
+        merged: Dict[str, Any] = {}
+        for obs in sorted(sent, key=lambda o: o["chunk_index"]):
+            merged.update(obs["payload"])
+        self.assertEqual(merged, payload)
+
+    def test2(self) -> None:
+        """
+        Test that a chunked payload actually reduces request count versus
+        sending it as one refused-whole observation -- more than one
+        request, none of them the size of the whole payload.
+        """
+        payload = {f"k{i}": "y" * 500 for i in range(8)}
+        whole_size = len(json.dumps(payload, separators=(",", ":")))
+        with self._emitter(batch_size=1, max_body_bytes=1200) as emitter:
+            emitter.emit(tool="dagster", event="huge", payload=payload)
+        self.assertGreater(len(_Recorder.received), 1)
+        for request in _Recorder.received:
+            self.assertLess(len(json.dumps(request)), whole_size)
+
+    def test3(self) -> None:
+        """
+        Test that an unchunked observation's `to_dict()` still carries the
+        chunk fields as `None` on the wire -- zero new shape for a receiver
+        that has never seen a chunked one.
+        """
+        with self._emitter() as emitter:
+            emitter.emit(tool="airflow", event="e", payload={"a": 1})
+        observation = self._sent()[0]
+        self.assertIsNone(observation["chunk_index"])
+        self.assertIsNone(observation["chunk_count"])

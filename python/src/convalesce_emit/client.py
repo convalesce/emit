@@ -25,6 +25,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 
 import convalesce_emit._version as ceversio
+import convalesce_emit.chunk as cechunk
 import convalesce_emit.config as ceconfig
 import convalesce_emit.envelope as ceenvelo
 import convalesce_emit.errors as ceerrors
@@ -43,6 +44,10 @@ _BODY_OVERHEAD = len(b'{"observations":[]}')
 # Caps the backoff so a long outage does not park a worker thread for
 # minutes at a time.
 _MAX_BACKOFF_SECONDS = 30
+# Slack between a chunk's budget and the receiver's own limit, covering the
+# few bytes a chunk's own `chunk_index`/`chunk_count` add over the shell
+# probe used to size that budget (see `_chunk`).
+_CHUNK_SAFETY_MARGIN = 64
 
 
 # #############################################################################
@@ -85,8 +90,11 @@ class Emitter:
 
         Full by count or by size: the receiver refuses a body above its
         limit whole, so an observation that would push the batch past it
-        goes into the next batch, and one that is over the limit on its own
-        is sent on its own, so at worst one is refused rather than fifty.
+        goes into the next batch. One that is over the limit on its own is
+        split into chunks that share one `observation_id` -- each chunk then
+        rides this same queueing path as an observation in its own right --
+        unless it cannot be split any smaller, in which case it is sent
+        alone, oversized, and may be refused.
 
         :param tool: which tool produced this
         :param event: which callback fired
@@ -107,11 +115,89 @@ class Emitter:
         )
         size = len(_encode(observation))
         if size + _BODY_OVERHEAD > self.config.max_body_bytes:
+            for chunk in self._chunk(observation, size):
+                self._enqueue_one(chunk)
+            return
+        self._enqueue_one(observation)
+
+    def _chunk(
+        self, observation: ceenvelo.Observation, whole_size: int
+    ) -> List[ceenvelo.Observation]:
+        """
+        Split one oversized observation into chunk observations, when
+        possible.
+
+        :param observation: the observation, already known to be too big
+        :param whole_size: its encoded size, for the fallback warning
+        :return: chunk observations sharing `observation.observation_id`,
+            or `[observation]` unchanged when it cannot be shrunk further
+        """
+        if not isinstance(observation.payload, dict):
+            _LOG.warning(
+                "convalesce: %s/%s is %d bytes and its payload is not a "
+                "dict, so it cannot be split into chunks; sending it whole "
+                "and it may be refused",
+                observation.tool,
+                observation.event,
+                whole_size,
+            )
+            return [observation]
+        shell = ceenvelo.build(
+            tool=observation.tool,
+            event=observation.event,
+            payload={},
+            tool_version=observation.tool_version,
+            excluded=observation.excluded,
+            observation_id=observation.observation_id,
+            chunk_index=0,
+            chunk_count=1,
+        )
+        budget = (
+            self.config.max_body_bytes
+            - len(_encode(shell))
+            - _BODY_OVERHEAD
+            - _CHUNK_SAFETY_MARGIN
+        )
+        parts = (
+            cechunk.split(observation.payload, budget)
+            if budget > 0
+            else [observation.payload]
+        )
+        if len(parts) <= 1:
+            return [observation]
+        count = len(parts)
+        return [
+            ceenvelo.build(
+                tool=observation.tool,
+                event=observation.event,
+                payload=part,
+                tool_version=observation.tool_version,
+                # Only the first chunk carries what was excluded from the
+                # whole payload; the receiver reassembles before any of it
+                # is read, and carrying it on every chunk would count it
+                # once per chunk instead of once per observation.
+                excluded=observation.excluded if i == 0 else None,
+                observation_id=observation.observation_id,
+                chunk_index=i,
+                chunk_count=count,
+            )
+            for i, part in enumerate(parts)
+        ]
+
+    def _enqueue_one(self, observation: ceenvelo.Observation) -> None:
+        """
+        Queue one already-built observation, sending the batch when full.
+
+        :param observation: a whole observation, or one chunk of one
+        :return: nothing
+        """
+        size = len(_encode(observation))
+        if size + _BODY_OVERHEAD > self.config.max_body_bytes:
             _LOG.warning(
                 "convalesce: %s/%s is %d bytes, above the receiver's limit "
                 "of %d; sending it alone and it may be refused",
-                tool,
-                event,
+                observation.tool,
+                observation.event,
                 size,
                 self.config.max_body_bytes,
             )

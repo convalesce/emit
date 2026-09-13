@@ -93,6 +93,40 @@ class Test_envelope1(unittest.TestCase):
         self.assertEqual(observation.excluded, excluded)
         self.assertIsNot(observation.excluded, excluded)
 
+    def test7(self) -> None:
+        """
+        Test that a whole, unchunked observation carries no chunk fields.
+        """
+        observation = ceenvelo.build(tool="t", event="e", payload={})
+        self.assertIsNone(observation.chunk_index)
+        self.assertIsNone(observation.chunk_count)
+
+    def test8(self) -> None:
+        """
+        Test that an id override is what lets every chunk of one oversized
+        observation share the same `observation_id`.
+        """
+        first = ceenvelo.build(
+            tool="t",
+            event="e",
+            payload={"a": 1},
+            observation_id="shared-id",
+            chunk_index=0,
+            chunk_count=2,
+        )
+        second = ceenvelo.build(
+            tool="t",
+            event="e",
+            payload={"b": 2},
+            observation_id="shared-id",
+            chunk_index=1,
+            chunk_count=2,
+        )
+        self.assertEqual(first.observation_id, "shared-id")
+        self.assertEqual(first.observation_id, second.observation_id)
+        self.assertEqual((first.chunk_index, first.chunk_count), (0, 2))
+        self.assertEqual((second.chunk_index, second.chunk_count), (1, 2))
+
 
 # #############################################################################
 # Test_envelope_version1
