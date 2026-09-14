@@ -31,14 +31,27 @@ confirmed against that real source, field for field:
   (`SetStateStatus` is a plain `AutoEnum`, so those are the literal wire
   values). Only `ACCEPT` is treated as success; `REJECT`/`ABORT`/`WAIT`
   all fail closed to `FAILED_TO_TRIGGER`, never retried in the same pass.
-- **What is NOT confirmed, and is a documented assumption rather than a
-  proven fact:** no live Prefect 3.x server was reached from this
-  environment to actually make this call. The request/response shapes
-  above are read from Prefect's own real source rather than guessed, and
-  the same REST path and body shape is what the official client itself
-  sends -- but the one thing the plan explicitly asked to verify against
-  a live server (does the API actually accept and reschedule the run
-  this way) is still unverified end-to-end. Flag this before shipping.
+
+**Live-verified against a real Prefect 3.8.5 server (the version this
+project's own `collect/e2e-observe/stacks/prefect` matrix already pins),
+not just against source -- see `plan/04-retry-remedy-kind.md`'s closing
+state section for the full run.** A real bug was caught doing this,
+fixed here: a successful `ACCEPT`ed transition comes back as HTTP **201**,
+not 200 -- confirmed with a direct `curl` against a real server before
+touching the code, and independently reproduced through this exact
+function. The pre-existing code treated anything but 200 as a transport
+failure, which meant every real, successful reschedule was misreported as
+`FAILED_TO_TRIGGER`; the unit tests never caught it because their fake
+server's default status was 200 for every scenario, including the
+`ACCEPT` one. A rejected/aborted transition (e.g. no deployment, a
+terminal state that refuses this transition) comes back as HTTP 200 with
+`status: "ABORT"`/`"REJECT"` in the body -- also confirmed live, calling
+`set_state` on a real terminal, no-deployment flow run and getting back
+exactly `{"status": "ABORT", "details": {"reason": "Cannot reschedule a
+run without an associated deployment."}}` at HTTP 200. A nonexistent flow
+run's id returns a real 404. The fix: treat both 200 and 201 as "the
+request was processed, now look at the body's own `status` field" and
+only 404 as the not-found case, unchanged from before.
 
 A flow run with no `deployment_id` has no worker or work pool watching
 for a `SCHEDULED` state to pick up, so setting one would leave it
@@ -269,7 +282,7 @@ def _reschedule_flow_run(
     )
     if status == 404:
         raise RuntimeError(f"flow run {flow_run_id} was not found")
-    if status != 200:
+    if status not in (200, 201):
         raise RuntimeError(f"set_state returned unexpected HTTP {status}")
     result = json.loads(body)
     if not isinstance(result, dict) or result.get("status") != "ACCEPT":

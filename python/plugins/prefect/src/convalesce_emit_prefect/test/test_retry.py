@@ -209,7 +209,16 @@ class Test_reschedule_flow_run1(_ServerCase):
         """
         Test an ACCEPTed transition: the right path, a SCHEDULED body
         naming this exact flow run, and force=False.
+
+        A real Prefect 3.8.5 server answers an ACCEPTed `set_state` with
+        HTTP 201, not 200 -- confirmed live against a real server (see
+        `plan/04-retry-remedy-kind.md`'s closing state section). The fake
+        server here is set to 201 on purpose, not the class default of
+        200, so this test would have caught the real bug that shipped
+        (every real success misreported as `FAILED_TO_TRIGGER`) instead
+        of passing against a response shape no real server sends.
         """
+        _Recorder.status = 201
         _Recorder.body = json.dumps(
             {"status": "ACCEPT", "state": {"type": "SCHEDULED"}}
         ).encode("utf-8")
@@ -228,7 +237,14 @@ class Test_reschedule_flow_run1(_ServerCase):
         """
         Test that a REJECTed transition raises rather than being treated
         as success.
+
+        A real server answers a REJECT/ABORT with HTTP 200 (confirmed
+        live against a real Prefect 3.8.5 server calling `set_state` on a
+        terminal, no-deployment flow run), so this is set explicitly
+        rather than left at the class default to document that fact
+        rather than merely benefit from it.
         """
+        _Recorder.status = 200
         _Recorder.body = json.dumps(
             {"status": "REJECT", "details": {"reason": "not schedulable"}}
         ).encode("utf-8")
