@@ -15,6 +15,7 @@ import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.zip.GZIPInputStream;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -30,13 +31,18 @@ public class EmitterTest {
   private HttpServer server;
   private String url;
   private final List<String> bodies = Collections.synchronizedList(new ArrayList<String>());
+  private final List<Integer> rawLengths = Collections.synchronizedList(new ArrayList<Integer>());
   private final List<String> auth = Collections.synchronizedList(new ArrayList<String>());
+  private final List<String> contentEncoding =
+      Collections.synchronizedList(new ArrayList<String>());
   private volatile int status = 200;
 
   @Before
   public void startServer() throws Exception {
     bodies.clear();
+    rawLengths.clear();
     auth.clear();
+    contentEncoding.clear();
     status = 200;
     server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
     server.createContext(
@@ -44,7 +50,12 @@ public class EmitterTest {
         new HttpHandler() {
           @Override
           public void handle(HttpExchange exchange) throws java.io.IOException {
-            bodies.add(read(exchange.getRequestBody()));
+            byte[] raw = readBytes(exchange.getRequestBody());
+            rawLengths.add(raw.length);
+            String encoding = exchange.getRequestHeaders().getFirst("Content-Encoding");
+            contentEncoding.add(String.valueOf(encoding));
+            byte[] decoded = "gzip".equals(encoding) ? gunzip(raw) : raw;
+            bodies.add(new String(decoded, "UTF-8"));
             auth.add(String.valueOf(exchange.getRequestHeaders().getFirst("Authorization")));
             exchange.sendResponseHeaders(status, -1);
             exchange.close();
@@ -71,6 +82,20 @@ public class EmitterTest {
     assertEquals(1, bodies.size());
     assertTrue(bodies.get(0).contains(payload));
     assertTrue(bodies.get(0).contains("\"tool\":\"spark\""));
+  }
+
+  @Test
+  public void bodyIsActuallyGzipCompressedOnTheWire() {
+    // Whole-payload forwarding makes a batch bigger than it used to be; gzip is what keeps that
+    // from costing the same on the wire. The header alone would not prove it -- the raw bytes
+    // must actually be smaller than the decoded text, and must actually be gzip (the handler's own
+    // GZIPInputStream already proved that; this repeats the check at the test level).
+    String payload = "{\"sql\":\"" + repeat("select * from orders ", 200) + "\"}";
+    emitter(1, 0).emit("spark", "e", payload, null);
+    assertEquals("gzip", contentEncoding.get(0));
+    assertTrue(
+        rawLengths.get(0)
+            < bodies.get(0).getBytes(java.nio.charset.Charset.forName("UTF-8")).length);
   }
 
   @Test
@@ -187,14 +212,23 @@ public class EmitterTest {
     assertNull(Config.of(url, "k", 1, 0).validate());
   }
 
-  private static String read(InputStream in) throws java.io.IOException {
+  private static byte[] readBytes(InputStream in) throws java.io.IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     byte[] buffer = new byte[4096];
     int read;
     while ((read = in.read(buffer)) != -1) {
       out.write(buffer, 0, read);
     }
-    return out.toString("UTF-8");
+    return out.toByteArray();
+  }
+
+  private static byte[] gunzip(byte[] data) throws java.io.IOException {
+    GZIPInputStream unzipped = new GZIPInputStream(new java.io.ByteArrayInputStream(data));
+    try {
+      return readBytes(unzipped);
+    } finally {
+      unzipped.close();
+    }
   }
 
   private static int countOccurrences(String haystack, String needle) {

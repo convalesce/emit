@@ -103,11 +103,12 @@ The same jar also loads on Java 21 (Spark 4.0.3), which is what Java 8 bytecode 
 
 ## What ran for real
 
-`e2e/` starts each tool in Docker at the versions in `.github/workflows/e2e.yml`,
-with the plugin installed the way a customer installs it, runs an example
-workflow with one step that fails, and reads what reached a stand-in endpoint
-over HTTP with the key. The first run found two things the in-process probes
-had not:
+`collect/e2e-observe/` (in the sibling `collect` checkout, where the integration
+stacks now live) starts each tool in Docker at the versions in its own e2e-observe
+workflow, with the plugin installed the way a customer installs it, runs an
+example workflow with one step that fails, and posts what it sends to a real
+metadata service with a real key. The first run found two things the
+in-process probes had not:
 
 - **The Airflow listener never sent anything at the default batch size.** Task
   hooks fire in a process Airflow forks per task and exits without telling

@@ -16,7 +16,7 @@ import dataclasses
 import datetime
 import logging
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import convalesce_emit._version as ceversio
 
@@ -24,7 +24,14 @@ _LOG = logging.getLogger(__name__)
 
 # Bumped only when the envelope's own shape changes. The payload inside is
 # versioned by `tool_version`, not by this.
-ENVELOPE_VERSION = 1
+#
+# Version 2: whole-payload forwarding. A repeated subtree collapses into a
+# `$ref` instead of being sent again or silently truncated (serialize.py),
+# and everything that did not cross whole -- bulk data, a redacted sample, a
+# path-scoped skip, a backstop -- is named in `excluded` instead of just
+# vanishing. Collect keeps reading version 1 unchanged; the shim resolves
+# `$ref` and `excluded` only for version 2.
+ENVELOPE_VERSION = 2
 
 
 def _now() -> str:
@@ -63,8 +70,19 @@ class Observation:
     :param tool_version: the tool's version, where it could be read
     :param envelope_version: shape of this wrapper, not of the payload
     :param client_version: which release of this package sent it
-    :param observation_id: unique per observation
+    :param observation_id: unique per observation. Shared across every chunk
+        of one oversized observation, so the receiver knows which group a
+        chunk belongs to
     :param emitted_at: when this was built, not when it was sent
+    :param excluded: everything in `payload` that did not cross whole --
+        bulk data, a redacted sample, a path-scoped skip, a backstop -- by
+        path and reason. Empty when nothing was left out
+    :param chunk_index: this observation's position among its siblings, when
+        a payload too big to send whole was split; `None` when it was not
+        split
+    :param chunk_count: how many chunks make up the whole payload; `None` or
+        `1` both mean "not split" -- a receiver must treat them alike, since
+        a sender is free to omit the field entirely rather than say `1`
     """
 
     tool: str
@@ -75,6 +93,9 @@ class Observation:
     client_version: str = ceversio.__version__
     observation_id: str = dataclasses.field(default_factory=_new_id)
     emitted_at: str = dataclasses.field(default_factory=_now)
+    excluded: List[Dict[str, str]] = dataclasses.field(default_factory=list)
+    chunk_index: Optional[int] = None
+    chunk_count: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -91,6 +112,10 @@ def build(
     event: str,
     payload: Any,
     tool_version: Optional[str] = None,
+    excluded: Optional[List[Dict[str, str]]] = None,
+    observation_id: Optional[str] = None,
+    chunk_index: Optional[int] = None,
+    chunk_count: Optional[int] = None,
 ) -> Observation:
     """
     Wrap a tool's payload for transport.
@@ -99,11 +124,26 @@ def build(
     :param event: which callback fired
     :param payload: the tool's own output, untouched
     :param tool_version: the tool's version, where it could be read
+    :param excluded: everything in `payload` that did not cross whole, by
+        path and reason; defaults to nothing left out
+    :param observation_id: override the freshly generated id -- how every
+        chunk of one oversized observation is made to share the same one
+    :param chunk_index: this chunk's position, when `payload` is one piece
+        of a larger one
+    :param chunk_count: how many chunks make up the whole
     :return: the observation to send
     """
-    return Observation(
+    observation = Observation(
         tool=tool,
         event=event,
         payload=payload,
         tool_version=tool_version,
+        excluded=list(excluded) if excluded else [],
+        chunk_index=chunk_index,
+        chunk_count=chunk_count,
     )
+    if observation_id is not None:
+        observation = dataclasses.replace(
+            observation, observation_id=observation_id
+        )
+    return observation

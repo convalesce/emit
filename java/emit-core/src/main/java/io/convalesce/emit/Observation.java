@@ -17,8 +17,15 @@ import java.util.UUID;
  */
 public final class Observation {
 
-  /** Bumped only when the envelope's own shape changes, never for the payload inside it. */
-  public static final int ENVELOPE_VERSION = 1;
+  /**
+   * Bumped only when the envelope's own shape changes, never for the payload inside it.
+   *
+   * <p>Version 2 adds {@code excluded}, naming anything left out of the payload by path and reason.
+   * This client's payload is already the tool's own JSON (Spark's {@code JsonProtocol}), not walked
+   * by anything of ours, so it always sends an empty list here -- there is nothing of ours to
+   * declare an exclusion about. Collect keeps reading version 1 unchanged.
+   */
+  public static final int ENVELOPE_VERSION = 2;
 
   private final String tool;
   private final String event;
@@ -58,6 +65,7 @@ public final class Observation {
     out.append(",\"tool_version\":").append(Json.quote(toolVersion));
     out.append(",\"event\":").append(Json.quote(event));
     out.append(",\"client_version\":").append(Json.quote(Version.VERSION));
+    out.append(",\"excluded\":[]");
     // Verbatim: this is the tool's own JSON, and re-encoding it would be the one thing this
     // package exists not to do.
     out.append(",\"payload\":").append(payloadJson == null ? "null" : payloadJson);

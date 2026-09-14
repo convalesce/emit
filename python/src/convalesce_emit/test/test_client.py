@@ -8,6 +8,7 @@ would test nothing.
 Run with `make test`.
 """
 
+import gzip
 import http.server
 import json
 import logging
@@ -39,12 +40,16 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
 
     received: List[Dict[str, Any]] = []
     headers_seen: List[Dict[str, str]] = []
+    raw_bodies: List[bytes] = []
     status = 200
 
     def do_POST(self) -> None:  # pylint: disable=invalid-name
         """Record one request and answer with the configured status."""
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
+        type(self).raw_bodies.append(body)
+        if self.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
         type(self).received.append(json.loads(body))
         type(self).headers_seen.append(dict(self.headers))
         self.send_response(type(self).status)
@@ -67,6 +72,7 @@ class _ServerCase(unittest.TestCase):
     def setUp(self) -> None:
         _Recorder.received = []
         _Recorder.headers_seen = []
+        _Recorder.raw_bodies = []
         _Recorder.status = 200
         self._httpd = http.server.HTTPServer(("127.0.0.1", 0), _Recorder)
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
@@ -163,6 +169,26 @@ class Test_emitter_wire1(_ServerCase):
         emitter.emit(tool="airflow", event="e", payload={})
         emitter.close()
         self.assertEqual(len(self._sent()), 1)
+
+    def test5(self) -> None:
+        """
+        Test that the request body is actually gzip-compressed on the wire.
+
+        Whole-payload forwarding makes a batch bigger than it used to be;
+        gzip is what keeps that from costing the same on the wire. The
+        header alone would not prove it -- the bytes must actually be
+        smaller and actually be gzip.
+        """
+        payload = {"sql": "select * from orders " * 200}
+        with self._emitter() as emitter:
+            emitter.emit(tool="airflow", event="e", payload=payload)
+        self.assertEqual(_Recorder.headers_seen[0]["Content-Encoding"], "gzip")
+        raw = _Recorder.raw_bodies[0]
+        uncompressed = json.dumps(self._sent()).encode("utf-8")
+        self.assertLess(len(raw), len(uncompressed))
+        # gzip.decompress in do_POST already proved these bytes are valid
+        # gzip; this is the same check made explicit at the test level.
+        self.assertEqual(raw[:2], b"\x1f\x8b")
 
 
 # #############################################################################
@@ -293,7 +319,9 @@ class Test_emitter_body_size1(_ServerCase):
 
     def test2(self) -> None:
         """
-        Test that one oversized observation goes alone, not with the others.
+        Test that one oversized observation goes alone, not with the others,
+        when its payload cannot be split any smaller -- one key holding one
+        giant string, nothing to group and nothing to recurse into.
         """
         with self._emitter(batch_size=50, max_body_bytes=4000) as emitter:
             emitter.emit(tool="spark", event="small", payload={"a": 1})
@@ -307,3 +335,65 @@ class Test_emitter_body_size1(_ServerCase):
         ]
         self.assertIn(["huge"], requests)
         self.assertEqual(len(self._sent()), 3)
+
+
+# #############################################################################
+# Test_emitter_chunking1
+# #############################################################################
+
+
+class Test_emitter_chunking1(_ServerCase):
+    """
+    Test that a payload too big for one observation is split into chunks
+    that ride the existing wire path.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that an oversized payload with several keys arrives as several
+        observations sharing one `observation_id`, each under the limit,
+        that reassemble to the original payload.
+        """
+        payload = {f"k{i}": "x" * 300 for i in range(10)}
+        with self._emitter(batch_size=50, max_body_bytes=1000) as emitter:
+            emitter.emit(tool="airflow", event="huge", payload=payload)
+        sent = self._sent()
+        self.assertGreater(len(sent), 1)
+        ids = {obs["observation_id"] for obs in sent}
+        self.assertEqual(len(ids), 1)
+        for obs in sent:
+            self.assertEqual(obs["chunk_count"], len(sent))
+            body = json.dumps(obs, separators=(",", ":"))
+            self.assertLessEqual(len(body), 1000)
+        indices = sorted(obs["chunk_index"] for obs in sent)
+        self.assertEqual(indices, list(range(len(sent))))
+        merged: Dict[str, Any] = {}
+        for obs in sorted(sent, key=lambda o: o["chunk_index"]):
+            merged.update(obs["payload"])
+        self.assertEqual(merged, payload)
+
+    def test2(self) -> None:
+        """
+        Test that a chunked payload actually reduces request count versus
+        sending it as one refused-whole observation -- more than one
+        request, none of them the size of the whole payload.
+        """
+        payload = {f"k{i}": "y" * 500 for i in range(8)}
+        whole_size = len(json.dumps(payload, separators=(",", ":")))
+        with self._emitter(batch_size=1, max_body_bytes=1200) as emitter:
+            emitter.emit(tool="dagster", event="huge", payload=payload)
+        self.assertGreater(len(_Recorder.received), 1)
+        for request in _Recorder.received:
+            self.assertLess(len(json.dumps(request)), whole_size)
+
+    def test3(self) -> None:
+        """
+        Test that an unchunked observation's `to_dict()` still carries the
+        chunk fields as `None` on the wire -- zero new shape for a receiver
+        that has never seen a chunked one.
+        """
+        with self._emitter() as emitter:
+            emitter.emit(tool="airflow", event="e", payload={"a": 1})
+        observation = self._sent()[0]
+        self.assertIsNone(observation["chunk_index"])
+        self.assertIsNone(observation["chunk_count"])

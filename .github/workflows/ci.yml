@@ -75,18 +75,17 @@ jobs:
       - run: pip install black isort flake8 mypy pylint
       # black and isort rewrite files. --check and --check-only make them
       # report instead, so a run cannot quietly pass by fixing what it was
-      # meant to fail on.
-      # The e2e stacks are linted against this directory's configuration
-      # too, named explicitly because the tools otherwise look beside the
-      # files.
+      # meant to fail on. The e2e stacks used to be linted here too; they
+      # moved to collect/e2e-observe, which lints them under collect's own
+      # configuration.
       - name: Lint
         working-directory: python
         run: |
-          isort --check-only --settings-path . src plugins ../e2e
-          black --check --config pyproject.toml src plugins ../e2e
-          flake8 --config .flake8 src plugins ../e2e
-          mypy --config-file mypy.ini src plugins ../e2e
-          pylint --rcfile .pylintrc src/convalesce_emit plugins/*/src/convalesce_emit_* $(find ../e2e -name '*.py')
+          isort --check-only --settings-path . src plugins
+          black --check --config pyproject.toml src plugins
+          flake8 --config .flake8 src plugins
+          mypy --config-file mypy.ini src plugins
+          pylint --rcfile .pylintrc src/convalesce_emit plugins/*/src/convalesce_emit_*
 
   python-test:
     runs-on: ubuntu-latest

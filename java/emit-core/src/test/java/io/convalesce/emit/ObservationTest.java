@@ -21,8 +21,16 @@ public class ObservationTest {
     assertTrue(json.contains("\"tool\":\"spark\""));
     assertTrue(json.contains("\"event\":\"SparkListenerJobEnd\""));
     assertTrue(json.contains("\"tool_version\":\"3.5.0\""));
-    assertTrue(json.contains("\"envelope_version\":1"));
+    assertTrue(json.contains("\"envelope_version\":2"));
     assertTrue(json.contains("\"client_version\":\"" + Version.VERSION + "\""));
+  }
+
+  @Test
+  public void declaresNothingExcludedSinceThePayloadIsNotWalked() {
+    // This client embeds Spark's own JsonProtocol output verbatim; there is no walker of ours to
+    // declare an exclusion for.
+    String json = new Observation("spark", "e", "{}", null).toJson();
+    assertTrue(json.contains("\"excluded\":[]"));
   }
 
   @Test
