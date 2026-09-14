@@ -9,6 +9,12 @@ is the entire point of this module.
 Run with `make test`.
 """
 
+# Every test file in this suite keeps its own private local-HTTP-server /
+# _Recorder harness rather than sharing one, `test_retry.py` and
+# `test_client.py` included, so each test file stays self-contained and
+# readable on its own; the check is turned off here rather than there too.
+# pylint: disable=duplicate-code
+
 import http.server
 import json
 import logging

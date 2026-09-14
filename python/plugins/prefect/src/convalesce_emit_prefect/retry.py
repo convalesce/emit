@@ -94,6 +94,13 @@ import convalesce_emit as cemit
 import convalesce_emit.retry as ceretry
 import convalesce_emit_prefect._version as ceprefectver
 
+# Airflow, Dagster and Prefect each run the same poll/claim/act/report shape
+# here, differing only in the native API each calls to act on a claim. Each
+# plugin is independently installable with zero cross-plugin dependency, so
+# sharing this would add a dependency for no real benefit; the similarity
+# stays and the check is turned off here rather than everywhere.
+# pylint: disable=duplicate-code
+
 TOOL = "prefect"
 
 _LOG = logging.getLogger(__name__)

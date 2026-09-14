@@ -11,6 +11,12 @@ entrypoint.
 Run with `make test`.
 """
 
+# Airflow, Dagster and Prefect each test their retry executor against the
+# same local HTTP server / _Recorder harness shape. Each plugin is
+# independently installable with zero cross-plugin dependency, so sharing a
+# test harness module between them would add one for no real benefit; the
+# similarity stays and the check is turned off here rather than everywhere.
+# pylint: disable=duplicate-code
 # pylint: disable=protected-access
 
 import http.server
