@@ -12,7 +12,8 @@ import convalesce_emit_dagster.sensor as cedsens
 """
 
 import logging
-from typing import Any, Dict, Optional
+import os
+from typing import Any, Dict, List, Optional
 
 import convalesce_emit as cemit
 
@@ -59,6 +60,34 @@ _FROM_INSTANCE = (
 # what ran, and left in they crowd the ops out of the payload's budget.
 _SNAPSHOT_NOISE = ("config_schema_snapshot", "dagster_type_namespace_snapshot")
 
+# The event types the event log is read for: what an asset materialised or
+# observed, what an IO manager handled or loaded, and a resource coming up --
+# the facts the run's stats and snapshots above say nothing about, because
+# none of them is a step's own output.
+_EVENT_LOG_TYPE_NAMES = (
+    "ASSET_MATERIALIZATION",
+    "ASSET_OBSERVATION",
+    "HANDLED_OUTPUT",
+    "LOADED_INPUT",
+    "RESOURCE_INIT_SUCCESS",
+)
+
+# The metadata on a materialisation or observation event is free text an
+# asset's own author attaches to describe what ran -- row counts, sample
+# values, arbitrary JSON -- and is by far the widest sensitive-data surface
+# of any of these five packages. Redacted the same way a Great Expectations
+# sample is, scoped to this call so no other package's "metadata" field is
+# touched.
+_EVENT_LOG_SAMPLE_KEYS = frozenset({"metadata"})
+
+# Dagster Cloud's own build of the deployment: which one, and from which
+# commit. Name-prefixed rather than read off any tool object, the same as
+# the Cloud UI itself documents these. `_CLOUD_ENV_SECRET_MARKERS` is a
+# second guard beyond the documented list, in case a future variable in this
+# namespace ever carries a credential.
+_CLOUD_ENV_PREFIX = "DAGSTER_CLOUD_"
+_CLOUD_ENV_SECRET_MARKERS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
+
 
 def emit_dagster_event(
     event: str, payload: Any, emitter: Optional[cemit.EmitterLike] = None
@@ -72,12 +101,15 @@ def emit_dagster_event(
         not given
     :return: nothing
     """
+    budget = cemit.new_budget()
+    dumped = cemit.dump(payload, budget=budget)
     cemit.send_one(
         tool=TOOL,
         event=event,
-        payload=cemit.dump(payload),
+        payload=dumped,
         emitter=emitter,
         tool_version=cemit.version_of("dagster"),
+        excluded=budget.excluded,
     )
 
 
@@ -103,19 +135,38 @@ def convalesce_sensor(
     """
     target = emitter or cemit.Emitter()
     parts = unwrap_context(context)
+    had_parts = bool(parts)
     run = parts.get("dagster_run")
     if run is not None:
         parts.update(reach_instance(context, run))
-    payload = {**parts, **kwargs} if parts else {"context": context, **kwargs}
-    body = cemit.dump(payload)
+    groups = asset_group_names(context)
+    if groups:
+        parts["asset_group_names"] = groups
+    cloud_env = cloud_environment()
+    if cloud_env:
+        parts["cloud_environment"] = cloud_env
+    payload = (
+        {**parts, **kwargs} if had_parts else {"context": context, **kwargs}
+    )
+    budget = cemit.new_budget()
+    body = cemit.dump(payload, budget=budget)
+    excluded = budget.excluded
     if isinstance(body, dict) and "job_snapshot" in body:
         body["job_snapshot"] = prune_snapshot(body["job_snapshot"])
+    if isinstance(body, dict) and "event_log" in body:
+        body["event_log"], redacted = cemit.redact_samples(
+            body["event_log"],
+            path="event_log",
+            extra_keys=_EVENT_LOG_SAMPLE_KEYS,
+        )
+        excluded = excluded + redacted
     cemit.send_one(
         tool=TOOL,
         event="run_status",
         payload=body,
         emitter=target,
         tool_version=cemit.version_of("dagster"),
+        excluded=excluded,
     )
     target.flush()
 
@@ -151,6 +202,139 @@ def reach_instance(context: Any, run: Any) -> Dict[str, Any]:
             continue
         if value is not None:
             out[name] = value
+    run_id = getattr(run, "run_id", None)
+    if run_id:
+        event_log = read_event_log(instance, run_id)
+        if event_log:
+            out["event_log"] = event_log
+    return out
+
+
+def read_event_log(instance: Any, run_id: str) -> Optional[List[Any]]:
+    """
+    The run's own event log, filtered to what is worth forwarding.
+
+    `instance.all_logs`, the call this was written against, is gone on
+    Dagster 1.13 -- removed in favour of `get_records_for_run`, which both
+    1.7 and 1.13 carry, found by reading the two versions' own source rather
+    than assumed from the older one alone. Filtered the same way either
+    method would have been: to asset materialisations and observations, what
+    an IO manager handled or loaded, and a resource coming up.
+
+    :param instance: the run-status context's own `instance`
+    :param run_id: the run this event log belongs to
+    :return: the matching records, forwarded whole; empty when Dagster is
+        absent, the types could not be resolved, or nothing matched
+    """
+    of_type = _event_log_types()
+    if not of_type:
+        return None
+    method = getattr(instance, "get_records_for_run", None)
+    if not callable(method):
+        return None
+    try:
+        connection = method(run_id, of_type=of_type)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: could not read the event log: %s", exc)
+        return None
+    records = getattr(connection, "records", None)
+    return list(records) if records else None
+
+
+def _event_log_types() -> Optional[Any]:
+    """
+    The `DagsterEventType` members the event log is filtered to.
+
+    Imported here, not at module level: this package depends on nothing but
+    the client, and must still import where Dagster is absent.
+
+    :return: the members that exist on this Dagster, or None when Dagster is
+        absent or named none of them
+    """
+    try:
+        # pylint: disable=import-outside-toplevel
+        from dagster import DagsterEventType
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    members = {
+        getattr(DagsterEventType, name)
+        for name in _EVENT_LOG_TYPE_NAMES
+        if hasattr(DagsterEventType, name)
+    }
+    return members or None
+
+
+def asset_group_names(context: Any) -> Dict[str, str]:
+    """
+    Asset key to group name, from the sensor's own repository definition.
+
+    A group name lives on the `AssetsDefinition` an asset was declared with,
+    not on a materialisation event, so it is reachable only from the
+    repository the sensor is defined in -- never from the run or its event
+    log.
+
+    :param context: Dagster's run-status context
+    :return: dot-joined asset key to group name, for every asset a group
+        could be read for; empty when the context carries no repository
+    """
+    repository_def = getattr(context, "repository_def", None)
+    if repository_def is None:
+        return {}
+    try:
+        assets_defs = repository_def.asset_graph.assets_defs_by_key.values()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: could not read the asset graph: %s", exc)
+        return {}
+    out: Dict[str, str] = {}
+    seen: set = set()
+    for assets_def in assets_defs:
+        if id(assets_def) in seen:
+            # One multi-asset `AssetsDefinition` is the value for every key
+            # it defines; reading its groups once is enough.
+            continue
+        seen.add(id(assets_def))
+        try:
+            groups = assets_def.group_names_by_key
+        except Exception:  # pylint: disable=broad-exception-caught
+            continue
+        for key, group in groups.items():
+            out[_asset_key_text(key)] = group
+    return out
+
+
+def _asset_key_text(key: Any) -> str:
+    """
+    An `AssetKey` as the dot-joined text a receiver can key lineage off.
+
+    :param key: the asset key
+    :return: its path, dot-joined; its `str()` if it has no path
+    """
+    path = getattr(key, "path", None)
+    if isinstance(path, (list, tuple)):
+        return ".".join(str(part) for part in path)
+    return str(key)
+
+
+def cloud_environment() -> Dict[str, str]:
+    """
+    Dagster Cloud's own deployment and commit info, from its environment.
+
+    Not read off any tool object: Dagster Cloud's agent sets these in the
+    process before user code ever runs, the same way the Cloud UI itself
+    documents them. `_CLOUD_ENV_SECRET_MARKERS` is a second guard beyond the
+    documented, credential-free list, in case a future variable in this
+    namespace ever carries one.
+
+    :return: every `DAGSTER_CLOUD_*` variable found, minus anything whose
+        name suggests a credential
+    """
+    out: Dict[str, str] = {}
+    for name, value in os.environ.items():
+        if not name.startswith(_CLOUD_ENV_PREFIX):
+            continue
+        if any(marker in name.upper() for marker in _CLOUD_ENV_SECRET_MARKERS):
+            continue
+        out[name] = value
     return out
 
 

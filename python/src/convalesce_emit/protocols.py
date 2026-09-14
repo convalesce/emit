@@ -12,7 +12,7 @@ import convalesce_emit.protocols as ceproto
 """
 
 import logging
-from typing import Any, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol
 
 _LOG = logging.getLogger(__name__)
 
@@ -32,6 +32,7 @@ class EmitterLike(Protocol):
         event: str,
         payload: Any,
         tool_version: Optional[str] = None,
+        excluded: Optional[List[Dict[str, str]]] = None,
     ) -> None:
         """
         Queue one observation.
@@ -40,6 +41,8 @@ class EmitterLike(Protocol):
         :param event: which callback fired
         :param payload: the tool's own output, untouched
         :param tool_version: the tool's version, where it could be read
+        :param excluded: everything in `payload` that did not cross whole,
+            by path and reason
         :return: nothing
         """
 

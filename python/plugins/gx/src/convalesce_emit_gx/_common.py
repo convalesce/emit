@@ -81,6 +81,45 @@ def shape(payload: Any) -> Any:
     return {"args": args, "kwargs": kwargs}
 
 
+def runtime_platform(payload: Any) -> Dict[str, str]:
+    """
+    What the execution engine says about the platform, read before the
+    runtime that carries it is left behind.
+
+    A receiver has only the datasource's *name* to go on otherwise
+    (`meta.active_batch_definition.datasource_name`), and falls back to
+    using that as the platform, which produces a urn like
+    `urn:li:dataset:(urn:li:dataPlatform:orders,orders,PROD)` for a
+    datasource named `orders`. On 0.x the engine's own dialect is the real
+    platform -- `engine.dialect.name`, never the engine's URL, so no
+    credential travels.
+
+    :param payload: the action's own arguments, before `shape()` reshapes
+        them
+    :return: `execution_engine_class` and, where the engine is backed by a
+        live SQLAlchemy engine, `dialect_name`; empty when nothing runtime
+        was handed to this action, or it named no engine
+    """
+    if not isinstance(payload, dict):
+        return {}
+    candidates: List[Any] = list(payload.get("args") or [])
+    candidates.extend((payload.get("kwargs") or {}).values())
+    for value in candidates:
+        if not is_runtime(value):
+            continue
+        engine = getattr(value, "execution_engine", None)
+        if engine is None:
+            continue
+        out: Dict[str, str] = {"execution_engine_class": type(engine).__name__}
+        sa_engine = getattr(engine, "engine", None)
+        dialect = getattr(sa_engine, "dialect", None)
+        name = getattr(dialect, "name", None)
+        if name:
+            out["dialect_name"] = str(name)
+        return out
+    return {}
+
+
 def forward(
     payload: Any, emitter: Optional[cemit.EmitterLike] = None
 ) -> Dict[str, Any]:
@@ -102,9 +141,15 @@ def forward(
     :return: whether the observation was emitted, and whether it was redacted
     """
     redact = not send_samples()
-    body = cemit.dump(shape(payload))
+    platform = runtime_platform(payload)
+    budget = cemit.new_budget()
+    body = cemit.dump(shape(payload), budget=budget)
+    if platform and isinstance(body, dict):
+        body.update(platform)
+    excluded = budget.excluded
     if redact:
-        body = cemit.redact_samples(body)
+        body, redacted = cemit.redact_samples(body)
+        excluded = excluded + redacted
     try:
         target = emitter or cemit.Emitter()
         target.emit(
@@ -112,6 +157,7 @@ def forward(
             event="validation_result",
             payload=body,
             tool_version=cemit.version_of("great_expectations"),
+            excluded=excluded,
         )
         target.flush()
     except Exception as exc:  # pylint: disable=broad-exception-caught

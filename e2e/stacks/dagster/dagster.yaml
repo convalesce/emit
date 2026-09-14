@@ -1,3 +1,0 @@
-# Sensors tick every 30 seconds by default; the sensor itself asks for less.
-telemetry:
-  enabled: false

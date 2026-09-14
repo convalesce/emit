@@ -100,9 +100,13 @@ the open `tool-plugin` issues, then:
 5. **A probe** in `.github/scripts/probe_<tool>.py` that registers with a
    real install of the tool and fires a real callback, and a row per
    version boundary in the `tools` matrix in `ci.yml`.
-6. **A stack** under `e2e/stacks/<tool>/` that runs the tool in Docker with
+6. **A stack**, in the sibling `collect` checkout under
+   `collect/e2e-observe/stacks/<tool>/`, that runs the tool in Docker with
    the plugin installed the way a customer installs it, plus a test in
-   `e2e/test_<tool>.py`, and a row in the `e2e.yml` matrix.
+   `collect/e2e-observe/test_<tool>.py`, and a row in that repo's
+   e2e-observe workflow matrix. Emit itself keeps only the dry-run probe in
+   the item above; the integration stacks live in `collect`, against a real
+   receiver, not a stand-in.
 7. **Docs**: a README in the plugin that shows the wiring, a row in
    `docs/version-support.md` with every version verified, and the tool in
    the table at the top of the repository README.

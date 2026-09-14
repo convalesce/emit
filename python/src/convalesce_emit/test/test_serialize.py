@@ -4,9 +4,14 @@ Tests for shaping a tool's own objects into JSON.
 Run with `make test`.
 """
 
+import base64
+import datetime
+import decimal
 import json
 import logging
 import unittest
+import unittest.mock
+import uuid
 from typing import Any
 
 import convalesce_emit.serialize as ceserial
@@ -86,12 +91,120 @@ class Test_dump1(unittest.TestCase):
 
     def test5(self) -> None:
         """
-        Test that a self-referential object terminates rather than spinning.
+        Test that a self-referential object resolves to a real `$ref`.
+
+        Cycles used to become the opaque string "...(cycle)". Version 2's
+        `$ref` mechanism handles a cycle the same way it handles any other
+        repeat: the object is stamped `$id` once, and the self-reference
+        points at it, so a receiver can actually resolve it rather than
+        just being told one existed.
         """
         node: dict = {"name": "a"}
         node["self"] = node
-        # Deep, but finite.
-        self.assertIsInstance(ceserial.dump(node), dict)
+        out = ceserial.dump(node)
+        self.assertEqual(out["name"], "a")
+        self.assertIn("$id", out)
+        self.assertEqual(out["self"], {"$ref": out["$id"]})
+
+
+# #############################################################################
+# Test_dump_ref1
+# #############################################################################
+
+
+class Test_dump_ref1(unittest.TestCase):
+    """
+    Test that a subtree reached two ways collapses into one `$ref`.
+    """
+
+    def test1(self) -> None:
+        """
+        Test the shape of Airflow issue #34: a task instance carries its
+        DAG, and the dag run carries the same DAG object. The listener dumps
+        the task instance and the dag run as two separate `dump()` calls;
+        they must share a budget for the repeat to collapse.
+        """
+
+        class Dag:
+            """Stands in for an Airflow DAG."""
+
+            def __init__(self) -> None:
+                self.dag_id = "nightly"
+
+        dag = Dag()
+
+        class Task:
+            """Stands in for an operator."""
+
+            def __init__(self, dag: Any) -> None:
+                self.task_id = "load"
+                self.dag = dag
+
+        class DagRun:
+            """Stands in for an Airflow DagRun."""
+
+            def __init__(self, dag: Any) -> None:
+                self.run_id = "manual__1"
+                self.dag = dag
+
+        budget = ceserial.new_budget()
+        task_out = ceserial.dump(Task(dag), budget=budget, path="task")
+        dag_run_out = ceserial.dump(DagRun(dag), budget=budget, path="dag_run")
+
+        self.assertEqual(task_out["dag"]["dag_id"], "nightly")
+        self.assertIn("$id", task_out["dag"])
+        self.assertEqual(dag_run_out["dag"], {"$ref": task_out["dag"]["$id"]})
+
+    def test2(self) -> None:
+        """
+        Test that a subtree dumped only once carries no `$id` at all.
+
+        The mechanism must cost nothing for the overwhelmingly common case
+        where nothing repeats.
+        """
+
+        class Dag:
+            """Stands in for an Airflow DAG."""
+
+            def __init__(self) -> None:
+                self.dag_id = "nightly"
+
+        out = ceserial.dump({"task_id": "load", "dag": Dag()})
+        self.assertNotIn("$id", out["dag"])
+        self.assertEqual(out["dag"]["dag_id"], "nightly")
+
+    def test3(self) -> None:
+        """
+        Test that two separate `dump()` calls that do NOT share a budget do
+        NOT collapse -- sharing is opt-in by passing the same budget.
+        """
+
+        class Dag:
+            """Stands in for an Airflow DAG."""
+
+            def __init__(self) -> None:
+                self.dag_id = "nightly"
+
+        dag = Dag()
+        first = ceserial.dump({"dag": dag})
+        second = ceserial.dump({"dag": dag})
+        self.assertNotIn("$id", first["dag"])
+        self.assertNotIn("$ref", second["dag"])
+        self.assertEqual(second["dag"]["dag_id"], "nightly")
+
+    def test4(self) -> None:
+        """
+        Test that a list reached two ways is not ref-collapsed.
+
+        Lists cannot be stamped with `$id` after the fact, so this is a
+        deliberate, narrower scope than dicts and objects: each occurrence
+        of a shared list is dumped in full.
+        """
+        shared = [1, 2, 3]
+        budget = ceserial.new_budget()
+        out = ceserial.dump({"a": shared, "b": shared}, budget=budget)
+        self.assertEqual(out["a"], [1, 2, 3])
+        self.assertEqual(out["b"], [1, 2, 3])
 
 
 # #############################################################################
@@ -101,7 +214,7 @@ class Test_dump1(unittest.TestCase):
 
 class Test_dump_budget1(unittest.TestCase):
     """
-    Test that an object graph cannot produce an unbounded payload.
+    Test that an object graph cannot allocate without bound.
     """
 
     def test1(self) -> None:
@@ -110,8 +223,8 @@ class Test_dump_budget1(unittest.TestCase):
 
         A real Prefect flow reaches its task runner, then that runner's
         logger, then the logging manager and every logger in the process:
-        one flow run produced a 256 MB payload before the walker had
-        budgets. The customer's worker is the one that pays for that.
+        one flow run produced a 256 MB payload before the walker had a skip
+        list. The customer's worker is the one that pays for that.
         """
 
         class Runner:
@@ -135,24 +248,29 @@ class Test_dump_budget1(unittest.TestCase):
 
     def test2(self) -> None:
         """
-        Test that breadth is capped, not only depth.
+        Test that breadth is no longer silently thinned.
 
-        One object holding thousands of entries is shallow and still
-        enormous, so a depth limit alone would not have caught it.
+        Version 2's whole-payload promise means a wide mapping is not
+        quietly cut down to a fixed item count the way it used to be; a
+        node budget still exists, but only as a pathological-graph backstop
+        (`Test_dump_backstop1` exercises that directly), sized far above
+        anything a real tool sends.
         """
-        wide = {f"k{i}": {"v": i} for i in range(10_000)}
-        encoded = json.dumps(ceserial.dump(wide), default=str)
-        self.assertLess(len(encoded), 200_000)
+        wide = {f"k{i}": {"v": i} for i in range(2_000)}
+        out = ceserial.dump(wide)
+        self.assertEqual(len(out), 2_000)
+        self.assertEqual(out["k0"], {"v": 0})
+        self.assertEqual(out["k1999"], {"v": 1999})
 
     def test3(self) -> None:
         """
-        Test that a cycle is reported rather than followed.
+        Test that a cycle is reported as a real, resolvable `$ref`.
         """
         node: dict = {"name": "a"}
         node["self"] = node
         out = ceserial.dump(node)
         self.assertEqual(out["name"], "a")
-        self.assertIn("cycle", str(out["self"]))
+        self.assertEqual(out["self"], {"$ref": out["$id"]})
 
     def test4(self) -> None:
         """
@@ -167,6 +285,63 @@ class Test_dump_budget1(unittest.TestCase):
         Run = collections.namedtuple("Run", ["job_name", "run_id"])
         out = ceserial.dump(Run(job_name="nightly", run_id="abc"))
         self.assertEqual(out, {"job_name": "nightly", "run_id": "abc"})
+
+
+# #############################################################################
+# Test_dump_backstop1
+# #############################################################################
+
+
+class Test_dump_backstop1(unittest.TestCase):
+    """
+    Test the last-resort limits that protect a customer's process, and that
+    hitting one is always declared, never silent.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the node backstop stops a runaway walk and says so.
+        """
+        budget = ceserial.Budget(nodes=2)
+        deep = {"a": {"b": {"c": {"d": 1}}}}
+        ceserial.dump(deep, budget=budget)
+        self.assertTrue(
+            any(e["reason"] == "node backstop" for e in budget.excluded)
+        )
+
+    def test2(self) -> None:
+        """
+        Test that the depth backstop stops pathological, non-repeating
+        nesting and says so, without raising.
+
+        A real tool object graph never nests past eight; this patches the
+        backstop down so the test does not have to build hundreds of levels
+        to prove the mechanism works.
+        """
+        deep: Any = "leaf"
+        for _ in range(10):
+            deep = {"child": deep}
+        with unittest.mock.patch.object(ceserial, "_DEPTH_BACKSTOP", 3):
+            budget = ceserial.new_budget()
+            out = ceserial.dump(deep, budget=budget)
+        self.assertTrue(
+            any(e["reason"] == "depth backstop" for e in budget.excluded)
+        )
+        self.assertIsNotNone(json.dumps(out))
+
+    def test3(self) -> None:
+        """
+        Test that ordinary nesting no longer hits a shallow cap.
+
+        The old cap of ten would have described this at level ten and lost
+        the leaf; version 2 forwards the whole payload.
+        """
+        deep: Any = "leaf"
+        for _ in range(20):
+            deep = {"child": deep}
+        out = ceserial.dump(deep)
+        text = json.dumps(out)
+        self.assertIn('"child": "leaf"', text)
 
 
 # #############################################################################
@@ -231,15 +406,14 @@ class Test_dump_depth1(unittest.TestCase):
 
     def test3(self) -> None:
         """
-        Test that the depth limit still holds on pathological nesting.
+        Test that ordinary, non-pathological nesting is not cut short.
         """
         deep: Any = "leaf"
         for _ in range(20):
             deep = {"child": deep}
         out = ceserial.dump(deep)
         text = json.dumps(out)
-        self.assertIn("child", text)
-        self.assertNotIn('"child": "leaf"', text)
+        self.assertIn('"child": "leaf"', text)
 
     def test4(self) -> None:
         """
@@ -610,6 +784,161 @@ class Test_dump_non_finite1(unittest.TestCase):
 
 
 # #############################################################################
+# Test_dump_datetime1
+# #############################################################################
+
+
+class Test_dump_datetime1(unittest.TestCase):
+    """
+    Test that the shapes datetime-adjacent values fall through to are
+    normalised, rather than crossing as whatever `str()` gives.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a datetime crosses as ISO-8601, not `str()`'s space.
+
+        The envelope's own `emitted_at` is ISO-8601; a payload's own
+        datetime used to cross with a space separator instead of a "T",
+        and the two shapes never matched.
+        """
+        when = datetime.datetime(
+            2026, 9, 12, 16, 0, 0, tzinfo=datetime.timezone.utc
+        )
+        out = ceserial.dump({"emitted_at": when})
+        self.assertEqual(out["emitted_at"], when.isoformat())
+        self.assertIn("T", out["emitted_at"])
+
+    def test2(self) -> None:
+        """
+        Test that a bare date crosses as ISO-8601 too.
+        """
+        out = ceserial.dump({"day": datetime.date(2026, 9, 12)})
+        self.assertEqual(out["day"], "2026-09-12")
+
+    def test3(self) -> None:
+        """
+        Test that a duration crosses as a number of seconds.
+        """
+        out = ceserial.dump({"duration": datetime.timedelta(seconds=90)})
+        self.assertEqual(out["duration"], 90.0)
+
+    def test4(self) -> None:
+        """
+        Test that a UUID crosses as its text form.
+        """
+        value = uuid.uuid4()
+        out = ceserial.dump({"observation_id": value})
+        self.assertEqual(out["observation_id"], str(value))
+
+    def test5(self) -> None:
+        """
+        Test that a Decimal crosses as text, not a float.
+
+        A float would silently lose precision a Decimal was chosen to keep.
+        """
+        out = ceserial.dump({"amount": decimal.Decimal("19.99")})
+        self.assertEqual(out["amount"], "19.99")
+
+    def test6(self) -> None:
+        """
+        Test that bytes cross as base64, not `str()`'s `b'...'` repr.
+        """
+        out = ceserial.dump({"body": b"hello"})
+        self.assertEqual(out["body"], base64.b64encode(b"hello").decode("ascii"))
+
+
+# #############################################################################
+# Test_dump_excluded1
+# #############################################################################
+
+
+class Test_dump_excluded1(unittest.TestCase):
+    """
+    Test that everything left out of a payload is declared, by path and
+    reason, rather than vanishing silently.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the bulk-data guard is declared.
+        """
+
+        class Frame:
+            """Stands in for a pandas DataFrame."""
+
+            shape = (4, 2)
+
+            def to_dict(self) -> Any:
+                """Return every row, the way pandas does."""
+                return {"email": {"0": "alice@example.com"}}
+
+        budget = ceserial.new_budget()
+        ceserial.dump({"data": Frame()}, budget=budget)
+        self.assertEqual(
+            budget.excluded, [{"path": "data", "reason": "bulk data"}]
+        )
+
+    def test2(self) -> None:
+        """
+        Test that a default-skipped name is dropped and declared.
+        """
+
+        class TaskInstance:
+            """Stands in for an Airflow task instance."""
+
+            def __init__(self) -> None:
+                self.state = "failed"
+                self.logger = "would-be-a-real-logger"
+
+        budget = ceserial.new_budget()
+        out = ceserial.dump(TaskInstance(), budget=budget)
+        self.assertNotIn("logger", out)
+        self.assertEqual(
+            budget.excluded,
+            [{"path": "logger", "reason": "excluded by name"}],
+        )
+
+    def test3(self) -> None:
+        """
+        Test that "parent" and "root" are no longer skipped by default.
+
+        A payload key legitimately called `parent` or `root` used to vanish
+        because some other tool's object happened to keep a live
+        back-reference under the same name.
+        """
+        out = ceserial.dump({"parent": "orders", "root": "warehouse"})
+        self.assertEqual(out["parent"], "orders")
+        self.assertEqual(out["root"], "warehouse")
+
+    def test4(self) -> None:
+        """
+        Test that a caller's own path-scoped skip drops only that location.
+        """
+        budget = ceserial.new_budget(skip=frozenset({"task.parent"}))
+        out = ceserial.dump(
+            {"task": {"parent": "hidden"}, "parent": "kept"}, budget=budget
+        )
+        self.assertNotIn("parent", out["task"])
+        self.assertEqual(out["parent"], "kept")
+        self.assertIn(
+            {"path": "task.parent", "reason": "excluded by name"},
+            budget.excluded,
+        )
+
+    def test5(self) -> None:
+        """
+        Test that the default plumbing names are still dropped everywhere.
+
+        Only "parent" and "root" were narrowed; a logger is never legitimate
+        payload data, wherever it turns up.
+        """
+        out = ceserial.dump({"handlers": ["h1"], "task": {"logger": "x"}})
+        self.assertNotIn("handlers", out)
+        self.assertNotIn("logger", out["task"])
+
+
+# #############################################################################
 # Test_dump_fields1
 # #############################################################################
 
@@ -703,6 +1032,47 @@ class Test_dump_fields1(unittest.TestCase):
         out = ceserial.dump(Record())
         self.assertEqual(out["step_key"], "load")
         self.assertIn("unreadable", out["materialization_events"])
+
+    def test4(self) -> None:
+        """
+        Test that an `attrs.define`-slotted object is read by its fields.
+
+        `attrs.define` defaults to `slots=True`: no `__dict__`, and no
+        `_fields` either -- `__attrs_attrs__`, attrs' own marker, sits on
+        the class instead. Airflow 3.2's `on_asset_event_emitted` hands the
+        listener exactly this shape; a real `attrs` dependency is not
+        needed to prove the introspection, just its class-level marker.
+        """
+
+        class _Attribute:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        class AssetEvent:
+            """Stands in for Airflow 3.2's attrs-slotted `AssetEvent`."""
+
+            __slots__ = ("source_dag_id", "source_task_id")
+            __attrs_attrs__ = (
+                _Attribute("source_dag_id"),
+                _Attribute("source_task_id"),
+            )
+
+            def __init__(self, source_dag_id: str, source_task_id: str) -> None:
+                self.source_dag_id = source_dag_id
+                self.source_task_id = source_task_id
+
+        event = AssetEvent(
+            source_dag_id="convalesce_example", source_task_id="publish"
+        )
+        self.assertFalse(hasattr(event, "__dict__"))
+        out = ceserial.dump({"asset_event": event})
+        self.assertEqual(
+            out["asset_event"],
+            {
+                "source_dag_id": "convalesce_example",
+                "source_task_id": "publish",
+            },
+        )
 
 
 # #############################################################################

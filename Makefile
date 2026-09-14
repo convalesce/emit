@@ -1,5 +1,5 @@
 # Delegates to each language's own gate.
-.PHONY: lint test lint-python test-python lint-java test-java e2e
+.PHONY: lint test lint-python test-python lint-java test-java
 
 lint: lint-python lint-java
 test: test-python test-java
@@ -16,6 +16,6 @@ lint-java:
 test-java:
 	cd java && ./gradlew --quiet test
 
-# One tool, one version, for real in Docker. See e2e/README.md.
-e2e:
-	cd e2e && EMIT_E2E_$$(echo $(TOOL) | tr a-z A-Z)=$(VERSION) python -m pytest test_$(TOOL).py
+# The real-Docker e2e stacks moved to collect/e2e-observe/ (a sibling
+# checkout's problem now, not this repo's): `cd ../collect/e2e-observe &&
+# EMIT_E2E_<TOOL>=<version> pytest test_<tool>.py`.

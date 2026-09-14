@@ -35,6 +35,14 @@ And one field is named rather than walked. A task belongs to a task group,
 and a task group holds its own copy of the whole DAG, so it was 40% of a
 task event and every byte of it appeared elsewhere already.
 
+`on_asset_event_emitted` does not exist before Airflow 3.2.0 (confirmed
+against the real hookspec source: absent at 3.0.x and 3.1.x, present from
+3.2.0). Below 3.2, an alias's resolved asset is only ever recoverable the
+way `asset_aliases()` above already does it -- read off the task's own
+outlet events, per task instance, never as its own event. Airflow 3.0/3.1
+carrying no alias-resolution *event* is an accepted gap, not a bug: nothing
+in this listener can manufacture a hook Airflow itself does not fire.
+
 Import as:
 
 import convalesce_emit_airflow.listener as cealist
@@ -76,6 +84,8 @@ _SPEC_MODULES = (
     "airflow._shared.listeners.spec.taskinstance",
     "airflow._shared.listeners.spec.dagrun",
     "airflow.sdk._shared.listeners.spec.taskinstance",
+    # Airflow 3 only; the in-tool listener never implemented these.
+    "airflow.listeners.spec.asset",
 )
 
 
@@ -90,6 +100,13 @@ WANTED = (
     "on_dag_run_failed",
     # Airflow 3 only; absent from 2.x, which the spec read handles.
     "on_task_instance_skipped",
+    "on_asset_created",
+    "on_asset_changed",
+    # Airflow 3.2+ only; absent from 3.0 and 3.1, which the spec read
+    # handles the same way. This is the only hook that carries a resolved
+    # alias->asset edge directly, rather than requiring the per-task-event
+    # reconstruction `asset_aliases()` above already does.
+    "on_asset_event_emitted",
 )
 
 # Hook arguments that are plumbing rather than anything about the run.
@@ -172,11 +189,13 @@ class _Base:
         if emitter is None:
             return
         try:
+            shaped, excluded = shape(payload)
             emitter.emit(
                 tool=TOOL,
                 event=event,
-                payload=shape(payload),
+                payload=shaped,
                 tool_version=self._version,
+                excluded=excluded,
             )
             # Sent now, not batched. Task hooks fire in a process Airflow
             # forks per task and exits without telling the listener, so
@@ -201,27 +220,268 @@ class _Base:
             self._emitter.flush()
 
 
-def shape(payload: Mapping[str, Any]) -> Dict[str, Any]:
+def shape(
+    payload: Mapping[str, Any],
+) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
     """
     Dump what a hook was handed, minus plumbing, plus the dag run.
 
+    Every value here is dumped against one shared budget rather than a fresh
+    one per key. A task carries its DAG, and on Airflow 2 the task instance
+    already carries the dag run too, which carries the same DAG object again;
+    on Airflow 3 the run is found separately and dumped in a second call. A
+    shared budget is what lets either shape collapse the repeat into a
+    `$ref` instead of sending the DAG twice.
+
     :param payload: the hook's own arguments
-    :return: what to send
+    :return: what to send, and everything left out of it, by path and reason
     """
+    budget = cemit.new_budget(summarise=_SUMMARISE)
     out = {
-        name: cemit.dump(value, summarise=_SUMMARISE)
+        name: cemit.dump(value, budget=budget, path=name)
         for name, value in payload.items()
         if name not in _SKIP_ARGS
     }
     task_instance = payload.get("task_instance")
     dumped = out.get("task_instance")
     if task_instance is None or not isinstance(dumped, dict):
-        return out
+        return out, budget.excluded
     if dumped.get("dag_run") is None:
         dag_run = find_dag_run(task_instance)
         if dag_run is not None:
-            dumped["dag_run"] = cemit.dump(dag_run, summarise=_SUMMARISE)
+            dumped["dag_run"] = cemit.dump(
+                dag_run, budget=budget, path="task_instance.dag_run"
+            )
+    task_dumped = dumped.get("task")
+    task = getattr(task_instance, "task", None)
+    if task is not None and isinstance(task_dumped, dict):
+        try:
+            connections = connection_coordinates(task)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            # A read here is not worth the run losing its task events over;
+            # see the same reasoning on the alias read just below.
+            _LOG.warning("convalesce: could not read connections: %s", exc)
+            connections = {}
+        if connections:
+            task_dumped["connections"] = connections
+    try:
+        aliases = asset_aliases(task_instance)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # Both of `asset_aliases`'s own reads are already guarded; this is
+        # the last line of defence, not the first -- a live task process
+        # already lost an entire event to an unguarded read here once (a
+        # real Airflow 3 exposed it, not a hypothetical), and nothing about
+        # an alias is worth the run losing its task events over.
+        _LOG.warning("convalesce: could not read asset aliases: %s", exc)
+        aliases = []
+    if aliases:
+        dumped["asset_aliases"] = cemit.dump(
+            aliases, budget=budget, path="task_instance.asset_aliases"
+        )
+    return out, budget.excluded
+
+
+# #############################################################################
+# connection coordinates
+# #############################################################################
+
+
+# Airflow has no single attribute name for an operator's connection: the
+# SQLite hook reads `sqlite_conn_id`, the Postgres hook `postgres_conn_id`,
+# a few operators just `conn_id`. Every attribute matching this is resolved;
+# the name is only ever used as a lookup key into Airflow's own Connection
+# model, never read for meaning.
+_CONN_ID_SUFFIX = "conn_id"
+
+
+def connection_coordinates(task: Any) -> Dict[str, Dict[str, Any]]:
+    """
+    Non-secret coordinates for every connection id the task names.
+
+    `conn_type`, `host`, `port` and `schema` only. Never `password`, never
+    `extra` -- `extra` commonly holds a second copy of the same secrets for
+    the connection types that keep them there instead.
+
+    :param task: the operator instance the hook named
+    :return: each resolved connection id to its coordinates
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    data = getattr(task, "__dict__", None)
+    if not isinstance(data, dict):
+        return out
+    for name, value in data.items():
+        if not isinstance(value, str) or not value:
+            continue
+        if name != _CONN_ID_SUFFIX and not name.endswith(f"_{_CONN_ID_SUFFIX}"):
+            continue
+        if value in out:
+            continue
+        try:
+            connection = _get_connection(value)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            # A connection id that does not resolve -- deleted, or a default
+            # this Airflow never seeded -- is Airflow's business, not a
+            # reason to drop the rest of the event.
+            _LOG.debug(
+                "convalesce: could not read connection %s: %s", value, exc
+            )
+            continue
+        out[value] = {
+            "conn_id": value,
+            "conn_type": getattr(connection, "conn_type", None),
+            "host": getattr(connection, "host", None),
+            "port": getattr(connection, "port", None),
+            "schema": getattr(connection, "schema", None),
+        }
     return out
+
+
+def _get_connection(conn_id: str) -> Any:
+    """
+    Ask Airflow for one connection, by id.
+
+    Imported here rather than at module level, the same as `hookimpl`:
+    this module must still import where Airflow is absent.
+
+    :param conn_id: the connection id to resolve
+    :return: Airflow's own Connection object
+    """
+    from airflow.hooks.base import (  # pylint: disable=import-outside-toplevel
+        BaseHook,
+    )
+
+    return BaseHook.get_connection(conn_id)
+
+
+# #############################################################################
+# asset aliases
+# #############################################################################
+
+
+_OUTLET_EVENTS_KEY = "outlet_events"
+
+
+def asset_aliases(task_instance: Any) -> List[Any]:
+    """
+    Runtime-resolved asset aliases for the task's own try.
+
+    An operator can declare an `AssetAlias` outlet instead of a concrete
+    asset; which asset it actually wrote to is known only once the task
+    runs, and lands on `OutletEventAccessors` in the template context. A
+    direct asset outlet is already forwarded as-is and never carries an
+    alias, so only entries something actually resolved are worth sending.
+
+    :param task_instance: whatever the hook was handed
+    :return: the resolved alias events, forwarded whole; empty when none
+        resolved or none could be read
+    """
+    events = _aliases_from_context(task_instance)
+    if events:
+        return events
+    return _aliases_from_asset_events(task_instance)
+
+
+def _aliases_from_context(task_instance: Any) -> List[Any]:
+    """
+    Read resolved aliases off the template context the task ran with.
+
+    :param task_instance: whatever the hook was handed
+    :return: alias events found this way; empty when the context, the
+        accessor or the events are not there
+    """
+    context = _template_context(task_instance)
+    if context is None:
+        return []
+    try:
+        accessors = context[_OUTLET_EVENTS_KEY]
+        pairs = list(accessors.items())
+    except Exception:  # pylint: disable=broad-exception-caught
+        # An Airflow that shapes this differently than the version this was
+        # written against; the fallback below still has a chance.
+        return []
+    out: List[Any] = []
+    for _, accessor in pairs:
+        alias_events = getattr(accessor, "asset_alias_events", None)
+        if alias_events:
+            out.extend(alias_events)
+    return out
+
+
+def _template_context(task_instance: Any) -> Any:
+    """
+    The context the task ran with, however this task instance holds it.
+
+    :param task_instance: whatever the hook was handed
+    :return: the context, or None when none could be found
+    """
+    getter = getattr(task_instance, "get_template_context", None)
+    if callable(getter):
+        try:
+            context = getter()
+        except Exception:  # pylint: disable=broad-exception-caught
+            context = None
+        if context is not None:
+            return context
+    for value in _private_values(task_instance):
+        try:
+            if _OUTLET_EVENTS_KEY in value:
+                return value
+        except Exception:  # pylint: disable=broad-exception-caught
+            continue
+    return None
+
+
+def _aliases_from_asset_events(task_instance: Any) -> List[Any]:
+    """
+    Fall back to the `AssetEvent` rows this task's own try produced.
+
+    A real, load-bearing failure mode, found only by running this in a real
+    Airflow 3 task process rather than by reading: Airflow 3 runs a task in
+    a sandboxed process that raises the instant *anything* touches the
+    metadata database's ORM directly -- not on import, but on
+    `Session()` itself, before a query is ever built. This fallback exists
+    for Airflow 2 (the primary path below, reading the live template
+    context, is what actually works on Airflow 3); on Airflow 3 it always
+    fails here, quietly, which is exactly what it should do.
+
+    :param task_instance: whatever the hook was handed
+    :return: rows whose `source_aliases` is non-empty; a direct asset
+        outlet has none, so those rows are skipped -- they are already sent
+    """
+    dag_id = getattr(task_instance, "dag_id", None)
+    run_id = getattr(task_instance, "run_id", None)
+    task_id = getattr(task_instance, "task_id", None)
+    if not (dag_id and run_id and task_id):
+        return []
+    try:
+        # pylint: disable=import-outside-toplevel
+        from airflow.models.asset import AssetEvent
+        from airflow.settings import Session
+
+        map_index = getattr(task_instance, "map_index", -1)
+        session = Session()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: asset events unavailable: %s", exc)
+        return []
+    try:
+        rows = (
+            session.query(AssetEvent)
+            .filter(
+                AssetEvent.source_dag_id == dag_id,
+                AssetEvent.source_run_id == run_id,
+                AssetEvent.source_task_id == task_id,
+                AssetEvent.source_map_index == map_index,
+            )
+            .all()
+        )
+        return [row for row in rows if getattr(row, "source_aliases", None)]
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # A store that cannot answer is Airflow's business; the rest of the
+        # event is still worth sending.
+        _LOG.debug("convalesce: could not read asset events: %s", exc)
+        return []
+    finally:
+        session.close()
 
 
 def find_dag_run(task_instance: Any) -> Any:
