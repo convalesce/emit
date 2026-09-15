@@ -52,6 +52,19 @@ Set these on the worker; no code changes are needed.
 Try it against a real pipeline before pointing it at an account:
 `CONVALESCE_DRY_RUN=true`.
 
+## Check the connection
+
+Run this where the tool runs, with the same environment it has:
+
+```sh
+convalesce-emit check                      # or: python -m convalesce_emit check
+java -jar convalesce-emit-core-0.1.3.jar   # on a Spark driver's host
+```
+
+It sends one empty batch with the configured key and says whether the key was
+accepted, refused, or never reached us. Once it passes, the console shows the
+key as heard from.
+
 ## What gets sent
 
 ```json

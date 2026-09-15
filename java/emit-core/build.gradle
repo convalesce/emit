@@ -9,3 +9,10 @@ publishing.publications.maven.pom {
   name = 'convalesce-emit-core'
   description = project.description
 }
+
+// `java -jar convalesce-emit-core.jar` checks this machine can reach Convalesce with its key.
+jar {
+  manifest {
+    attributes 'Main-Class': 'io.convalesce.emit.Check'
+  }
+}

@@ -27,7 +27,7 @@ public final class Emitter {
 
   private static final Logger LOG = Logger.getLogger(Emitter.class.getName());
   private static final Charset UTF8 = Charset.forName("UTF-8");
-  private static final String OBSERVATIONS_PATH = "/v1/observations";
+  static final String OBSERVATIONS_PATH = "/v1/observations";
   private static final String BODY_OPEN = "{\"observations\":[";
   private static final String BODY_CLOSE = "]}";
 
@@ -195,6 +195,21 @@ public final class Emitter {
   }
 
   private void attempt(String url, byte[] body) throws TransportException {
+    post(config, url, body);
+  }
+
+  /**
+   * Makes one HTTP request with a configuration's key, without retrying.
+   *
+   * <p>Shared with {@link Check}, so the check sends exactly the headers, compression and path a
+   * real batch does.
+   *
+   * @param config whose key and timeout to use
+   * @param url where to post
+   * @param body the gzip-compressed batch
+   * @throws TransportException on any HTTP or connection failure
+   */
+  static void post(Config config, String url, byte[] body) throws TransportException {
     HttpURLConnection connection = null;
     try {
       connection = (HttpURLConnection) new URL(url).openConnection();
@@ -229,11 +244,11 @@ public final class Emitter {
     }
   }
 
-  private static String trimTrailingSlash(String value) {
+  static String trimTrailingSlash(String value) {
     return value.endsWith("/") ? value.substring(0, value.length() - 1) : value;
   }
 
-  private static byte[] gzip(byte[] data) throws java.io.IOException {
+  static byte[] gzip(byte[] data) throws java.io.IOException {
     java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(data.length);
     java.util.zip.GZIPOutputStream zipped = new java.util.zip.GZIPOutputStream(out);
     try {
