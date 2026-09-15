@@ -165,7 +165,7 @@ class Test_emitter_wire1(_ServerCase):
         """
         Test that closing flushes a partial batch.
         """
-        emitter = self._emitter(batch_size=100)
+        emitter = self._emitter(batch_size=50)
         emitter.emit(tool="airflow", event="e", payload={})
         emitter.close()
         self.assertEqual(len(self._sent()), 1)

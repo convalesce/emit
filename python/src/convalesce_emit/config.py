@@ -37,8 +37,13 @@ DEFAULT_MAX_RETRIES = 3
 # Fifty keeps a busy scheduler to roughly one request a second while staying
 # small enough that a crash loses little.
 DEFAULT_BATCH_SIZE = 50
-# The receiver refuses a request body above one megabyte, and refuses it
-# whole, so a batch is closed before it would reach that.
+# The receiver takes at most fifty observations and five megabytes in one
+# request and refuses the whole request past either, and a refusal is not
+# retried, so a configured batch may not exceed them.
+RECEIVER_MAX_OBSERVATIONS = 50
+RECEIVER_MAX_BODY_BYTES = 5_000_000
+# Well under the receiver's limit, so a batch is closed long before a request
+# could be refused for its size.
 DEFAULT_MAX_BODY_BYTES = 1_000_000
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -126,6 +131,16 @@ class Config:
         if not self.endpoint.startswith(("http://", "https://")):
             raise ceerrors.ConfigError(
                 f"endpoint must be an http(s) URL, got {self.endpoint!r}"
+            )
+        if not 0 < self.batch_size <= RECEIVER_MAX_OBSERVATIONS:
+            raise ceerrors.ConfigError(
+                f"CONVALESCE_BATCH_SIZE must be 1 to {RECEIVER_MAX_OBSERVATIONS},"
+                f" the receiver's limit, got {self.batch_size}"
+            )
+        if not 0 < self.max_body_bytes <= RECEIVER_MAX_BODY_BYTES:
+            raise ceerrors.ConfigError(
+                f"CONVALESCE_MAX_BODY_BYTES must be 1 to {RECEIVER_MAX_BODY_BYTES},"
+                f" the receiver's limit, got {self.max_body_bytes}"
             )
 
 

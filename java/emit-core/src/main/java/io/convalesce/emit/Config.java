@@ -25,8 +25,13 @@ public final class Config {
   // Fifty keeps a busy driver to roughly one request a second while staying small enough that a
   // lost batch costs little.
   private static final int DEFAULT_BATCH_SIZE = 50;
-  // The receiver refuses a request body above one megabyte, and refuses it whole, so a batch is
-  // closed before it would reach that.
+  // The receiver takes at most fifty observations and five megabytes in one request and refuses the
+  // whole request past either, and a refusal is not retried, so a configured batch may not exceed
+  // them.
+  static final int RECEIVER_MAX_OBSERVATIONS = 50;
+  static final int RECEIVER_MAX_BODY_BYTES = 5_000_000;
+  // Well under the receiver's limit, so a batch is closed long before a request could be
+  // refused for its size.
   private static final int DEFAULT_MAX_BODY_BYTES = 1_000_000;
 
   private final String endpoint;
@@ -119,6 +124,18 @@ public final class Config {
     }
     if (!endpoint.startsWith("http://") && !endpoint.startsWith("https://")) {
       return "CONVALESCE_ENDPOINT must be an http(s) URL, got: " + endpoint;
+    }
+    if (batchSize <= 0 || batchSize > RECEIVER_MAX_OBSERVATIONS) {
+      return "CONVALESCE_BATCH_SIZE must be 1 to "
+          + RECEIVER_MAX_OBSERVATIONS
+          + ", the receiver's limit, got: "
+          + batchSize;
+    }
+    if (maxBodyBytes <= 0 || maxBodyBytes > RECEIVER_MAX_BODY_BYTES) {
+      return "CONVALESCE_MAX_BODY_BYTES must be 1 to "
+          + RECEIVER_MAX_BODY_BYTES
+          + ", the receiver's limit, got: "
+          + maxBodyBytes;
     }
     return null;
   }

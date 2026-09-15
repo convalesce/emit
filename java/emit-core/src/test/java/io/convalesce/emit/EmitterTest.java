@@ -164,7 +164,7 @@ public class EmitterTest {
 
   @Test
   public void closeFlushesAPartialBatch() {
-    Emitter emitter = emitter(100, 0);
+    Emitter emitter = emitter(Config.RECEIVER_MAX_OBSERVATIONS, 0);
     emitter.emit("spark", "e", "{}", null);
     assertEquals(0, bodies.size());
     emitter.close();
@@ -210,6 +210,14 @@ public class EmitterTest {
   @Test
   public void usableConfigValidatesClean() {
     assertNull(Config.of(url, "k", 1, 0).validate());
+  }
+
+  @Test
+  public void limitsBeyondTheReceiverAreReported() {
+    // The receiver refuses such a request whole with a 400, which is not retried.
+    assertNotNull(Config.of(url, "k", Config.RECEIVER_MAX_OBSERVATIONS + 1, 0).validate());
+    assertNotNull(Config.of(url, "k", 1, 0, Config.RECEIVER_MAX_BODY_BYTES + 1).validate());
+    assertNull(Config.of(url, "k", Config.RECEIVER_MAX_OBSERVATIONS, 0).validate());
   }
 
   private static byte[] readBytes(InputStream in) throws java.io.IOException {
