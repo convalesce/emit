@@ -21,6 +21,10 @@ requires-python = ">=3.9"
 # works in someone else's pipeline. Transport is urllib from the stdlib.
 dependencies = []
 
+[project.scripts]
+# Run where the tool runs, to prove its key and endpoint reach Convalesce.
+convalesce-emit = "convalesce_emit.cli:main"
+
 [dependency-groups]
 dev = [
   { include-group = "lint" },
