@@ -9,11 +9,17 @@ Nothing here raises into the caller. A customer's DAG must not go red because
 our endpoint had a bad minute: we are watching their pipeline, not standing
 in it.
 
+Nothing here is thrown away either. A batch that cannot be delivered goes to
+the local spool and is sent again after the next send that succeeds; a batch
+the receiver refuses is split so one bad observation cannot take the others
+with it, and whatever is still refused is kept on disk rather than dropped.
+
 Import as:
 
 import convalesce_emit.client as ceclient
 """
 
+import atexit
 import gzip
 import json
 import logging
@@ -22,6 +28,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import weakref
 from typing import Any, Dict, List, Optional
 
 import convalesce_emit._version as ceversio
@@ -30,12 +37,20 @@ import convalesce_emit.config as ceconfig
 import convalesce_emit.envelope as ceenvelo
 import convalesce_emit.errors as ceerrors
 import convalesce_emit.protocols as ceproto
+import convalesce_emit.spool as cespool
 
 _LOG = logging.getLogger(__name__)
 
 # Retry only what a retry can fix. A 400 means the receiver understood us and
 # said no; sending it again just wastes the pipeline's time.
 RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+# What the receiver says when it read the batch and will never take it as
+# sent. Anything else that fails -- an outage, a wrong key, no network -- is
+# worth sending again later.
+REFUSED_STATUS = frozenset({400, 413, 422})
+# Spooled batches sent after one successful send, at most. Bounds how long a
+# long outage's backlog can hold up the caller that finally got through.
+_DRAIN_PER_SEND = 20
 
 _OBSERVATIONS_PATH = "/v1/observations"
 # What wrapping a batch costs on the wire, beyond the observations and the
@@ -69,6 +84,12 @@ class Emitter:
         self._lock = threading.Lock()
         self._batch: List[ceenvelo.Observation] = []
         self._batch_bytes = 0
+        self._spool = cespool.Spool(
+            self.config.spool_directory(), self.config.spool_max_bytes
+        )
+        # A caller that never flushes still gets its last partial batch out
+        # when the interpreter exits normally.
+        atexit.register(_flush_at_exit, weakref.ref(self))
 
     def __enter__(self) -> "Emitter":
         return self
@@ -246,14 +267,97 @@ class Emitter:
                     json.dumps(observation.to_dict(), default=str),
                 )
             return
+        body = b""
         try:
-            self._post(batch)
+            body = _compress(batch)
+            self._post_body(body)
+        except ceerrors.TransportError as exc:
+            if exc.status in REFUSED_STATUS:
+                self._refused(batch, body, exc)
+            else:
+                self._keep(body, len(batch), exc)
+            return
         except Exception as exc:  # pylint: disable=broad-exception-caught
             # Deliberately broad: see the module docstring. Anything escaping
             # here would surface inside the customer's task.
+            self._keep(body, len(batch), exc)
+            return
+        self._drain()
+
+    def _refused(
+        self,
+        batch: List[ceenvelo.Observation],
+        body: bytes,
+        exc: ceerrors.TransportError,
+    ) -> None:
+        """
+        Deal with a batch the receiver read and said no to.
+
+        :param batch: what was sent
+        :param body: it, compressed
+        :param exc: the refusal
+        """
+        if len(batch) > 1:
+            # One observation the receiver will not take must not cost the
+            # others in its batch.
+            for observation in batch:
+                self._send([observation])
+            return
+        path = self._spool.save(body, cespool.REJECTED)
+        _LOG.warning(
+            "convalesce: %s/%s was refused (%s); kept at %s",
+            batch[0].tool,
+            batch[0].event,
+            exc,
+            path,
+        )
+
+    def _keep(self, body: bytes, count: int, exc: Exception) -> None:
+        """
+        Spool a batch that could not be delivered, to send again later.
+
+        :param body: the batch, compressed; empty if it never got that far
+        :param count: how many observations it holds
+        :param exc: why it was not delivered
+        """
+        path = self._spool.save(body) if body else None
+        if path:
             _LOG.warning(
-                "convalesce: dropped %d observation(s): %s", len(batch), exc
+                "convalesce: could not deliver %d observation(s), kept at %s "
+                "to send again: %s",
+                count,
+                path,
+                exc,
             )
+        else:
+            _LOG.error(
+                "convalesce: lost %d observation(s), could not keep them: %s",
+                count,
+                exc,
+            )
+
+    def _drain(self) -> None:
+        """
+        Send spooled batches, oldest first, now that the receiver answers.
+
+        Stops at the first one that fails again; it stays in the spool.
+        """
+        for path in self._spool.pending()[:_DRAIN_PER_SEND]:
+            claimed = self._spool.claim(path)
+            if claimed is None:
+                continue
+            try:
+                self._post_body(self._spool.read(claimed))
+            except ceerrors.TransportError as exc:
+                if exc.status in REFUSED_STATUS:
+                    self._spool.reject(claimed)
+                    continue
+                self._spool.release(claimed)
+                return
+            except Exception:  # pylint: disable=broad-exception-caught
+                self._spool.release(claimed)
+                return
+            self._spool.done(claimed)
 
     def close(self) -> None:
         """
@@ -263,24 +367,14 @@ class Emitter:
         """
         self.flush()
 
-    def _post(self, batch: List[ceenvelo.Observation]) -> None:
+    def _post_body(self, compressed: bytes) -> None:
         """
-        Send one batch, retrying what a retry can fix.
+        Send one compressed batch, retrying what a retry can fix.
 
-        :param batch: observations to deliver
+        :param compressed: the gzip-compressed request body
         :return: nothing
         :raises TransportError: if every attempt failed
         """
-        body = (
-            b'{"observations":['
-            + b",".join(_encode(obs) for obs in batch)
-            + b"]}"
-        )
-        # Whole-payload forwarding means a batch is bigger than it used to
-        # be; gzip is what keeps the wire cost from growing at the same
-        # rate. The receiver decides its size cap against the decompressed
-        # bytes, not these, so the local batching above is unaffected.
-        compressed = gzip.compress(body)
         url = self.config.endpoint.rstrip("/") + _OBSERVATIONS_PATH
         for attempt in range(self.config.max_retries + 1):
             try:
@@ -331,6 +425,34 @@ class Emitter:
             raise ceerrors.TransportError(
                 f"could not reach {url}: {exc.reason}"
             ) from exc
+
+
+def _flush_at_exit(ref: "weakref.ReferenceType[Emitter]") -> None:
+    """
+    Flush an emitter still alive at interpreter exit.
+
+    :param ref: the emitter, weakly, so registering it does not keep it alive
+    """
+    emitter = ref()
+    if emitter is not None:
+        emitter.flush()
+
+
+def _compress(batch: List[ceenvelo.Observation]) -> bytes:
+    """
+    Build the request body for one batch.
+
+    Whole-payload forwarding means a batch is bigger than it used to be;
+    gzip is what keeps the wire cost from growing at the same rate. The
+    receiver decides its size cap against the decompressed bytes, not these,
+    so the local batching above is unaffected.
+
+    :param batch: observations to deliver
+    :return: the gzip-compressed body
+    """
+    return gzip.compress(
+        b'{"observations":[' + b",".join(_encode(obs) for obs in batch) + b"]}"
+    )
 
 
 def _encode(observation: ceenvelo.Observation) -> bytes:

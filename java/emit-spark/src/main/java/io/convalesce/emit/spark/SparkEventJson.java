@@ -50,19 +50,44 @@ final class SparkEventJson {
    * Renders one event.
    *
    * @param event a Spark listener event
-   * @return the event as JSON, or null when this Spark cannot be asked
+   * @return the event as JSON; when Spark cannot render it, a stand-in naming the event and why, so
+   *     the receiver still learns it happened
    */
   static String toJson(Object event) {
     if (STRATEGY == null) {
-      return null;
+      return unrendered(event, "this Spark has no serialiser we recognise");
     }
     try {
       return STRATEGY.render(event);
     } catch (Throwable t) {
-      // A single unserialisable event must not stop the ones after it.
-      LOG.fine("convalesce: could not serialise " + event.getClass().getSimpleName());
-      return null;
+      // A single unserialisable event must not stop the ones after it, nor vanish.
+      LOG.warning("convalesce: could not serialise " + event.getClass().getSimpleName() + ": " + t);
+      return unrendered(event, t.toString());
     }
+  }
+
+  /** What is still known about an event Spark could not render: its type and why. */
+  static String unrendered(Object event, String why) {
+    return "{\"Event\":"
+        + quote(event.getClass().getName())
+        + ",\"convalesce_unrendered\":"
+        + quote(why)
+        + "}";
+  }
+
+  private static String quote(String value) {
+    StringBuilder out = new StringBuilder(value.length() + 2).append('"');
+    for (int i = 0; i < value.length(); i++) {
+      char c = value.charAt(i);
+      if (c == '"' || c == '\\') {
+        out.append('\\').append(c);
+      } else if (c < 0x20) {
+        out.append(String.format("\\u%04x", (int) c));
+      } else {
+        out.append(c);
+      }
+    }
+    return out.append('"').toString();
   }
 
   /** True when this Spark exposes a serialiser we can use. */
@@ -140,20 +165,6 @@ final class SparkEventJson {
       out.append(c);
     }
     return null;
-  }
-
-  private static String quote(String value) {
-    StringBuilder out = new StringBuilder(value.length() + 2);
-    out.append('"');
-    for (int i = 0; i < value.length(); i++) {
-      char c = value.charAt(i);
-      if (c == '"' || c == '\\') {
-        out.append('\\');
-      }
-      out.append(c);
-    }
-    out.append('"');
-    return out.toString();
   }
 
   private interface Strategy {

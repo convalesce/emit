@@ -12,6 +12,7 @@ import gzip
 import http.server
 import json
 import logging
+import os
 import threading
 import unittest
 import unittest.mock
@@ -397,3 +398,60 @@ class Test_emitter_chunking1(_ServerCase):
         observation = self._sent()[0]
         self.assertIsNone(observation["chunk_index"])
         self.assertIsNone(observation["chunk_count"])
+
+
+# #############################################################################
+# Test_emitter_spool1
+# #############################################################################
+
+
+class Test_emitter_spool1(_ServerCase):
+    """
+    Test that nothing that fails to send is thrown away.
+    """
+
+    def _spooled(self, kind: str) -> List[str]:
+        folder = os.path.join(os.environ["CONVALESCE_SPOOL_DIR"], kind)
+        return sorted(os.listdir(folder)) if os.path.isdir(folder) else []
+
+    def test1(self) -> None:
+        """
+        Test that a batch the receiver could not take is kept and delivered
+        after the next send that succeeds.
+        """
+        _Recorder.status = 503
+        emitter = self._emitter(max_retries=0)
+        emitter.emit(tool="airflow", event="lost", payload={"a": 1})
+        self.assertEqual(len(self._spooled("pending")), 1)
+        _Recorder.status = 200
+        emitter.emit(tool="airflow", event="next", payload={"b": 2})
+        events = [obs["event"] for obs in self._sent()]
+        self.assertEqual(events, ["lost", "next", "lost"])
+        self.assertEqual(self._spooled("pending"), [])
+
+    def test2(self) -> None:
+        """
+        Test that a refused batch is split, and each observation still
+        refused is kept rather than dropped.
+        """
+        _Recorder.status = 400
+        emitter = self._emitter(batch_size=3, max_retries=0)
+        for i in range(3):
+            emitter.emit(tool="spark", event=f"e{i}", payload={})
+        # The batch once, then each observation on its own.
+        self.assertEqual(len(_Recorder.received), 4)
+        self.assertEqual(len(self._spooled("rejected")), 3)
+        self.assertEqual(self._spooled("pending"), [])
+
+    def test3(self) -> None:
+        """
+        Test that an unreachable endpoint's batch is kept too.
+        """
+        config = ceconfig.Config(
+            endpoint="http://127.0.0.1:1",
+            ingest_key="k",
+            batch_size=1,
+            max_retries=0,
+        )
+        ceclient.Emitter(config).emit(tool="airflow", event="e", payload={})
+        self.assertEqual(len(self._spooled("pending")), 1)
