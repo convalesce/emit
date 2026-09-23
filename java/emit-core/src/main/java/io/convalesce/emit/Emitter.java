@@ -1,15 +1,21 @@
 package io.convalesce.emit;
 
+import java.io.File;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -22,6 +28,12 @@ import java.util.logging.Logger;
  *
  * <p>Nothing here throws into the caller. A customer's job must not fail because our endpoint had a
  * bad minute: we are watching their pipeline, not standing in it.
+ *
+ * <p>Nothing here is thrown away either. A batch that cannot be delivered goes to the local {@link
+ * Spool} and is sent again after the next send that succeeds; a refused batch is split so one bad
+ * observation cannot take the others with it, and whatever is still refused is kept on disk. A part
+ * batch is flushed in the background every few seconds and when the JVM shuts down, so a driver
+ * that dies between events loses nothing it had already queued.
  */
 public final class Emitter {
 
@@ -36,6 +48,15 @@ public final class Emitter {
   private static final Set<Integer> RETRYABLE_STATUS =
       new HashSet<Integer>(Arrays.asList(408, 425, 429, 500, 502, 503, 504));
 
+  // The receiver read the batch and will never take it as sent. Anything else that fails is worth
+  // sending again later.
+  private static final Set<Integer> REFUSED_STATUS =
+      new HashSet<Integer>(Arrays.asList(400, 413, 422));
+
+  // Spooled batches sent after one successful send, at most, so a long outage's backlog cannot
+  // hold up the send that finally got through.
+  private static final int DRAIN_PER_SEND = 20;
+
   // Caps the backoff so a long outage cannot park a driver thread for minutes.
   private static final long MAX_BACKOFF_MS = 30_000L;
 
@@ -46,6 +67,7 @@ public final class Emitter {
   private int batchBytes = 0;
   private final Object lock = new Object();
   private final boolean usable;
+  private final Spool spool;
 
   /**
    * Builds an emitter.
@@ -59,6 +81,46 @@ public final class Emitter {
     if (problem != null) {
       LOG.warning("convalesce: not emitting: " + problem);
     }
+    this.spool = new Spool(config.spoolDir(), config.spoolMaxBytes());
+    if (usable && config.enabled()) {
+      startBackgroundFlush();
+    }
+  }
+
+  private void startBackgroundFlush() {
+    Runnable flusher =
+        new Runnable() {
+          @Override
+          public void run() {
+            try {
+              flush();
+            } catch (Throwable t) {
+              LOG.warning("convalesce: background flush failed: " + t.getMessage());
+            }
+          }
+        };
+    try {
+      Runtime.getRuntime().addShutdownHook(new Thread(flusher, "convalesce-emit-shutdown"));
+    } catch (Exception e) {
+      // Already shutting down; there is nothing left to hook.
+      LOG.fine("convalesce: no shutdown flush: " + e.getMessage());
+    }
+    int interval = config.flushIntervalMs();
+    if (interval <= 0) {
+      return;
+    }
+    ScheduledExecutorService timer =
+        Executors.newSingleThreadScheduledExecutor(
+            new ThreadFactory() {
+              @Override
+              public Thread newThread(Runnable task) {
+                Thread thread = new Thread(task, "convalesce-emit-flush");
+                // Never the reason a driver stays up after its job is done.
+                thread.setDaemon(true);
+                return thread;
+              }
+            });
+    timer.scheduleWithFixedDelay(flusher, interval, interval, TimeUnit.MILLISECONDS);
   }
 
   /** Builds an emitter from the process environment. */
@@ -143,12 +205,75 @@ public final class Emitter {
       }
       return;
     }
+    byte[] body = null;
     try {
-      post(sending);
+      body = compress(sending);
+      postBody(body);
+    } catch (TransportException e) {
+      if (REFUSED_STATUS.contains(e.status())) {
+        refused(sending, body, e);
+      } else {
+        keep(body, sending.size(), e);
+      }
+      return;
     } catch (Exception e) {
       // Deliberately broad: see the class docstring. Anything escaping here surfaces inside the
       // customer's job.
-      LOG.warning("convalesce: dropped " + sending.size() + " observation(s): " + e.getMessage());
+      keep(body, sending.size(), e);
+      return;
+    }
+    drain();
+  }
+
+  private void refused(List<byte[]> sending, byte[] body, TransportException e) {
+    if (sending.size() > 1) {
+      // One observation the receiver will not take must not cost the others in its batch.
+      for (byte[] observation : sending) {
+        send(Collections.singletonList(observation));
+      }
+      return;
+    }
+    File path = spool.save(body, Spool.REJECTED);
+    LOG.warning("convalesce: an observation was refused (" + e.getMessage() + "); kept at " + path);
+  }
+
+  private void keep(byte[] body, int count, Exception e) {
+    File path = body == null ? null : spool.save(body, Spool.PENDING);
+    if (path != null) {
+      LOG.warning(
+          "convalesce: could not deliver "
+              + count
+              + " observation(s), kept at "
+              + path
+              + " to send again: "
+              + e.getMessage());
+    } else {
+      LOG.severe(
+          "convalesce: lost " + count + " observation(s), could not keep them: " + e.getMessage());
+    }
+  }
+
+  private void drain() {
+    List<File> waiting = spool.pending();
+    for (int i = 0; i < waiting.size() && i < DRAIN_PER_SEND; i++) {
+      File claimed = spool.claim(waiting.get(i));
+      if (claimed == null) {
+        continue;
+      }
+      try {
+        postBody(Spool.read(claimed));
+      } catch (TransportException e) {
+        if (REFUSED_STATUS.contains(e.status())) {
+          spool.reject(claimed);
+          continue;
+        }
+        spool.release(claimed);
+        return;
+      } catch (Exception e) {
+        spool.release(claimed);
+        return;
+      }
+      Spool.done(claimed);
     }
   }
 
@@ -157,7 +282,7 @@ public final class Emitter {
     flush();
   }
 
-  private void post(List<byte[]> sending) throws Exception {
+  private static byte[] compress(List<byte[]> sending) throws java.io.IOException {
     int size = BODY_OPEN.length() + BODY_CLOSE.length() + sending.size();
     for (byte[] observation : sending) {
       size += observation.length;
@@ -175,7 +300,10 @@ public final class Emitter {
     // wire cost from growing at the same rate. The receiver decides its size cap against the
     // decompressed bytes, so the batching above, sized off the uncompressed `bytes.length`, is
     // unaffected.
-    byte[] compressed = gzip(body.toByteArray());
+    return gzip(body.toByteArray());
+  }
+
+  private void postBody(byte[] compressed) throws Exception {
     String url = trimTrailingSlash(config.endpoint()) + OBSERVATIONS_PATH;
 
     for (int attempt = 0; attempt <= config.maxRetries(); attempt++) {

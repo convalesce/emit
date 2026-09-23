@@ -79,7 +79,8 @@ public class ConvalesceSparkListener extends SparkListener {
     this.emitter = emitter;
     this.sparkVersion = sparkVersion;
     if (!SparkEventJson.available()) {
-      LOG.warning("convalesce: this Spark has no serialiser we recognise; nothing will be sent");
+      LOG.warning(
+          "convalesce: this Spark has no serialiser we recognise; events will carry only their type");
     }
   }
 
@@ -111,12 +112,30 @@ public class ConvalesceSparkListener extends SparkListener {
 
   @Override
   public void onStageCompleted(SparkListenerStageCompleted event) {
-    forward(event);
+    // Stages are off by default, but a failed one carries the reason the job died; that is never
+    // left behind.
+    forward(event, failed(event));
   }
 
   @Override
   public void onTaskEnd(SparkListenerTaskEnd event) {
-    forward(event);
+    forward(event, failed(event));
+  }
+
+  static boolean failed(SparkListenerStageCompleted event) {
+    try {
+      return event.stageInfo().failureReason().isDefined();
+    } catch (Throwable t) {
+      return false;
+    }
+  }
+
+  static boolean failed(SparkListenerTaskEnd event) {
+    try {
+      return !(event.reason() instanceof org.apache.spark.Success$);
+    } catch (Throwable t) {
+      return false;
+    }
   }
 
   /** The application this listener is reporting on, once anything has named it. */
@@ -136,15 +155,16 @@ public class ConvalesceSparkListener extends SparkListener {
   }
 
   private void forward(SparkListenerEvent event) {
+    forward(event, false);
+  }
+
+  private void forward(SparkListenerEvent event, boolean always) {
     try {
       String name = event.getClass().getSimpleName();
-      if (!events.wanted(name)) {
+      if (!always && !events.wanted(name)) {
         return;
       }
       String json = SparkEventJson.toJson(event);
-      if (json == null) {
-        return;
-      }
       json = SparkEventJson.withAppId(json, remember(json));
       emitter.emit(TOOL, name, json, sparkVersion);
     } catch (Throwable t) {

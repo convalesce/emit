@@ -101,8 +101,12 @@ def emit_dagster_event(
         not given
     :return: nothing
     """
-    budget = cemit.new_budget()
-    dumped = cemit.dump(payload, budget=budget)
+    try:
+        budget = cemit.new_budget()
+        dumped = cemit.dump(payload, budget=budget)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.warning("convalesce: could not shape %s: %s", event, exc)
+        return
     cemit.send_one(
         tool=TOOL,
         event=event,
@@ -133,6 +137,17 @@ def convalesce_sensor(
     :param kwargs: whatever else Dagster passes; forwarded untouched
     :return: nothing
     """
+    try:
+        _sensor(context, emitter, **kwargs)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # A sensor that raises fails its tick in the customer's Dagster UI;
+        # nothing about reporting on a run is worth that.
+        _LOG.warning("convalesce: could not emit run_status: %s", exc)
+
+
+def _sensor(
+    context: Any, emitter: Optional[cemit.EmitterLike], **kwargs: Any
+) -> None:
     target = emitter or cemit.Emitter()
     parts = unwrap_context(context)
     had_parts = bool(parts)

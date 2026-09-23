@@ -78,4 +78,12 @@ public class SparkEventsTest {
     assertNull(SparkEventJson.withAppId(null, "local-1789"));
     assertEquals("{\"App ID\":\"local-1789\"}", SparkEventJson.withAppId("{}", "local-1789"));
   }
+
+  @Test
+  public void anUnrenderableEventStillNamesItselfAndWhy() {
+    String json = SparkEventJson.unrendered(new Object(), "bad \"quote\"\n");
+    assertEquals(
+        "{\"Event\":\"java.lang.Object\",\"convalesce_unrendered\":\"bad \\\"quote\\\"\\u000a\"}",
+        json);
+  }
 }
