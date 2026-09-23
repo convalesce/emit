@@ -24,14 +24,19 @@ Configure it with the same environment variables the Python client uses:
 `CONVALESCE_INGEST_KEY`, `CONVALESCE_ENDPOINT`,
 `CONVALESCE_DRY_RUN`, `CONVALESCE_ENABLED`, `CONVALESCE_BATCH_SIZE`,
 `CONVALESCE_MAX_RETRIES`, `CONVALESCE_TIMEOUT`,
-`CONVALESCE_MAX_BODY_BYTES`.
+`CONVALESCE_MAX_BODY_BYTES`, `CONVALESCE_SPOOL_DIR`,
+`CONVALESCE_SPOOL_MAX_BYTES`. `CONVALESCE_FLUSH_INTERVAL` (seconds, default
+`5`) sends a part batch in the background, and the JVM's shutdown sends what
+is left.
 
 One setting is Spark's own: `CONVALESCE_SPARK_EVENTS`. By default the
 listener forwards what describes a run, which is the application, the jobs
 and the SQL executions starting and ending. Task and stage events describe
 the inside of a job, one per task, so they are sent only when asked for:
 `all` for everything Spark offers, or a comma-separated list of event class
-simple names to add to the default.
+simple names to add to the default. A failed task or stage is always sent,
+because it carries the reason the job died, and an event Spark cannot render
+still arrives, carrying its type and why it could not be rendered.
 
 ## What it sends
 

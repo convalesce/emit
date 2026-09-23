@@ -74,9 +74,15 @@ def _emit(
     :param emitter: emitter to send through
     :return: nothing
     """
-    payload = {**payload, **api_state(payload)}
-    budget = cemit.new_budget()
-    dumped = cemit.dump(payload, budget=budget)
+    try:
+        payload = {**payload, **api_state(payload)}
+        budget = cemit.new_budget()
+        dumped = cemit.dump(payload, budget=budget)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # A Prefect hook that raises is logged by Prefect as the flow's own
+        # failure; nothing about reporting on it is worth that.
+        _LOG.warning("convalesce: could not shape %s: %s", event, exc)
+        return
     cemit.send_one(
         tool=TOOL,
         event=event,

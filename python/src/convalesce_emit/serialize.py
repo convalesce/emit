@@ -264,6 +264,12 @@ def dump(
             raise
         active.exclude(path, "recursion backstop")
         return "...(excluded: recursion backstop)"
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # One value that cannot be walked -- a dict another thread changes
+        # mid-iteration, a lazy proxy whose load fails -- costs that value,
+        # not the whole event it sits in.
+        active.exclude(path, f"unreadable: {type(exc).__name__}")
+        return f"<{type(obj).__name__}: unreadable>"
 
 
 def _dump(  # pylint: disable=too-many-return-statements
@@ -432,7 +438,7 @@ def _dump_container(obj: Any, budget: Budget, depth: int, path: str) -> Any:
     fields = _dump_fields(obj, budget, nxt, path)
     if fields is not _UNSET:
         return fields
-    data = getattr(obj, "__dict__", None)
+    data = _probe(obj, "__dict__")
     if isinstance(data, dict):
         public = {}
         for key, value in data.items():
@@ -528,7 +534,7 @@ def _dump_fields(obj: Any, budget: Budget, depth: int, path: str) -> Any:
     :param path: dotted path of `obj` from the payload root
     :return: the fields as a mapping, or `_UNSET` when there are none
     """
-    fields = getattr(obj, "_fields", None)
+    fields = _probe(obj, "_fields")
     if not isinstance(fields, tuple) or not fields:
         fields = _attrs_field_names(obj)
     if not isinstance(fields, tuple) or not fields:
@@ -542,11 +548,11 @@ def _dump_fields(obj: Any, budget: Budget, depth: int, path: str) -> Any:
             budget.exclude(child_path, "excluded by name")
             continue
         if name.lower() in budget.summarise:
-            out[name] = _describe(getattr(obj, name, None))
+            out[name] = _describe(_probe(obj, name))
             continue
         if name.lower() in _DATA_NAMES:
             budget.exclude(child_path, "bulk data")
-            out[name] = _describe_bulk_data(getattr(obj, name, None))
+            out[name] = _describe_bulk_data(_probe(obj, name))
             continue
         try:
             value = getattr(obj, name)
@@ -569,12 +575,12 @@ def _attrs_field_names(obj: Any) -> Optional[Tuple[str, ...]]:
     :param obj: the object being walked
     :return: the field names, or None when the object is not attrs-decorated
     """
-    declared = getattr(type(obj), "__attrs_attrs__", None)
+    declared = _probe(type(obj), "__attrs_attrs__")
     if not isinstance(declared, tuple) or not declared:
         return None
     names: List[str] = []
     for field in declared:
-        name = getattr(field, "name", None)
+        name = _probe(field, "name")
         if not isinstance(name, str):
             return None
         names.append(name)
@@ -610,7 +616,7 @@ def _is_namedtuple(obj: Any) -> bool:
     :param obj: the value being walked
     :return: whether it carries field names worth keeping
     """
-    return isinstance(obj, tuple) and hasattr(obj, "_fields")
+    return isinstance(obj, tuple) and _probe(obj, "_fields") is not None
 
 
 def _has_property(obj: Any, name: str) -> bool:
@@ -621,7 +627,7 @@ def _has_property(obj: Any, name: str) -> bool:
     :param name: the attribute name
     :return: whether reading it runs the class's own code
     """
-    return isinstance(getattr(type(obj), name, None), property)
+    return isinstance(_probe(type(obj), name), property)
 
 
 def _dump_property(
@@ -646,6 +652,25 @@ def _dump_property(
     return dump(value, budget=budget, depth=depth, path=path)
 
 
+def _probe(obj: Any, name: str) -> Any:
+    """
+    Read an attribute we are only checking for, treating any failure as absent.
+
+    `getattr(obj, name, None)` only swallows AttributeError. An object whose
+    `__getattr__` looks the name up elsewhere raises something else for a name
+    it does not have: Airflow's `var.value` accessor raises KeyError ("Variable
+    shape does not exist"), and that lost every failed task's event.
+
+    :param obj: the value being walked
+    :param name: the attribute to look for
+    :return: its value, or None when reading it fails in any way
+    """
+    try:
+        return getattr(obj, name, None)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+
+
 def _is_scalar(obj: Any) -> bool:
     """
     Tell a value that is already JSON from one that has to be walked.
@@ -667,11 +692,13 @@ def _is_bulk_data(obj: Any) -> bool:
     :param obj: the value being walked
     :return: whether it holds data values
     """
-    shape = getattr(obj, "shape", None)
+    shape = _probe(obj, "shape")
     if isinstance(shape, tuple) and shape:
         return all(isinstance(size, int) for size in shape)
     # A Spark frame has no shape; it does have a schema.
-    return hasattr(obj, "columns") and hasattr(obj, "dtypes")
+    return (
+        _probe(obj, "columns") is not None and _probe(obj, "dtypes") is not None
+    )
 
 
 def _describe_bulk_data(obj: Any) -> str:
@@ -684,7 +711,7 @@ def _describe_bulk_data(obj: Any) -> str:
     :return: its type and, where it has one, its shape
     """
     name = type(obj).__name__
-    shape = getattr(obj, "shape", None)
+    shape = _probe(obj, "shape")
     if isinstance(shape, tuple) and all(isinstance(size, int) for size in shape):
         return f"<{name} {list(shape)}>"
     return f"<{name}>"
@@ -722,7 +749,7 @@ def _try_dump_methods(obj: Any, budget: Budget, depth: int, path: str) -> Any:
     :return: the dumped value, or `_UNSET` if no method worked
     """
     for attr in _DUMP_METHODS:
-        method = getattr(obj, attr, None)
+        method = _probe(obj, attr)
         if not callable(method):
             continue
         try:

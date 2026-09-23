@@ -141,16 +141,18 @@ def forward(
     :return: whether the observation was emitted, and whether it was redacted
     """
     redact = not send_samples()
-    platform = runtime_platform(payload)
-    budget = cemit.new_budget()
-    body = cemit.dump(shape(payload), budget=budget)
-    if platform and isinstance(body, dict):
-        body.update(platform)
-    excluded = budget.excluded
-    if redact:
-        body, redacted = cemit.redact_samples(body)
-        excluded = excluded + redacted
     try:
+        # Inside the guard, not before it: GX fails the whole checkpoint when
+        # an action raises.
+        platform = runtime_platform(payload)
+        budget = cemit.new_budget()
+        body = cemit.dump(shape(payload), budget=budget)
+        if platform and isinstance(body, dict):
+            body.update(platform)
+        excluded = budget.excluded
+        if redact:
+            body, redacted = cemit.redact_samples(body)
+            excluded = excluded + redacted
         target = emitter or cemit.Emitter()
         target.emit(
             tool=TOOL,

@@ -48,6 +48,8 @@ Set these on the worker; no code changes are needed.
 | `CONVALESCE_MAX_BODY_BYTES` | `1000000` | a batch is sent before the body would pass this |
 | `CONVALESCE_MAX_RETRIES` | `3` | |
 | `CONVALESCE_TIMEOUT` | `10` | seconds |
+| `CONVALESCE_SPOOL_DIR` | `<temp dir>/convalesce-emit-spool` | undelivered batches wait here and are sent after the next send that succeeds; refused ones are kept under `rejected/` |
+| `CONVALESCE_SPOOL_MAX_BYTES` | `1000000000` | the waiting batches stop growing past this, with an error in the log |
 
 Try it against a real pipeline before pointing it at an account:
 `CONVALESCE_DRY_RUN=true`.
