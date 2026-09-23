@@ -593,6 +593,26 @@ class Test_dump_property1(unittest.TestCase):
         self.assertEqual(out["ok"], 1)
         self.assertEqual(out["var"], {"name": "vars"})
 
+    def test5(self) -> None:
+        """
+        Test that a value that cannot be walked costs only that value.
+        """
+
+        class Changing(list):
+            """A list another thread changes while it is walked."""
+
+            def __iter__(self) -> Any:
+                raise RuntimeError("list changed size during iteration")
+
+        budget = ceserial.new_budget()
+        out = ceserial.dump({"steps": Changing([1]), "ok": 1}, budget=budget)
+        self.assertEqual(out["ok"], 1)
+        self.assertIn("unreadable", out["steps"])
+        self.assertEqual(
+            budget.excluded,
+            [{"path": "steps", "reason": "unreadable: RuntimeError"}],
+        )
+
 
 # #############################################################################
 # Test_dump_keys1

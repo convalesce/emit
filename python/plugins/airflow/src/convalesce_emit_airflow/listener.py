@@ -247,7 +247,13 @@ def shape(
     if task_instance is None or not isinstance(dumped, dict):
         return out, budget.excluded
     if dumped.get("dag_run") is None:
-        dag_run = find_dag_run(task_instance)
+        try:
+            dag_run = find_dag_run(task_instance)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            # Airflow 2 loads the run lazily, and a task instance detached
+            # from its session raises instead of answering.
+            _LOG.warning("convalesce: could not read the dag run: %s", exc)
+            dag_run = None
         if dag_run is not None:
             dumped["dag_run"] = cemit.dump(
                 dag_run, budget=budget, path="task_instance.dag_run"

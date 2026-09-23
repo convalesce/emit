@@ -264,6 +264,12 @@ def dump(
             raise
         active.exclude(path, "recursion backstop")
         return "...(excluded: recursion backstop)"
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # One value that cannot be walked -- a dict another thread changes
+        # mid-iteration, a lazy proxy whose load fails -- costs that value,
+        # not the whole event it sits in.
+        active.exclude(path, f"unreadable: {type(exc).__name__}")
+        return f"<{type(obj).__name__}: unreadable>"
 
 
 def _dump(  # pylint: disable=too-many-return-statements
