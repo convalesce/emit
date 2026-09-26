@@ -175,12 +175,21 @@ jobs:
             python: "3.12"
           # The two Great Expectations majors need two different action
           # classes; one cannot satisfy both.
+          # The backward test runs real checkpoints over SQLite and a CSV, so
+          # it needs SQLAlchemy and pandas; 0.18 and 1.22 do not import with
+          # SQLAlchemy 2.1 or pandas 3.
           - tool: gx
             spec: "great-expectations==0.18.22"
             python: "3.11"
+            extras: "sqlalchemy<2.1 pandas<3"
           - tool: gx
             spec: "great-expectations==1.22.0"
             python: "3.12"
+            extras: "sqlalchemy<2.1 pandas<3"
+          - tool: gx
+            spec: "great-expectations==1.23.2"
+            python: "3.12"
+            extras: "sqlalchemy pandas"
           - tool: dagster
             spec: "dagster==1.7.16"
             python: "3.11"
@@ -234,7 +243,7 @@ jobs:
       - name: Backward coverage
         working-directory: python
         run: |
-          pip install pytest pytest-timeout pyyaml
+          pip install pytest pytest-timeout pyyaml ${{ matrix.extras }}
           tests=$(ls plugins/${{ matrix.tool }}/src/*/test/test_backward.py 2>/dev/null || true)
           if [ -z "$tests" ]; then
             echo "no backward test for ${{ matrix.tool }} yet"

@@ -8,7 +8,7 @@ import convalesce_emit_gx._common as cegxcom
 
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
 
@@ -168,9 +168,11 @@ def _v0_database(
         out: Dict[str, Any] = {"database": database}
         source = _v0_datasource_name(payload)
         if source:
-            out["datasources"] = {
-                source: {"type": platform, "database": database}
-            }
+            facts: Dict[str, Any] = {"type": platform, "database": database}
+            schema = url_schema(url, platform)
+            if schema:
+                facts["schema"] = schema
+            out["datasources"] = {source: facts}
         return out
     except Exception as exc:  # pylint: disable=broad-exception-caught
         _LOG.warning("convalesce: could not name the database: %s", exc)
@@ -189,6 +191,10 @@ _PLATFORMS = {
 # Datasource types with no SQL engine behind them: no database to name, and
 # the type is a dataframe library rather than a platform.
 _NOT_SQL = frozenset({"pandas", "spark"})
+
+# Datasource types that read files. Their batch's own path names the dataset,
+# so the type crosses as GX named it and nothing else is looked up.
+_FILE_TYPE_PREFIXES = ("pandas_", "spark_")
 
 
 def _field(value: Any, name: str) -> Any:
@@ -234,6 +240,10 @@ def url_database(url: Any, platform: Optional[str]) -> Optional[str]:
         host = getattr(url, "host", None)
         return str(host) if host else None
     database = getattr(url, "database", None)
+    if platform == "databricks":
+        # Unity Catalog's three levels: the catalog is on the query string.
+        catalog = _url_query(url, "catalog")
+        return catalog or (str(database) if database else None)
     if not database or platform == "sqlite":
         return None
     if platform == "snowflake":
@@ -241,46 +251,138 @@ def url_database(url: Any, platform: Optional[str]) -> Optional[str]:
     return str(database)
 
 
-def datasource_facts(datasource: Any) -> Optional[Dict[str, Optional[str]]]:
+def url_schema(url: Any, platform: Optional[str]) -> Optional[str]:
     """
-    A 1.x fluent datasource's platform and database; never its connection.
+    The schema a SQLAlchemy URL makes the default, where it names one.
 
-    The engine is the datasource's own, cached from the validation that just
-    ran, so reading its URL opens nothing new.
+    A table asset with no `schema_name` lives in it, and a receiver cannot
+    otherwise tell `analytics.orders` from `public.orders`.
+
+    :param url: a SQLAlchemy `URL`
+    :param platform: the platform it belongs to
+    :return: the schema, or None
+    """
+    if platform == "bigquery":
+        dataset = getattr(url, "database", None)
+        return str(dataset) if dataset else None
+    if platform == "snowflake":
+        database = str(getattr(url, "database", None) or "")
+        if "/" in database:
+            return database.split("/", 1)[1] or None
+        return _url_query(url, "schema")
+    if platform == "databricks":
+        return _url_query(url, "schema")
+    return None
+
+
+def _url_query(url: Any, name: str) -> Optional[str]:
+    """
+    One query-string parameter of a SQLAlchemy URL.
+
+    :param url: a SQLAlchemy `URL`
+    :param name: the parameter
+    :return: its value, or None
+    """
+    query = getattr(url, "query", None) or {}
+    try:
+        value = query.get(name)
+    except AttributeError:
+        return None
+    if isinstance(value, (tuple, list)):
+        value = value[0] if value else None
+    return str(value) if value else None
+
+
+def _datasource_url(datasource: Any) -> Any:
+    """
+    The SQLAlchemy URL behind a fluent datasource, without connecting.
+
+    The engine is preferred, being the datasource's own and already cached
+    by the validation that just ran. Where it cannot be built here -- a
+    BigQuery engine wants credentials, a `sql` datasource a driver this
+    process may not import -- the connection string is parsed instead, which
+    needs neither.
 
     :param datasource: a GX 1.x fluent datasource
-    :return: `{"type", "database"}`, or None for a datasource with no SQL
-        engine behind it
+    :return: the URL, or None
+    """
+    get_engine = getattr(datasource, "get_engine", None)
+    if callable(get_engine):
+        try:
+            return get_engine().url
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _LOG.debug("convalesce: no engine for datasource: %s", exc)
+    raw = _field(datasource, "connection_string")
+    resolve = getattr(raw, "get_config_value", None)
+    if callable(resolve):
+        try:
+            # pylint: disable-next=protected-access
+            raw = resolve(datasource._data_context.config_provider)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _LOG.debug("convalesce: unresolved connection string: %s", exc)
+            return None
+    if not isinstance(raw, str):
+        return None
+    try:
+        # pylint: disable-next=import-outside-toplevel
+        from sqlalchemy.engine import make_url
+
+        return make_url(raw)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: unreadable connection string: %s", exc)
+        return None
+
+
+def datasource_facts(datasource: Any) -> Optional[Dict[str, Optional[str]]]:
+    """
+    A 1.x fluent datasource's platform, database and schema; never its
+    connection.
+
+    :param datasource: a GX 1.x fluent datasource
+    :return: `{"type", "database"}` and, where the connection names a
+        default schema, `"schema"`; the type alone for a datasource that
+        reads files; None for one with nothing behind it but a frame
     """
     kind = _field(datasource, "type")
     if not kind or str(kind).lower() in _NOT_SQL:
         return None
-    url = None
-    get_engine = getattr(datasource, "get_engine", None)
-    if callable(get_engine):
-        try:
-            url = get_engine().url
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            _LOG.debug("convalesce: no engine for datasource: %s", exc)
+    if str(kind).lower().startswith(_FILE_TYPE_PREFIXES):
+        return {"type": str(kind).lower(), "database": None}
+    url = _datasource_url(datasource)
     platform = _platform(str(kind))
     if platform == "sql":
         platform = _platform(getattr(url, "drivername", None))
     if not platform or platform == "sql":
         return None
-    database = url_database(url, platform) if url is not None else None
-    return {"type": platform, "database": database}
+    out: Dict[str, Optional[str]] = {"type": platform, "database": None}
+    if url is not None:
+        out["database"] = url_database(url, platform)
+        schema = url_schema(url, platform)
+        if schema:
+            out["schema"] = schema
+    return out
 
 
-def _datasource_names(checkpoint_result: Any) -> List[str]:
+def _run_results(checkpoint_result: Any) -> Dict[Any, Any]:
     """
-    Every datasource a 1.x checkpoint result's validations ran against.
+    A 1.x checkpoint result's validation results, by identifier.
 
     :param checkpoint_result: GX 1.x `CheckpointResult`
+    :return: the mapping, empty when it has none
+    """
+    run_results = _field(checkpoint_result, "run_results")
+    return run_results if isinstance(run_results, dict) else {}
+
+
+def _datasource_names(results: List[Any]) -> List[str]:
+    """
+    Every datasource some validation results ran against.
+
+    :param results: GX validation results
     :return: the names, in the order first seen
     """
     names: List[str] = []
-    run_results = _field(checkpoint_result, "run_results") or {}
-    for result in run_results.values():
+    for result in results:
         meta = _field(result, "meta") or {}
         batch = _field(meta, "active_batch_definition")
         name = _field(batch, "datasource_name")
@@ -334,22 +436,30 @@ def project_datasource(name: str) -> Any:
         return None
 
 
-def datasources_v1(checkpoint_result: Any) -> Dict[str, Dict[str, Any]]:
+def datasources_v1(
+    checkpoint_result: Any, results: Optional[List[Any]] = None
+) -> Dict[str, Dict[str, Any]]:
     """
-    Name each datasource a 1.x checkpoint validated by platform and database.
+    Name each datasource a 1.x validation ran against by platform, database
+    and schema.
 
     A 1.x action is handed a checkpoint result rather than an engine, so
     without this a receiver has only the datasource's *name* to go on. Only
-    the type and the database name cross: the connection string, host and
-    credentials stay here. Never raises; a checkpoint must not fail over it.
+    the type and the database and schema names cross: the connection string,
+    host and credentials stay here. Never raises; a checkpoint must not fail
+    over it.
 
-    :param checkpoint_result: GX 1.x `CheckpointResult`
-    :return: `{<datasource name>: {"type", "database"}}`
+    :param checkpoint_result: GX 1.x `CheckpointResult`, or None
+    :param results: validation results to name instead, for one run outside
+        a checkpoint
+    :return: `{<datasource name>: {"type", "database", "schema"?}}`
     """
     out: Dict[str, Dict[str, Any]] = {}
     try:
+        if results is None:
+            results = list(_run_results(checkpoint_result).values())
         known = _context_datasources(checkpoint_result)
-        for name in _datasource_names(checkpoint_result):
+        for name in _datasource_names(results):
             source = known.get(name) or project_datasource(name)
             if source is None:
                 continue
@@ -361,10 +471,203 @@ def datasources_v1(checkpoint_result: Any) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def result_urls_v1(checkpoint_result: Any) -> Dict[str, str]:
+    """
+    Each validation result's GX Cloud page, by the identifier it is keyed by.
+
+    GX Cloud sets `result_url` on a validation result it stored, but the
+    result's own serialiser leaves the field out, so it would never cross
+    with the rest of the result. Keyed by the identifier as the dump renders
+    it, the same key the result itself crosses under.
+
+    :param checkpoint_result: GX 1.x `CheckpointResult`
+    :return: identifier to page; empty outside GX Cloud
+    """
+    out: Dict[str, str] = {}
+    try:
+        for key, result in _run_results(checkpoint_result).items():
+            url = _field(result, "result_url")
+            if isinstance(url, str) and url:
+                out[str(key)] = url
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: no result urls: %s", exc)
+    return out
+
+
+# Expectations whose observed value is a set of the column's own values:
+# the distinct values, or the most common ones. Redacted whatever those
+# values are, numbers included, because a column of ids is numbers.
+_VALUE_EXPECTATIONS = frozenset(
+    {
+        "expect_column_distinct_values_to_be_in_set",
+        "expect_column_distinct_values_to_contain_set",
+        "expect_column_distinct_values_to_equal_set",
+        "expect_column_most_common_value_to_be_in_set",
+    }
+)
+
+# Expectations whose observed value is the table's shape -- its column names
+# -- rather than anything in its rows. Kept.
+_SCHEMA_EXPECTATIONS = frozenset(
+    {
+        "expect_table_columns_to_match_ordered_list",
+        "expect_table_columns_to_match_set",
+        "expect_column_to_exist",
+    }
+)
+
+_VALUES_REASON = "column values redacted"
+
+
+def redact_values(payload: Any) -> Tuple[Any, List[Dict[str, str]]]:
+    """
+    Replace the column values an expectation observed with their count.
+
+    `redact_samples` catches the failing rows GX samples, by name. This is
+    the other way values leave: a distinct-values or most-common-value
+    expectation reports the values it saw as `observed_value`, and GX 0.x
+    adds each value's count as `details.value_counts`. A numeric aggregate
+    (a mean, a row count, a column's max) is the substance of a result and
+    is kept; so is a list of column names.
+
+    :param payload: the dumped payload
+    :return: the same shape with observed values summarised, and what was
+        redacted, by path and reason
+    """
+    excluded: List[Dict[str, str]] = []
+    return _walk_values(payload, "", excluded), excluded
+
+
+def _walk_values(value: Any, path: str, excluded: List[Dict[str, str]]) -> Any:
+    """
+    Recurse through one value, redacting each expectation result in it.
+
+    :param value: the value being walked
+    :param path: dotted path of `value` from the payload root
+    :param excluded: accumulator every redaction is appended to
+    :return: the same shape, redacted
+    """
+    if isinstance(value, list):
+        return [
+            _walk_values(item, f"{path}[{i}]", excluded)
+            for i, item in enumerate(value)
+        ]
+    if not isinstance(value, dict):
+        return value
+    out = {
+        key: _walk_values(item, f"{path}.{key}" if path else str(key), excluded)
+        for key, item in value.items()
+    }
+    result = out.get("result")
+    config = out.get("expectation_config")
+    if isinstance(result, dict) and isinstance(config, dict):
+        kind = config.get("type") or config.get("expectation_type")
+        out["result"] = _redact_result(
+            result,
+            str(kind or ""),
+            f"{path}.result" if path else "result",
+            excluded,
+        )
+    return out
+
+
+def _redact_result(
+    result: Dict[str, Any],
+    kind: str,
+    path: str,
+    excluded: List[Dict[str, str]],
+) -> Dict[str, Any]:
+    """
+    Redact one expectation result's observed values.
+
+    :param result: the expectation result's `result`
+    :param kind: the expectation's type
+    :param path: dotted path of `result`
+    :param excluded: accumulator every redaction is appended to
+    :return: the result, redacted
+    """
+    out = dict(result)
+    observed = out.get("observed_value")
+    if isinstance(observed, (list, dict)) and kind not in _SCHEMA_EXPECTATIONS:
+        if kind in _VALUE_EXPECTATIONS or not _numeric(observed):
+            out["observed_value"] = {"redacted": True, "count": len(observed)}
+            excluded.append(
+                {"path": f"{path}.observed_value", "reason": _VALUES_REASON}
+            )
+    details = out.get("details")
+    if isinstance(details, dict) and "value_counts" in details:
+        counts = details["value_counts"]
+        details = dict(details)
+        details["value_counts"] = {
+            "redacted": True,
+            "count": len(counts) if isinstance(counts, (list, dict)) else 0,
+        }
+        out["details"] = details
+        excluded.append(
+            {"path": f"{path}.details.value_counts", "reason": _VALUES_REASON}
+        )
+    return out
+
+
+def _numeric(value: Any) -> bool:
+    """
+    Whether every leaf of a value is a number: quantiles, a histogram.
+
+    :param value: an observed value
+    :return: True when nothing in it is text
+    """
+    if isinstance(value, dict):
+        return all(_numeric(item) for item in value.values())
+    if isinstance(value, list):
+        return all(_numeric(item) for item in value)
+    return value is None or (
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+    )
+
+
+def forward_validation_result(
+    result: Any,
+    emitter: Optional[cemit.EmitterLike] = None,
+    validator: Any = None,
+) -> Dict[str, Any]:
+    """
+    Forward one validation result that ran outside a checkpoint.
+
+    GX runs actions only from a checkpoint: `ValidationDefinition.run()`,
+    `Batch.validate()` and a 0.x `Validator.validate()` return their result
+    to the caller and fire nothing. This sends that result the way the 0.x
+    action sends its own, so a receiver reads it the same way.
+
+    :param result: the `ExpectationSuiteValidationResult` GX returned
+    :param emitter: emitter to send through; built from the environment when
+        not given
+    :param validator: on 0.x, the validator that produced it: its engine
+        names the platform, as a checkpoint's runtime does, and is then left
+        behind. 1.x looks its datasources up on the running context instead
+    :return: whether the observation was emitted, and whether it was redacted
+    """
+    urls: Dict[str, str] = {}
+    url = _field(result, "result_url")
+    if isinstance(url, str) and url:
+        # No identifier exists outside a checkpoint; the receiver reads a
+        # lone result under the empty one.
+        urls[""] = url
+    return forward(
+        {
+            "args": [validator] if validator is not None else [],
+            "kwargs": {"validation_result_suite": result},
+        },
+        emitter,
+        datasources=datasources_v1(None, results=[result]),
+        result_urls=urls,
+    )
+
+
 def forward(
     payload: Any,
     emitter: Optional[cemit.EmitterLike] = None,
     datasources: Optional[Dict[str, Dict[str, Any]]] = None,
+    result_urls: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     Redact and send one validation result.
@@ -372,7 +675,8 @@ def forward(
     Redaction is on unless deliberately turned off: a GX result carries
     sample failing values, which are real rows from the customer's table,
     and the handbook promises we read "table shapes, run outcomes, row
-    counts, lineage. Not the rows themselves."
+    counts, lineage. Not the rows themselves." The same goes for the values
+    a distinct-values expectation observed; see `redact_values`.
 
     The Great Expectations runtime is left behind for the same reason and
     one more: a validator owns the frame it validated, and no receiver reads
@@ -383,20 +687,28 @@ def forward(
         not given
     :param datasources: each datasource's platform and database, where the
         action could name them
+    :param result_urls: each validation result's GX Cloud page, by
+        identifier
     :return: whether the observation was emitted, and whether it was redacted
     """
     redact = not send_samples()
     platform = runtime_platform(payload)
     if datasources:
         platform["datasources"] = datasources
+    if result_urls:
+        platform["result_urls"] = result_urls
     budget = cemit.new_budget()
     body = cemit.dump(shape(payload), budget=budget)
     if platform and isinstance(body, dict):
         body.update(platform)
-    excluded = budget.excluded
+    # Always, samples or not: a pandas `read_sql_*` asset keeps its `con`,
+    # the connection string, in the batch spec every result carries.
+    body, secrets = cemit.redact_secrets(body)
+    excluded = budget.excluded + secrets
     if redact:
         body, redacted = cemit.redact_samples(body)
-        excluded = excluded + redacted
+        body, values = redact_values(body)
+        excluded = excluded + redacted + values
     try:
         target = emitter or cemit.Emitter()
         target.emit(

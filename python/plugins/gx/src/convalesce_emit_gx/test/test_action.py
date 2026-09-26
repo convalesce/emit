@@ -7,6 +7,7 @@ majors; these cover the parts that hold whichever is present.
 Run with `make test`.
 """
 
+import importlib.util
 import json
 import logging
 import os
@@ -109,6 +110,10 @@ class Test_gx_forward1(unittest.TestCase):
 # #############################################################################
 
 
+@unittest.skipIf(
+    importlib.util.find_spec("great_expectations"),
+    "the dispatch is exercised against a real install by test_backward",
+)
 class Test_gx_dispatch1(unittest.TestCase):
     """
     Test that the right action class is chosen for the installed GX.
@@ -530,10 +535,12 @@ class Test_datasources_v1(unittest.TestCase):
 
     def test4(self) -> None:
         """
-        Test that a datasource whose engine cannot be built still names its
-        type, with no database.
+        Test that a datasource whose engine cannot be built, and whose
+        connection string cannot be read, still names its type.
         """
-        facts = cegxcom.datasource_facts(_Datasource("wh", "redshift"))
+        source = _Datasource("wh", "redshift")
+        source.connection_string = None  # type: ignore[assignment]
+        facts = cegxcom.datasource_facts(source)
         self.assertEqual(facts, {"type": "redshift", "database": None})
 
     def test5(self) -> None:
@@ -566,3 +573,370 @@ class Test_datasources_v1(unittest.TestCase):
 
         self.assertEqual(cegxcom.datasources_v1(Broken()), {})
         self.assertEqual(cegxcom.datasources_v1(None), {})
+
+
+# #############################################################################
+# Test_datasource_facts1
+# #############################################################################
+
+
+class _QueryUrl(_Url):
+    """A SQLAlchemy URL whose query string carries part of the name."""
+
+    def __init__(
+        self, drivername: str, host: str, database: Any, **query: str
+    ) -> None:
+        super().__init__(drivername, host, database)
+        self.query = query
+
+
+class Test_datasource_facts1(unittest.TestCase):
+    """
+    Test that each warehouse names the database and schema a table with no
+    schema of its own lives in.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the schema a connection makes the default crosses.
+        """
+        cases = [
+            (
+                "snowflake",
+                _Url("snowflake", "acct", "MYDB/ANALYTICS"),
+                {"type": "snowflake", "database": "MYDB", "schema": "ANALYTICS"},
+            ),
+            (
+                "snowflake",
+                _QueryUrl("snowflake", "acct", "MYDB", schema="RAW"),
+                {"type": "snowflake", "database": "MYDB", "schema": "RAW"},
+            ),
+            (
+                "bigquery",
+                _Url("bigquery", "my-proj", "sales"),
+                {"type": "bigquery", "database": "my-proj", "schema": "sales"},
+            ),
+            (
+                "databricks_sql",
+                _QueryUrl("databricks", "h", None, catalog="main", schema="s"),
+                {"type": "databricks", "database": "main", "schema": "s"},
+            ),
+            (
+                "postgres",
+                _Url("postgresql", "db", "shop"),
+                {"type": "postgres", "database": "shop"},
+            ),
+        ]
+        for kind, url, expected in cases:
+            facts = cegxcom.datasource_facts(_Datasource("d", kind, url))
+            self.assertEqual(facts, expected, kind)
+
+    def test2(self) -> None:
+        """
+        Test that a datasource reading files crosses as the type GX gave it,
+        its batches' paths naming the datasets.
+        """
+        for kind in ("pandas_s3", "spark_gcs", "pandas_filesystem"):
+            facts = cegxcom.datasource_facts(_Datasource("f", kind))
+            self.assertEqual(facts, {"type": kind, "database": None})
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("sqlalchemy"), "needs SQLAlchemy to parse"
+    )
+    def test3(self) -> None:
+        """
+        Test that a datasource whose engine cannot be built here is named
+        from its connection string, and the string itself stays here.
+        """
+        source = _Datasource("bq", "bigquery")
+        source.connection_string = "bigquery://my-proj/sales"
+        facts = cegxcom.datasource_facts(source)
+        self.assertEqual(
+            facts, {"type": "bigquery", "database": "my-proj", "schema": "sales"}
+        )
+
+
+# #############################################################################
+# Test_redact_values1
+# #############################################################################
+
+
+def _expectation(kind: str, result: Any, key: str = "type") -> Any:
+    """
+    Build one dumped expectation result.
+
+    :param kind: the expectation's type
+    :param result: its `result`
+    :param key: where the type sits: `type` on 1.x, `expectation_type` on 0.x
+    :return: the expectation result
+    """
+    return {
+        "success": False,
+        "expectation_config": {key: kind},
+        "result": result,
+    }
+
+
+def _suite(*results: Any) -> Any:
+    """
+    Build the payload a 0.x action sends for some expectation results.
+
+    :param results: the expectation results
+    :return: the payload
+    """
+    return {
+        "args": [],
+        "kwargs": {"validation_result_suite": {"results": list(results)}},
+    }
+
+
+def _sent_results(recorder: _Recorder) -> List[Any]:
+    """
+    Read the expectation results back from what was sent.
+
+    :param recorder: the recorder the payload was sent to
+    :return: each expectation's `result`
+    """
+    payload = recorder.sent[0]["payload"]
+    suite = payload["kwargs"]["validation_result_suite"]
+    return [item["result"] for item in suite["results"]]
+
+
+class Test_redact_values1(unittest.TestCase):
+    """
+    Test that the column values an expectation observed do not leave the
+    process by default, and that aggregates and column names do.
+    """
+
+    def _send(self, env: Any, *results: Any) -> _Recorder:
+        recorder = _Recorder()
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            cegxcom.forward(_suite(*results), recorder)
+        return recorder
+
+    def test1(self) -> None:
+        """
+        Test that distinct values and their counts become counts.
+        """
+        recorder = self._send(
+            {},
+            _expectation(
+                "expect_column_distinct_values_to_be_in_set",
+                {
+                    "observed_value": ["alice@x.com", "bob@x.com", 7],
+                    "details": {
+                        "value_counts": [
+                            {"value": "alice@x.com", "count": 2},
+                            {"value": "bob@x.com", "count": 1},
+                        ]
+                    },
+                },
+                key="expectation_type",
+            ),
+            _expectation(
+                "expect_column_most_common_value_to_be_in_set",
+                {"observed_value": [1001]},
+            ),
+        )
+        wire = json.dumps(recorder.sent, default=str)
+        self.assertNotIn("alice@x.com", wire)
+        distinct, common = _sent_results(recorder)
+        self.assertEqual(
+            distinct["observed_value"], {"redacted": True, "count": 3}
+        )
+        self.assertEqual(
+            distinct["details"]["value_counts"], {"redacted": True, "count": 2}
+        )
+        # Numbers are values too when they are the column's own: an id.
+        self.assertEqual(
+            common["observed_value"], {"redacted": True, "count": 1}
+        )
+        reasons = [
+            e["path"]
+            for e in recorder.sent[0]["excluded"]
+            if e["reason"] == "column values redacted"
+        ]
+        self.assertEqual(len(reasons), 3)
+
+    def test2(self) -> None:
+        """
+        Test that aggregates, quantiles and column names are kept.
+        """
+        results = (
+            _expectation(
+                "expect_column_mean_to_be_between", {"observed_value": 8.5}
+            ),
+            _expectation(
+                "expect_column_max_to_be_between", {"observed_value": "zed"}
+            ),
+            _expectation(
+                "expect_column_quantile_values_to_be_between",
+                {"observed_value": {"quantiles": [0.5], "values": [12]}},
+            ),
+            _expectation(
+                "expect_table_columns_to_match_set",
+                {"observed_value": ["id", "email"]},
+            ),
+        )
+        recorder = self._send({}, *results)
+        self.assertEqual(
+            [r["observed_value"] for r in _sent_results(recorder)],
+            [8.5, "zed", {"quantiles": [0.5], "values": [12]}, ["id", "email"]],
+        )
+
+    def test3(self) -> None:
+        """
+        Test that an expectation this does not know, observing text, is
+        redacted rather than trusted.
+        """
+        recorder = self._send(
+            {},
+            _expectation("expect_custom_thing", {"observed_value": ["bob"]}),
+        )
+        self.assertEqual(
+            _sent_results(recorder)[0]["observed_value"],
+            {"redacted": True, "count": 1},
+        )
+
+    def test4(self) -> None:
+        """
+        Test that values cross when the operator deliberately sends samples.
+        """
+        recorder = self._send(
+            {"CONVALESCE_GX_SEND_SAMPLES": "true"},
+            _expectation(
+                "expect_column_distinct_values_to_equal_set",
+                {"observed_value": ["Pune", "Oslo"]},
+            ),
+        )
+        self.assertEqual(
+            _sent_results(recorder)[0]["observed_value"], ["Pune", "Oslo"]
+        )
+
+
+# #############################################################################
+# Test_forward_validation_result1
+# #############################################################################
+
+
+class Test_forward_validation_result1(unittest.TestCase):
+    """
+    Test that a validation run outside a checkpoint can still be sent.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the lone result crosses in the 0.x action's shape, its
+        datasource named and its GX Cloud page beside it.
+        """
+
+        class Batch:
+            """Stands in for a `LegacyBatchDefinition`."""
+
+            datasource_name = "shop"
+
+        class Result:
+            """Stands in for an `ExpectationSuiteValidationResult`."""
+
+            meta = {"active_batch_definition": Batch()}
+            results = [_RESULT]
+            result_url = "https://app.greatexpectations.io/r/1"
+
+            def to_json_dict(self) -> Any:
+                """Serialise the way GX does, dropping `result_url`."""
+                return {"results": self.results, "meta": {"x": 1}}
+
+        url = _Url("postgresql", "db", "shop")
+        recorder = _Recorder()
+        with unittest.mock.patch.object(
+            cegxcom,
+            "project_datasource",
+            return_value=_Datasource("shop", "postgres", url),
+        ):
+            outcome = cegxcom.forward_validation_result(Result(), recorder)
+        self.assertTrue(outcome["convalesce_emitted"])
+        payload = recorder.sent[0]["payload"]
+        self.assertIn("validation_result_suite", payload["kwargs"])
+        self.assertEqual(
+            payload["datasources"],
+            {"shop": {"type": "postgres", "database": "shop"}},
+        )
+        self.assertEqual(
+            payload["result_urls"], {"": "https://app.greatexpectations.io/r/1"}
+        )
+
+
+# #############################################################################
+# Test_result_urls_v1
+# #############################################################################
+
+
+class Test_result_urls_v1(unittest.TestCase):
+    """
+    Test that each result's GX Cloud page is read under its identifier.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that pages are keyed by identifier and absent ones skipped.
+        """
+
+        class Stored:
+            """A result GX Cloud stored."""
+
+            result_url = "https://app.greatexpectations.io/r/2"
+
+        class Local:
+            """A result stored locally."""
+
+            result_url = None
+
+        class Result:
+            """Stands in for a 1.x `CheckpointResult`."""
+
+            run_results = {"id-1": Stored(), "id-2": Local()}
+
+        self.assertEqual(
+            cegxcom.result_urls_v1(Result()),
+            {"id-1": "https://app.greatexpectations.io/r/2"},
+        )
+        self.assertEqual(cegxcom.result_urls_v1(None), {})
+
+
+# #############################################################################
+# Test_gx_secrets1
+# #############################################################################
+
+
+class Test_gx_secrets1(unittest.TestCase):
+    """
+    Test that a connection string in a batch spec never crosses whole.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a pandas `read_sql_table` asset's `con` is masked, even
+        when the operator sends samples.
+        """
+        suite = {
+            "meta": {
+                "batch_spec": {
+                    "reader_method": "read_sql_table",
+                    "reader_options": {
+                        "table_name": "orders",
+                        "con": "postgresql://user:s3cret@db:5432/shop",
+                    },
+                }
+            },
+            "results": [],
+        }
+        recorder = _Recorder()
+        env = {"CONVALESCE_GX_SEND_SAMPLES": "true"}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            cegxcom.forward(
+                {"args": [], "kwargs": {"validation_result_suite": suite}},
+                recorder,
+            )
+        wire = json.dumps(recorder.sent, default=str)
+        self.assertNotIn("s3cret", wire)
+        self.assertIn("postgresql://user:***@db:5432/shop", wire)
