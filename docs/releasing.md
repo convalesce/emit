@@ -17,12 +17,12 @@ at a commit on it. Three things enforce this, so a slip cannot publish:
 
 ## Cut a release
 
-1. On `main`, set the version in all seven places, identically:
-   `python/src/convalesce_emit/_version.py`, the four
+1. On `main`, set the version in all eight places, identically:
+   `python/src/convalesce_emit/_version.py`, the five
    `python/plugins/*/src/*/_version.py`, `version` in `java/build.gradle`,
    and `VERSION` in `java/emit-core/.../emit/Version.java`. Each
    `pyproject.toml` reads its `_version.py`, so there is nothing else to
-   edit. The workflow checks all seven against the tag, so a missed one
+   edit. The workflow checks all eight against the tag, so a missed one
    stops the release rather than shipping a wrong `client_version`. Merge it
    with `ci` and `e2e` green.
 2. Open a pull request from `main` into `release` and merge it. Both
@@ -34,7 +34,9 @@ at a commit on it. Three things enforce this, so a slip cannot publish:
    ```
 
 The `publish` workflow then checks the tag against every declared version,
-builds and uploads the five Python packages to PyPI, builds, signs and
+builds and uploads the Python packages to PyPI (the five in the publish
+matrix; `convalesce-emit-pyspark` joins once its trusted publisher is
+registered), builds, signs and
 deploys the two jars to Maven Central's staging area, and creates the
 GitHub release with generated notes.
 
