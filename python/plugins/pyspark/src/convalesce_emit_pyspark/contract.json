@@ -1,0 +1,20 @@
+{
+  "events": {
+    "driver_failure": [
+      "application_id",
+      "application_name",
+      "argv",
+      "error_detail",
+      "error_detail.cause",
+      "error_detail.cause.message",
+      "error_detail.cause.traceback",
+      "error_detail.cause.type",
+      "error_detail.message",
+      "error_detail.traceback",
+      "error_detail.type",
+      "pyspark_version",
+      "python_version"
+    ]
+  },
+  "tool": "spark"
+}

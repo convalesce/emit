@@ -28,6 +28,9 @@ pip install convalesce-emit-airflow   # or -dagster, -prefect, -gx
 ```
 
 For Spark, two lines of config rather than a pip install. See [`java/`](java).
+A PySpark driver that fails in Python before Spark runs anything still ends
+its application as a success; `convalesce-emit-pyspark` reports it. See
+[`python/plugins/pyspark`](python/plugins/pyspark).
 
 Each plugin pulls in `convalesce-emit`, which has **no dependencies of its
 own**: transport is `urllib` from the standard library. It installs into an

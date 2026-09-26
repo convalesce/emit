@@ -31,7 +31,10 @@ listener forwards what describes a run, which is the application, the jobs
 and the SQL executions starting and ending. Task and stage events describe
 the inside of a job, one per task, so they are sent only when asked for:
 `all` for everything Spark offers, or a comma-separated list of event class
-simple names to add to the default.
+simple names to add to the default (`QueryStartedEvent`, `CreateTableEvent`).
+The only events `all` leaves out are the deprecated `*Blacklisted` twins of
+the `*Excluded` ones; `emit-spark/src/test/resources/spark-events.yml` lists
+them, and a test fails when a new Spark adds an event in neither place.
 
 ## What it sends
 

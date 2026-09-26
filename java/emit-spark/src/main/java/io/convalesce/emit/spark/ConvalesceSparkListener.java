@@ -6,11 +6,33 @@ import org.apache.spark.SparkConf;
 import org.apache.spark.scheduler.SparkListener;
 import org.apache.spark.scheduler.SparkListenerApplicationEnd;
 import org.apache.spark.scheduler.SparkListenerApplicationStart;
+import org.apache.spark.scheduler.SparkListenerBlockManagerAdded;
+import org.apache.spark.scheduler.SparkListenerBlockManagerRemoved;
+import org.apache.spark.scheduler.SparkListenerBlockUpdated;
+import org.apache.spark.scheduler.SparkListenerEnvironmentUpdate;
 import org.apache.spark.scheduler.SparkListenerEvent;
+import org.apache.spark.scheduler.SparkListenerExecutorAdded;
+import org.apache.spark.scheduler.SparkListenerExecutorExcluded;
+import org.apache.spark.scheduler.SparkListenerExecutorExcludedForStage;
+import org.apache.spark.scheduler.SparkListenerExecutorMetricsUpdate;
+import org.apache.spark.scheduler.SparkListenerExecutorRemoved;
+import org.apache.spark.scheduler.SparkListenerExecutorUnexcluded;
 import org.apache.spark.scheduler.SparkListenerJobEnd;
 import org.apache.spark.scheduler.SparkListenerJobStart;
+import org.apache.spark.scheduler.SparkListenerNodeExcluded;
+import org.apache.spark.scheduler.SparkListenerNodeExcludedForStage;
+import org.apache.spark.scheduler.SparkListenerNodeUnexcluded;
+import org.apache.spark.scheduler.SparkListenerResourceProfileAdded;
+import org.apache.spark.scheduler.SparkListenerSpeculativeTaskSubmitted;
 import org.apache.spark.scheduler.SparkListenerStageCompleted;
+import org.apache.spark.scheduler.SparkListenerStageExecutorMetrics;
+import org.apache.spark.scheduler.SparkListenerStageSubmitted;
 import org.apache.spark.scheduler.SparkListenerTaskEnd;
+import org.apache.spark.scheduler.SparkListenerTaskGettingResult;
+import org.apache.spark.scheduler.SparkListenerTaskStart;
+import org.apache.spark.scheduler.SparkListenerUnpersistRDD;
+import org.apache.spark.scheduler.SparkListenerUnschedulableTaskSetAdded;
+import org.apache.spark.scheduler.SparkListenerUnschedulableTaskSetRemoved;
 
 /**
  * Forwards Spark's own listener events to Convalesce, unchanged.
@@ -130,6 +152,121 @@ public class ConvalesceSparkListener extends SparkListener {
 
   @Override
   public void onTaskEnd(SparkListenerTaskEnd event) {
+    forward(event);
+  }
+
+  // Every other callback Spark has, so that `CONVALESCE_SPARK_EVENTS` can ask for any event Spark
+  // posts: an event with a callback of its own never reaches `onOtherEvent`. Each is dropped by the
+  // default filter before it is serialised. The Blacklisted twins of the Excluded events are left
+  // out on purpose; see spark-events.yml beside the tests.
+
+  @Override
+  public void onStageSubmitted(SparkListenerStageSubmitted event) {
+    forward(event);
+  }
+
+  @Override
+  public void onTaskStart(SparkListenerTaskStart event) {
+    forward(event);
+  }
+
+  @Override
+  public void onTaskGettingResult(SparkListenerTaskGettingResult event) {
+    forward(event);
+  }
+
+  @Override
+  public void onEnvironmentUpdate(SparkListenerEnvironmentUpdate event) {
+    forward(event);
+  }
+
+  @Override
+  public void onBlockManagerAdded(SparkListenerBlockManagerAdded event) {
+    forward(event);
+  }
+
+  @Override
+  public void onBlockManagerRemoved(SparkListenerBlockManagerRemoved event) {
+    forward(event);
+  }
+
+  @Override
+  public void onUnpersistRDD(SparkListenerUnpersistRDD event) {
+    forward(event);
+  }
+
+  @Override
+  public void onExecutorMetricsUpdate(SparkListenerExecutorMetricsUpdate event) {
+    forward(event);
+  }
+
+  @Override
+  public void onStageExecutorMetrics(SparkListenerStageExecutorMetrics event) {
+    forward(event);
+  }
+
+  @Override
+  public void onExecutorAdded(SparkListenerExecutorAdded event) {
+    forward(event);
+  }
+
+  @Override
+  public void onExecutorRemoved(SparkListenerExecutorRemoved event) {
+    forward(event);
+  }
+
+  @Override
+  public void onExecutorExcluded(SparkListenerExecutorExcluded event) {
+    forward(event);
+  }
+
+  @Override
+  public void onExecutorExcludedForStage(SparkListenerExecutorExcludedForStage event) {
+    forward(event);
+  }
+
+  @Override
+  public void onNodeExcludedForStage(SparkListenerNodeExcludedForStage event) {
+    forward(event);
+  }
+
+  @Override
+  public void onExecutorUnexcluded(SparkListenerExecutorUnexcluded event) {
+    forward(event);
+  }
+
+  @Override
+  public void onNodeExcluded(SparkListenerNodeExcluded event) {
+    forward(event);
+  }
+
+  @Override
+  public void onNodeUnexcluded(SparkListenerNodeUnexcluded event) {
+    forward(event);
+  }
+
+  @Override
+  public void onBlockUpdated(SparkListenerBlockUpdated event) {
+    forward(event);
+  }
+
+  @Override
+  public void onSpeculativeTaskSubmitted(SparkListenerSpeculativeTaskSubmitted event) {
+    forward(event);
+  }
+
+  @Override
+  public void onUnschedulableTaskSetAdded(SparkListenerUnschedulableTaskSetAdded event) {
+    forward(event);
+  }
+
+  @Override
+  public void onUnschedulableTaskSetRemoved(SparkListenerUnschedulableTaskSetRemoved event) {
+    forward(event);
+  }
+
+  @Override
+  public void onResourceProfileAdded(SparkListenerResourceProfileAdded event) {
     forward(event);
   }
 

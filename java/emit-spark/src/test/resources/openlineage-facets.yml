@@ -1,0 +1,88 @@
+# Every OpenLineage facet a run event forwarded as `openlineage` can carry,
+# and whether collect's decoder reads it.
+#
+# The sections are where the facet sits in a RunEvent: `run` (run.facets),
+# `job` (job.facets), `dataset` (inputs[]/outputs[].facets), `input`
+# (inputs[].inputFacets) and `output` (outputs[].outputFacets). A value is
+# `decoded`, or `ignored: <why>`.
+#
+# Two tests hold it to the truth:
+# - emit's OpenLineageFacetInventoryTest fails when openlineage-java defines a
+#   facet, or openlineage-spark ships a facet class, that is not listed here.
+# - collect's test_openlineage_facets.py fails when a facet marked `decoded`
+#   is not read by the decoder, or one marked `ignored` is. Collect keeps a
+#   copy of this file and checks it against this one when the two
+#   checkouts sit side by side.
+run:
+  parent: decoded
+  errorMessage: decoded
+  externalQuery: decoded
+  processing_engine: decoded
+  nominalTime: "ignored: the scheduled time; a run's own start and end cross in the tool's native events"
+  tags: "ignored: free-form labels no aspect maps yet"
+  environmentVariables: "ignored: a process environment can hold credentials and is never copied"
+  extractionError: "ignored: why the integration failed to extract lineage, which is about the producer, not the job"
+  executionParameters: "ignored: run parameters; the native events already carry the run's configuration"
+  jobDependencies: "ignored: declared job-to-job dependencies no producer this decodes sets; the parent facet links runs"
+  test: "ignored: a test execution's facet, set by no producer this decodes"
+  gcp_dataproc: "ignored: Dataproc's own ids; spark_applicationDetails names the application"
+  gcp_composer_run: "ignored: Composer's own ids; the Airflow native events name the task run"
+  spark_applicationDetails: decoded
+  spark_jobDetails: decoded
+  spark_properties: decoded
+  spark.exception: decoded
+  environment-properties: decoded
+  spark.logicalPlan: "ignored: the optimised plan the lineage was already extracted from; emit drops it when an event is too large"
+  spark_unknown: "ignored: plan nodes openlineage-spark could not read, a debugging aid"
+  debug: "ignored: openlineage-spark's own debugging dump (classpath, config, memory)"
+job:
+  sql: decoded
+  sourceCode: decoded
+  sourceCodeLocation: decoded
+  jobType: "ignored: application versus action is read from the job's name, which says the same"
+  ownership: "ignored: owners by name, which name no user in the graph"
+  documentation: "ignored: a producer's description of the job; none of the Spark or Airflow producers set it"
+  tags: "ignored: free-form labels no aspect maps yet"
+  lineage: "ignored: declared static lineage; a run's inputs and outputs are the lineage path"
+  gcp_lineage: "ignored: Google Cloud Lineage's origin marker"
+  gcp_composer_job: "ignored: Composer's own ids"
+dataset:
+  schema: decoded
+  symlinks: decoded
+  version: decoded
+  columnLineage: decoded
+  lifecycleStateChange: decoded
+  dataSource: "ignored: the namespace already names the source"
+  storage: "ignored: the table format (delta, iceberg, parquet), which does not change the dataset's urn"
+  catalog: "ignored: the catalog a table resolved through; a symlink names the table itself"
+  datasetType: "ignored: table, view or topic; the platform's own ingestion sets the subtype"
+  hierarchy: "ignored: the dataset's place in its source's hierarchy, which the name already encodes"
+  documentation: "ignored: descriptions belong to the platform's own ingestion"
+  ownership: "ignored: owners by name, which name no user in the graph"
+  tags: "ignored: free-form labels no aspect maps yet"
+  dataQualityMetrics: "ignored: column metrics; data quality crosses through the GX and dbt paths"
+  lineage: "ignored: declared static lineage; a run's inputs and outputs are the lineage path"
+input:
+  inputStatistics: decoded
+  dataQualityMetrics: "ignored: column metrics; data quality crosses through the GX and dbt paths"
+  dataQualityAssertions: "ignored: assertions; data quality crosses through the GX and dbt paths"
+  subset: "ignored: the partitions read, which no aspect holds"
+  icebergScanReport: "ignored: Iceberg's scan metrics; inputStatistics carries the counts"
+output:
+  outputStatistics: decoded
+  outputSubset: "ignored: the partitions written, which no aspect holds"
+  icebergCommitReport: "ignored: Iceberg's commit metrics; outputStatistics carries the counts"
+# openlineage-spark's own facet classes, and the facet each is sent as.
+openlineage_spark:
+  DebugRunFacet: run.debug
+  EnvironmentFacet: run.environment-properties
+  ErrorFacet: run.spark.exception
+  GcpDataprocRunFacet: run.gcp_dataproc
+  GcpLineageJobFacet: job.gcp_lineage
+  IcebergCommitReportOutputDatasetFacet: output.icebergCommitReport
+  IcebergScanReportInputDatasetFacet: input.icebergScanReport
+  LogicalPlanFacet: run.spark.logicalPlan
+  SparkApplicationDetailsFacet: run.spark_applicationDetails
+  SparkJobDetailsFacet: run.spark_jobDetails
+  SparkPropertyFacet: run.spark_properties
+  UnknownEntryFacet: run.spark_unknown

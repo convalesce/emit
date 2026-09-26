@@ -38,7 +38,7 @@ jobs:
           EOF
           cat > .isort.cfg <<'EOF'
           [settings]
-          known_first_party=convalesce_emit,convalesce_emit_airflow,convalesce_emit_dagster,convalesce_emit_gx,convalesce_emit_prefect,harness
+          known_first_party=convalesce_emit,convalesce_emit_airflow,convalesce_emit_dagster,convalesce_emit_gx,convalesce_emit_prefect,convalesce_emit_pyspark,harness
           treat_all_comments_as_code=True
           line_length=81
           profile=black
@@ -107,7 +107,7 @@ jobs:
       # that has already broken once.
       - name: Install every distribution
         working-directory: python
-        run: pip install . plugins/airflow plugins/dagster plugins/prefect plugins/gx
+        run: pip install . plugins/airflow plugins/dagster plugins/prefect plugins/gx plugins/pyspark
       - name: Test
         working-directory: python
         run: pytest
