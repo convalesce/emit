@@ -21,7 +21,6 @@ import convalesce_emit_prefect.hooks as cephooks
 import logging
 import os
 import re
-import traceback
 from typing import Any, Dict, List, Optional
 
 import convalesce_emit as cemit
@@ -57,10 +56,6 @@ _TASK_RUN_PAGE_BACKSTOP = 50
 
 # A Prefect Cloud API URL names the account and the workspace in its own
 # path; nothing about a run has to be read to find them.
-# The tail of a traceback is where it failed; the head is Prefect's own
-# engine calling into the task.
-_TRACEBACK_LIMIT = 16000
-
 _CLOUD_URL_RE = re.compile(
     r"^https://api\.prefect\.cloud/api/accounts/(?P<account>[^/]+)"
     r"/workspaces/(?P<workspace>[^/]+)/?"
@@ -425,7 +420,7 @@ def emit_task_run(
 # #############################################################################
 
 
-def error_detail(state: Any) -> Optional[Dict[str, str]]:
+def error_detail(state: Any) -> Optional[Dict[str, Any]]:
     """
     The exception a failed state holds, where it is already in memory.
 
@@ -437,8 +432,8 @@ def error_detail(state: Any) -> Optional[Dict[str, str]]:
     from storage, which is the customer's, and may be remote.
 
     :param state: the state the hook was given
-    :return: `type`, `message` and `traceback` (its last 16000 characters),
-        or None when the state is not a failure or holds no exception here
+    :return: `cemit.error_detail()` of the exception, or None when the state
+        is not a failure or holds no exception here
     """
     try:
         for check in ("is_failed", "is_crashed"):
@@ -451,14 +446,7 @@ def error_detail(state: Any) -> Optional[Dict[str, str]]:
         exc = _held_exception(getattr(state, "data", None))
         if exc is None:
             return None
-        text = "".join(
-            traceback.format_exception(type(exc), exc, exc.__traceback__)
-        )
-        return {
-            "type": type(exc).__name__,
-            "message": str(exc),
-            "traceback": text[-_TRACEBACK_LIMIT:],
-        }
+        return cemit.error_detail(exc)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         _LOG.debug("convalesce: could not read the failure: %s", exc)
         return None

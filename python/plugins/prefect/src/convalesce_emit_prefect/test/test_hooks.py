@@ -553,10 +553,10 @@ class Test_error_detail1(unittest.TestCase):
                 task="T", task_run=_TaskRun(), state=state, emitter=recorder
             )
         detail = recorder.sent[0]["payload"]["error_detail"]
-        self.assertEqual(detail["type"], "ValueError")
+        self.assertEqual(detail["type"], "builtins.ValueError")
         self.assertEqual(detail["message"], "bad row")
-        self.assertIn("KeyError", detail["traceback"])
         self.assertIn("_raised", detail["traceback"])
+        self.assertEqual(detail["cause"]["type"], "builtins.KeyError")
 
     def test2(self) -> None:
         """
@@ -573,24 +573,9 @@ class Test_error_detail1(unittest.TestCase):
         for data in (_raised(), Cached(_raised())):
             detail = cephooks.error_detail(_State(True, data))
             assert detail is not None
-            self.assertEqual(detail["type"], "ValueError")
+            self.assertEqual(detail["type"], "builtins.ValueError")
 
     def test3(self) -> None:
-        """
-        Test that a long traceback keeps its tail, where it failed.
-        """
-        exc = _raised()
-        with mock.patch.object(
-            cephooks.traceback,
-            "format_exception",
-            return_value=["head" + "x" * 20000, "tail"],
-        ):
-            detail = cephooks.error_detail(_State(True, exc))
-        assert detail is not None
-        self.assertEqual(len(detail["traceback"]), 16000)
-        self.assertTrue(detail["traceback"].endswith("tail"))
-
-    def test4(self) -> None:
         """
         Test that nothing is added for a success, a failure whose result is
         not in memory, or a state that is not Prefect's.
