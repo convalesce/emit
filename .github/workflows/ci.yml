@@ -178,10 +178,12 @@ jobs:
           # The backward test runs real checkpoints over SQLite and a CSV, so
           # it needs SQLAlchemy and pandas; 0.18 and 1.22 do not import with
           # SQLAlchemy 2.1 or pandas 3.
+          # 0.18 cannot serialise SQLAlchemy 2 result rows in its COMPLETE
+          # result format, so it gets the 1.4 line it was built against.
           - tool: gx
             spec: "great-expectations==0.18.22"
             python: "3.11"
-            extras: '"sqlalchemy<2.1" "pandas<3"'
+            extras: '"sqlalchemy<2" "pandas<2.2"'
           - tool: gx
             spec: "great-expectations==1.22.0"
             python: "3.12"
