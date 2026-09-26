@@ -106,6 +106,13 @@ _METADATA_ALLOWED = frozenset(
         "convalesce_urn",
         "datahub_urn",
         "dagster/column_schema",
+        # The SQL an asset ran: its text names tables, not rows, and is what
+        # collect parses into table and column lineage.
+        "Query",
+        "query",
+        "sql",
+        "dagster/query",
+        "convalesce/query",
     }
 )
 
