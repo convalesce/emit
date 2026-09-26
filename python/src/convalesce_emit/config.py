@@ -25,6 +25,7 @@ import convalesce_emit.config as ceconfig
 import dataclasses
 import logging
 import os
+import tempfile
 from typing import Any, Optional
 
 import convalesce_emit.errors as ceerrors
@@ -45,6 +46,10 @@ RECEIVER_MAX_BODY_BYTES = 5_000_000
 # Well under the receiver's limit, so a batch is closed long before a request
 # could be refused for its size.
 DEFAULT_MAX_BODY_BYTES = 1_000_000
+# Where undelivered batches wait to be sent again, and how much of the disk
+# they may take before a new one is refused rather than filling it.
+DEFAULT_SPOOL_DIR = os.path.join(tempfile.gettempdir(), "convalesce-emit-spool")
+DEFAULT_SPOOL_MAX_BYTES = 1_000_000_000
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -70,6 +75,10 @@ class Config:
     :param max_body_bytes: encoded size a batch is sent before reaching
     :param dry_run: build and log envelopes, send nothing
     :param enabled: when False, emitting is a no-op
+    :param spool_dir: where batches that could not be delivered are kept;
+        `CONVALESCE_SPOOL_DIR`, else a directory under the system temp dir,
+        when not given
+    :param spool_max_bytes: how large the waiting batches may grow on disk
     """
 
     endpoint: str = DEFAULT_ENDPOINT
@@ -81,6 +90,8 @@ class Config:
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
     dry_run: bool = False
     enabled: bool = True
+    spool_dir: Optional[str] = None
+    spool_max_bytes: int = DEFAULT_SPOOL_MAX_BYTES
 
     @classmethod
     def from_env(cls, **overrides: Any) -> "Config":
@@ -107,10 +118,28 @@ class Config:
             ),
             dry_run=_read_bool("CONVALESCE_DRY_RUN", False),
             enabled=_read_bool("CONVALESCE_ENABLED", True),
+            spool_max_bytes=int(
+                _read_num("CONVALESCE_SPOOL_MAX_BYTES", DEFAULT_SPOOL_MAX_BYTES)
+            ),
         )
         if overrides:
             config = dataclasses.replace(config, **overrides)
         return config
+
+    def spool_directory(self) -> str:
+        """
+        Where undelivered batches are kept.
+
+        Read when asked rather than when built, so a `Config()` made in code
+        still honours the variable an operator set.
+
+        :return: the directory
+        """
+        return (
+            self.spool_dir
+            or _read_str("CONVALESCE_SPOOL_DIR")
+            or DEFAULT_SPOOL_DIR
+        )
 
     def validate(self) -> None:
         """

@@ -692,24 +692,26 @@ def forward(
     :return: whether the observation was emitted, and whether it was redacted
     """
     redact = not send_samples()
-    platform = runtime_platform(payload)
-    if datasources:
-        platform["datasources"] = datasources
-    if result_urls:
-        platform["result_urls"] = result_urls
-    budget = cemit.new_budget()
-    body = cemit.dump(shape(payload), budget=budget)
-    if platform and isinstance(body, dict):
-        body.update(platform)
-    # Always, samples or not: a pandas `read_sql_*` asset keeps its `con`,
-    # the connection string, in the batch spec every result carries.
-    body, secrets = cemit.redact_secrets(body)
-    excluded = budget.excluded + secrets
-    if redact:
-        body, redacted = cemit.redact_samples(body)
-        body, values = redact_values(body)
-        excluded = excluded + redacted + values
     try:
+        # Inside the guard, not before it: GX fails the whole checkpoint when
+        # an action raises.
+        platform = runtime_platform(payload)
+        if datasources:
+            platform["datasources"] = datasources
+        if result_urls:
+            platform["result_urls"] = result_urls
+        budget = cemit.new_budget()
+        body = cemit.dump(shape(payload), budget=budget)
+        if platform and isinstance(body, dict):
+            body.update(platform)
+        # Always, samples or not: a pandas `read_sql_*` asset keeps its `con`,
+        # the connection string, in the batch spec every result carries.
+        body, secrets = cemit.redact_secrets(body)
+        excluded = budget.excluded + secrets
+        if redact:
+            body, redacted = cemit.redact_samples(body)
+            body, values = redact_values(body)
+            excluded = excluded + redacted + values
         target = emitter or cemit.Emitter()
         target.emit(
             tool=TOOL,

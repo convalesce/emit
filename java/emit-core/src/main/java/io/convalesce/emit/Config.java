@@ -33,6 +33,14 @@ public final class Config {
   // Well under the receiver's limit, so a batch is closed long before a request could be
   // refused for its size.
   private static final int DEFAULT_MAX_BODY_BYTES = 1_000_000;
+  // Where undelivered batches wait to be sent again, and how much disk they may take before a new
+  // one is refused rather than filling it. The same directory the Python client uses.
+  private static final String DEFAULT_SPOOL_DIR =
+      new java.io.File(System.getProperty("java.io.tmpdir"), "convalesce-emit-spool").getPath();
+  private static final long DEFAULT_SPOOL_MAX_BYTES = 1_000_000_000L;
+  // A driver that runs for hours still sends what it has every few seconds, instead of holding a
+  // part batch until fifty events or the application's end.
+  private static final int DEFAULT_FLUSH_INTERVAL_MS = 5_000;
 
   private final String endpoint;
   private final String ingestKey;
@@ -42,6 +50,9 @@ public final class Config {
   private final int maxBodyBytes;
   private final boolean dryRun;
   private final boolean enabled;
+  private final String spoolDir;
+  private final long spoolMaxBytes;
+  private final int flushIntervalMs;
 
   private Config(
       String endpoint,
@@ -51,7 +62,10 @@ public final class Config {
       int batchSize,
       int maxBodyBytes,
       boolean dryRun,
-      boolean enabled) {
+      boolean enabled,
+      String spoolDir,
+      long spoolMaxBytes,
+      int flushIntervalMs) {
     this.endpoint = endpoint;
     this.ingestKey = ingestKey;
     this.timeoutMs = timeoutMs;
@@ -60,6 +74,9 @@ public final class Config {
     this.maxBodyBytes = maxBodyBytes;
     this.dryRun = dryRun;
     this.enabled = enabled;
+    this.spoolDir = spoolDir;
+    this.spoolMaxBytes = spoolMaxBytes;
+    this.flushIntervalMs = flushIntervalMs;
   }
 
   /**
@@ -76,7 +93,10 @@ public final class Config {
         readInt("CONVALESCE_BATCH_SIZE", DEFAULT_BATCH_SIZE),
         readInt("CONVALESCE_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
         readBoolean("CONVALESCE_DRY_RUN", false),
-        readBoolean("CONVALESCE_ENABLED", true));
+        readBoolean("CONVALESCE_ENABLED", true),
+        orDefault(readString("CONVALESCE_SPOOL_DIR"), DEFAULT_SPOOL_DIR),
+        readLong("CONVALESCE_SPOOL_MAX_BYTES", DEFAULT_SPOOL_MAX_BYTES),
+        readInt("CONVALESCE_FLUSH_INTERVAL", DEFAULT_FLUSH_INTERVAL_MS / 1000) * 1000);
   }
 
   /**
@@ -105,7 +125,39 @@ public final class Config {
   public static Config of(
       String endpoint, String ingestKey, int batchSize, int maxRetries, int maxBodyBytes) {
     return new Config(
-        endpoint, ingestKey, DEFAULT_TIMEOUT_MS, maxRetries, batchSize, maxBodyBytes, false, true);
+        endpoint,
+        ingestKey,
+        DEFAULT_TIMEOUT_MS,
+        maxRetries,
+        batchSize,
+        maxBodyBytes,
+        false,
+        true,
+        DEFAULT_SPOOL_DIR,
+        DEFAULT_SPOOL_MAX_BYTES,
+        // Off: a caller building a configuration in code flushes when it chooses.
+        0);
+  }
+
+  /**
+   * The same configuration, keeping undelivered batches somewhere else.
+   *
+   * @param directory where the spool lives
+   * @return the configuration
+   */
+  public Config withSpoolDir(String directory) {
+    return new Config(
+        endpoint,
+        ingestKey,
+        timeoutMs,
+        maxRetries,
+        batchSize,
+        maxBodyBytes,
+        dryRun,
+        enabled,
+        directory,
+        spoolMaxBytes,
+        flushIntervalMs);
   }
 
   /**
@@ -172,6 +224,19 @@ public final class Config {
     return enabled;
   }
 
+  public String spoolDir() {
+    return spoolDir;
+  }
+
+  public long spoolMaxBytes() {
+    return spoolMaxBytes;
+  }
+
+  /** Milliseconds between background flushes; zero or less turns them off. */
+  public int flushIntervalMs() {
+    return flushIntervalMs;
+  }
+
   private static String readString(String name) {
     String value = System.getenv(name);
     return value == null ? null : value.trim();
@@ -188,6 +253,18 @@ public final class Config {
     }
     String lower = raw.toLowerCase();
     return lower.equals("1") || lower.equals("true") || lower.equals("yes") || lower.equals("on");
+  }
+
+  private static long readLong(String name, long fallback) {
+    String raw = readString(name);
+    if (raw == null || raw.isEmpty()) {
+      return fallback;
+    }
+    try {
+      return (long) Double.parseDouble(raw);
+    } catch (NumberFormatException e) {
+      return fallback;
+    }
   }
 
   private static int readInt(String name, int fallback) {

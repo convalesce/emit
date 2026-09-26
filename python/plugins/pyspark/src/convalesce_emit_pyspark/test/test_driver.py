@@ -17,6 +17,9 @@ from unittest import mock
 import convalesce_emit_pyspark as cepyspar
 import convalesce_emit_pyspark.driver as cepysdri
 
+# The recording emitter mirrors the Airflow OpenLineage test's own.
+# pylint: disable=duplicate-code
+
 _LOG = logging.getLogger(__name__)
 
 # Beside the package in the source tree; at site-packages' root once installed.

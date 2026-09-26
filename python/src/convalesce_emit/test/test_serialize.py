@@ -573,6 +573,48 @@ class Test_dump_property1(unittest.TestCase):
 
     def test4(self) -> None:
         """
+        Test that an object raising KeyError for unknown names still dumps.
+
+        Airflow's `var.value` accessor looks every attribute up as a
+        Variable and raises KeyError ("Variable shape does not exist"), which
+        the probes let through and every failed task's event was lost.
+        """
+
+        class VariableAccessor:
+            """Stands in for Airflow's VariableAccessor."""
+
+            def __init__(self) -> None:
+                self.name = "vars"
+
+            def __getattr__(self, key: str) -> Any:
+                raise KeyError(f"Variable {key} does not exist")
+
+        out = ceserial.dump({"var": VariableAccessor(), "ok": 1})
+        self.assertEqual(out["ok"], 1)
+        self.assertEqual(out["var"], {"name": "vars"})
+
+    def test5(self) -> None:
+        """
+        Test that a value that cannot be walked costs only that value.
+        """
+
+        class Changing(list):
+            """A list another thread changes while it is walked."""
+
+            def __iter__(self) -> Any:
+                raise RuntimeError("list changed size during iteration")
+
+        budget = ceserial.new_budget()
+        out = ceserial.dump({"steps": Changing([1]), "ok": 1}, budget=budget)
+        self.assertEqual(out["ok"], 1)
+        self.assertIn("unreadable", out["steps"])
+        self.assertEqual(
+            budget.excluded,
+            [{"path": "steps", "reason": "unreadable: RuntimeError"}],
+        )
+
+    def test6(self) -> None:
+        """
         Test that a value raising when merely inspected loses only itself.
 
         Airflow's lazy `triggering_dataset_events` is a proxy whose
@@ -596,7 +638,7 @@ class Test_dump_property1(unittest.TestCase):
         self.assertEqual(out["op_kwargs"]["ds"], "2026-09-20")
         self.assertEqual(out["op_kwargs"]["events"], "<Proxy: unreadable>")
         self.assertIn(
-            {"path": "op_kwargs.events", "reason": "unreadable"},
+            {"path": "op_kwargs.events", "reason": "unreadable: RuntimeError"},
             budget.excluded,
         )
 

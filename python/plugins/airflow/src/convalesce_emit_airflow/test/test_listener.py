@@ -415,6 +415,28 @@ class Test_listener_dag_run1(unittest.TestCase):
         self.assertEqual(task["dag"]["dag_id"], "demo_pipeline")
         self.assertEqual(dag_run["dag"], {"$ref": task["dag"]["$id"]})
 
+    def test6(self) -> None:
+        """
+        Test that a run that raises when loaded still lets the task through.
+
+        Airflow 2 loads `dag_run` lazily, and a task instance detached from
+        its session raises DetachedInstanceError rather than AttributeError.
+        """
+
+        class Detached:
+            """Stands in for a detached Airflow 2 task instance."""
+
+            def __init__(self) -> None:
+                self.task_id = "load"
+
+            @property
+            def dag_run(self) -> Any:
+                """Fail, the way a detached lazy load does."""
+                raise RuntimeError("Parent instance is not bound to a Session")
+
+        payload, _ = cealist.shape({"task_instance": Detached()})
+        self.assertEqual(payload["task_instance"]["task_id"], "load")
+
 
 # #############################################################################
 # Test_listener_task_group1

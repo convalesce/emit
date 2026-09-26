@@ -92,15 +92,21 @@ def _emit(
     :param emitter: emitter to send through
     :return: nothing
     """
-    payload = {**payload, **api_state(payload)}
-    budget = cemit.new_budget(skip=_SKIP)
-    dumped = cemit.dump(payload, budget=budget)
-    withheld: List[Dict[str, str]] = []
-    if not send_parameters():
-        dumped, withheld = withhold_parameters(dumped)
-    # A run's job variables and, when sent, its parameters are whatever
-    # launched it typed, and either can hold a literal credential.
-    dumped, secrets = cemit.redact_secrets(dumped)
+    try:
+        payload = {**payload, **api_state(payload)}
+        budget = cemit.new_budget(skip=_SKIP)
+        dumped = cemit.dump(payload, budget=budget)
+        withheld: List[Dict[str, str]] = []
+        if not send_parameters():
+            dumped, withheld = withhold_parameters(dumped)
+        # A run's job variables and, when sent, its parameters are whatever
+        # launched it typed, and either can hold a literal credential.
+        dumped, secrets = cemit.redact_secrets(dumped)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # A Prefect hook that raises is logged by Prefect as the flow's own
+        # failure; nothing about reporting on it is worth that.
+        _LOG.warning("convalesce: could not shape %s: %s", event, exc)
+        return
     cemit.send_one(
         tool=TOOL,
         event=event,

@@ -7,4 +7,4 @@ import convalesce_emit_airflow._version as ceairflowver
 """
 
 __package_name__ = "convalesce-emit-airflow"
-__version__ = "0.1.3"
+__version__ = "0.1.4"

@@ -18,7 +18,9 @@ import java.util.List;
 import java.util.zip.GZIPInputStream;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 /**
  * Drives the emitter against a real HTTP server.
@@ -27,6 +29,10 @@ import org.junit.Test;
  * nothing.
  */
 public class EmitterTest {
+
+  // Each test's undelivered batches stay its own; a shared spool would be drained into the next
+  // test's server.
+  @Rule public TemporaryFolder spool = new TemporaryFolder();
 
   private HttpServer server;
   private String url;
@@ -71,7 +77,8 @@ public class EmitterTest {
   }
 
   private Emitter emitter(int batchSize, int maxRetries) {
-    return new Emitter(Config.of(url, "secret-key", batchSize, maxRetries));
+    return new Emitter(
+        Config.of(url, "secret-key", batchSize, maxRetries).withSpoolDir(spoolDir()));
   }
 
   @Test
@@ -119,7 +126,8 @@ public class EmitterTest {
   public void batchIsClosedByBodySizeNotOnlyCount() {
     // The receiver refuses a body above its limit whole and does not retry, so fifty Spark plan
     // events used to be dropped together.
-    Emitter emitter = new Emitter(Config.of(url, "secret-key", 50, 0, 10_000));
+    Emitter emitter =
+        new Emitter(Config.of(url, "secret-key", 50, 0, 10_000).withSpoolDir(spoolDir()));
     String payload = "{\"plan\":\"" + repeat("x", 4000) + "\"}";
     for (int i = 0; i < 6; i++) {
       emitter.emit("spark", "e", payload, null);
@@ -136,7 +144,8 @@ public class EmitterTest {
 
   @Test
   public void anOversizedObservationGoesAlone() {
-    Emitter emitter = new Emitter(Config.of(url, "secret-key", 50, 0, 4000));
+    Emitter emitter =
+        new Emitter(Config.of(url, "secret-key", 50, 0, 4000).withSpoolDir(spoolDir()));
     emitter.emit("spark", "small", "{\"a\":1}", null);
     emitter.emit("spark", "huge", "{\"plan\":\"" + repeat("x", 8000) + "\"}", null);
     emitter.emit("spark", "small", "{\"b\":2}", null);
@@ -187,7 +196,8 @@ public class EmitterTest {
 
   @Test
   public void unreachableEndpointNeverReachesTheCaller() {
-    Emitter emitter = new Emitter(Config.of("http://127.0.0.1:1", "k", 1, 0));
+    Emitter emitter =
+        new Emitter(Config.of("http://127.0.0.1:1", "k", 1, 0).withSpoolDir(spoolDir()));
     emitter.emit("spark", "e", "{}", null);
   }
 
@@ -210,7 +220,7 @@ public class EmitterTest {
   @Test
   public void missingKeyIsReportedNotThrown() {
     assertNotNull(Config.of(url, null, 1, 0).validate());
-    new Emitter(Config.of(url, null, 1, 0)).emit("spark", "e", "{}", null);
+    new Emitter(Config.of(url, null, 1, 0).withSpoolDir(spoolDir())).emit("spark", "e", "{}", null);
     assertEquals(0, bodies.size());
   }
 
@@ -225,6 +235,48 @@ public class EmitterTest {
     assertNotNull(Config.of(url, "k", Config.RECEIVER_MAX_OBSERVATIONS + 1, 0).validate());
     assertNotNull(Config.of(url, "k", 1, 0, Config.RECEIVER_MAX_BODY_BYTES + 1).validate());
     assertNull(Config.of(url, "k", Config.RECEIVER_MAX_OBSERVATIONS, 0).validate());
+  }
+
+  private String spoolDir() {
+    return spool.getRoot().getPath();
+  }
+
+  private int spooled(String kind) {
+    String[] names = new java.io.File(spool.getRoot(), kind).list();
+    return names == null ? 0 : names.length;
+  }
+
+  @Test
+  public void undeliveredBatchIsKeptAndSentAfterTheNextSuccess() {
+    status = 503;
+    Emitter emitter = emitter(1, 0);
+    emitter.emit("spark", "lost", "{}", null);
+    assertEquals(1, spooled(Spool.PENDING));
+    status = 200;
+    emitter.emit("spark", "next", "{}", null);
+    assertEquals(3, bodies.size());
+    assertTrue(bodies.get(2).contains("\"lost\""));
+    assertEquals(0, spooled(Spool.PENDING));
+  }
+
+  @Test
+  public void refusedBatchIsSplitAndEachRefusalKept() {
+    status = 400;
+    Emitter emitter = emitter(3, 0);
+    for (int i = 0; i < 3; i++) {
+      emitter.emit("spark", "e" + i, "{}", null);
+    }
+    // The batch once, then each observation on its own.
+    assertEquals(4, bodies.size());
+    assertEquals(3, spooled(Spool.REJECTED));
+    assertEquals(0, spooled(Spool.PENDING));
+  }
+
+  @Test
+  public void unreachableEndpointBatchIsKept() {
+    new Emitter(Config.of("http://127.0.0.1:1", "k", 1, 0).withSpoolDir(spoolDir()))
+        .emit("spark", "e", "{}", null);
+    assertEquals(1, spooled(Spool.PENDING));
   }
 
   private static byte[] readBytes(InputStream in) throws java.io.IOException {
