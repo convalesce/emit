@@ -28,6 +28,9 @@ pip install convalesce-emit-airflow   # or -dagster, -prefect, -gx
 ```
 
 For Spark, two lines of config rather than a pip install. See [`java/`](java).
+A PySpark driver that fails in Python before Spark runs anything still ends
+its application as a success; `convalesce-emit-pyspark` reports it. See
+[`python/plugins/pyspark`](python/plugins/pyspark).
 
 Each plugin pulls in `convalesce-emit`, which has **no dependencies of its
 own**: transport is `urllib` from the standard library. It installs into an
@@ -41,11 +44,11 @@ Set these on the worker; no code changes are needed.
 | Variable | Default | |
 | --- | --- | --- |
 | `CONVALESCE_INGEST_KEY` | none | required unless dry-running |
-| `CONVALESCE_ENDPOINT` | `https://api.convalesce.io` | |
+| `CONVALESCE_ENDPOINT` | `https://api.convalesce.io` | for a self-hosted collect, its GMS URL ending in `/openapi`, e.g. `http://localhost:8080/openapi` |
 | `CONVALESCE_DRY_RUN` | `false` | build envelopes, log them, send nothing |
 | `CONVALESCE_ENABLED` | `true` | set `false` to switch off entirely |
-| `CONVALESCE_BATCH_SIZE` | `50` | observations per request |
-| `CONVALESCE_MAX_BODY_BYTES` | `1000000` | a batch is sent before the body would pass this |
+| `CONVALESCE_BATCH_SIZE` | `50` | observations per request; at most 50, the receiver's limit |
+| `CONVALESCE_MAX_BODY_BYTES` | `1000000` | a batch is sent before the body would pass this; at most 5000000 |
 | `CONVALESCE_MAX_RETRIES` | `3` | |
 | `CONVALESCE_TIMEOUT` | `10` | seconds |
 | `CONVALESCE_SPOOL_DIR` | `<temp dir>/convalesce-emit-spool` | undelivered batches wait here and are sent after the next send that succeeds; refused ones are kept under `rejected/` |
@@ -53,6 +56,19 @@ Set these on the worker; no code changes are needed.
 
 Try it against a real pipeline before pointing it at an account:
 `CONVALESCE_DRY_RUN=true`.
+
+## Check the connection
+
+Run this where the tool runs, with the same environment it has:
+
+```sh
+convalesce-emit check                      # or: python -m convalesce_emit check
+java -jar convalesce-emit-core-0.1.3.jar   # on a Spark driver's host
+```
+
+It sends one empty batch with the configured key and says whether the key was
+accepted, refused, or never reached us. Once it passes, the console shows the
+key as heard from.
 
 ## What gets sent
 

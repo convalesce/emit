@@ -49,6 +49,31 @@ class Test_config1(unittest.TestCase):
         with self.assertRaises(ceerrors.ConfigError):
             ceconfig.Config(ingest_key="k", endpoint="ftp://nope").validate()
 
+    def test4(self) -> None:
+        """
+        Test that a batch larger than the receiver takes is refused.
+
+        The receiver answers 400 to the whole request and a 400 is not
+        retried, so this would otherwise drop every batch silently.
+        """
+        with self.assertRaises(ceerrors.ConfigError):
+            ceconfig.Config(
+                ingest_key="k", batch_size=ceconfig.RECEIVER_MAX_OBSERVATIONS + 1
+            ).validate()
+        ceconfig.Config(
+            ingest_key="k", batch_size=ceconfig.RECEIVER_MAX_OBSERVATIONS
+        ).validate()
+
+    def test5(self) -> None:
+        """
+        Test that a body cap above the receiver's limit is refused.
+        """
+        with self.assertRaises(ceerrors.ConfigError):
+            ceconfig.Config(
+                ingest_key="k",
+                max_body_bytes=ceconfig.RECEIVER_MAX_BODY_BYTES + 1,
+            ).validate()
+
 
 # #############################################################################
 # Test_config_from_env1

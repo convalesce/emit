@@ -21,9 +21,10 @@ import convalesce_emit_prefect.hooks as cephooks
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
+import convalesce_emit_prefect._lineage as celin
 
 _LOG = logging.getLogger(__name__)
 
@@ -53,6 +54,23 @@ _FALSY = frozenset({"0", "false", "no", "off"})
 _TASK_RUN_PAGE_SIZE = 200
 _TASK_RUN_PAGE_BACKSTOP = 50
 
+# A state's data is what the flow or task returned -- the customer's own
+# data, which never crosses -- or, on a failure, the exception, which crosses
+# as `error_detail` instead. The run objects carry their own copy of it.
+_SKIP = frozenset({"state.data", "flow_run.state.data", "task_run.state.data"})
+
+# A flow's parameters are whatever launched the run typed -- a customer id, a
+# date range, a bucket -- and nothing a receiver reads. Their names and types
+# cross; their values only when a customer opts in.
+_SEND_PARAMETERS_ENV = "CONVALESCE_PREFECT_SEND_PARAMETERS"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_PARAMETER_VALUES = (("flow_run", "parameters"), ("api_flow_run", "parameters"))
+# The flow's own parameter schema carries each parameter's default value.
+_PARAMETER_SCHEMA = ("flow", "parameters", "properties")
+_PARAMETERS_WITHHELD = "parameter values withheld"
+# Stamped by `cemit.dump` on a mapping something else points at; kept as is.
+_REF_ID = "$id"
+
 # A Prefect Cloud API URL names the account and the workspace in its own
 # path; nothing about a run has to be read to find them.
 _CLOUD_URL_RE = re.compile(
@@ -76,8 +94,14 @@ def _emit(
     """
     try:
         payload = {**payload, **api_state(payload)}
-        budget = cemit.new_budget()
+        budget = cemit.new_budget(skip=_SKIP)
         dumped = cemit.dump(payload, budget=budget)
+        withheld: List[Dict[str, str]] = []
+        if not send_parameters():
+            dumped, withheld = withhold_parameters(dumped)
+        # A run's job variables and, when sent, its parameters are whatever
+        # launched it typed, and either can hold a literal credential.
+        dumped, secrets = cemit.redact_secrets(dumped)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         # A Prefect hook that raises is logged by Prefect as the flow's own
         # failure; nothing about reporting on it is worth that.
@@ -89,8 +113,77 @@ def _emit(
         payload=dumped,
         emitter=emitter,
         tool_version=cemit.version_of("prefect"),
-        excluded=budget.excluded,
+        excluded=budget.excluded + withheld + secrets,
     )
+
+
+# #############################################################################
+# Parameters
+# #############################################################################
+
+
+def send_parameters() -> bool:
+    """
+    Whether flow parameter values cross, off by default.
+
+    :return: whether `CONVALESCE_PREFECT_SEND_PARAMETERS` is set truthy
+    """
+    raw = os.environ.get(_SEND_PARAMETERS_ENV, "")
+    return raw.strip().lower() in _TRUTHY
+
+
+def withhold_parameters(
+    body: Any,
+) -> Tuple[Any, List[Dict[str, str]]]:
+    """
+    Replace each flow parameter's value, and each default, with its type.
+
+    The names survive, so a receiver still sees what a run was called with,
+    just not with what.
+
+    :param body: the dumped payload
+    :return: the same payload, values replaced, and what was withheld, by
+        path and reason
+    """
+    excluded: List[Dict[str, str]] = []
+    if not isinstance(body, dict):
+        return body, excluded
+    for carrier, name in _PARAMETER_VALUES:
+        holder = body.get(carrier)
+        if not isinstance(holder, dict) or not isinstance(
+            holder.get(name), dict
+        ):
+            continue
+        holder[name] = {
+            key: value if key == _REF_ID else _type_marker(value)
+            for key, value in holder[name].items()
+        }
+        excluded.append(
+            {"path": f"{carrier}.{name}", "reason": _PARAMETERS_WITHHELD}
+        )
+    properties: Any = body
+    for step in _PARAMETER_SCHEMA:
+        properties = (
+            properties.get(step) if isinstance(properties, dict) else None
+        )
+    if not isinstance(properties, dict):
+        return body, excluded
+    for key, schema in properties.items():
+        if isinstance(schema, dict) and "default" in schema:
+            schema["default"] = _type_marker(schema["default"])
+            path = ".".join(_PARAMETER_SCHEMA + (str(key), "default"))
+            excluded.append({"path": path, "reason": _PARAMETERS_WITHHELD})
+    return body, excluded
+
+
+def _type_marker(value: Any) -> str:
+    """
+    What stands in for a withheld value.
+
+    :param value: the dumped value
+    :return: its type, as `<str>`, `<int>` and so on
+    """
+    return f"<{type(value).__name__}>"
 
 
 # #############################################################################
@@ -355,6 +448,9 @@ def emit_flow_run(
     :return: nothing
     """
     payload = {"flow": flow, "flow_run": flow_run, "state": state, **kwargs}
+    detail = error_detail(state)
+    if detail is not None:
+        payload.setdefault("error_detail", detail)
     _emit("flow_run", payload, emitter)
 
 
@@ -405,6 +501,12 @@ def emit_task_run(
     :return: nothing
     """
     payload = {"task": task, "task_run": task_run, "state": state, **kwargs}
+    declared = celin.take(task_run)
+    if declared is not None:
+        payload.setdefault("lineage", declared)
+    detail = error_detail(state)
+    if detail is not None:
+        payload.setdefault("error_detail", detail)
     # The hook's own arguments win: what the context holds is a fallback for
     # what the task run does not name, never a replacement for it.
     for name, value in running_flow().items():
@@ -412,3 +514,66 @@ def emit_task_run(
         if payload[name] is None:
             payload[name] = value
     _emit("task_run", payload, emitter)
+
+
+# #############################################################################
+# Failure detail
+# #############################################################################
+
+
+def error_detail(state: Any) -> Optional[Dict[str, Any]]:
+    """
+    The exception a failed state holds, where it is already in memory.
+
+    A failed state's `message` names the exception but not where it was
+    raised. The exception itself is the state's data: on Prefect 3 a result
+    record whose `result` is the exception, on Prefect 2 a result holding it
+    in its cache, or on either the bare exception. `state.result()` is
+    deliberately not called: where results are persisted it reads them back
+    from storage, which is the customer's, and may be remote.
+
+    :param state: the state the hook was given
+    :return: `cemit.error_detail()` of the exception, or None when the state
+        is not a failure or holds no exception here
+    """
+    try:
+        for check in ("is_failed", "is_crashed"):
+            method = getattr(state, check, None)
+            if callable(method) and method():
+                break
+        else:
+            if callable(getattr(state, "is_failed", None)):
+                return None
+        exc = _held_exception(getattr(state, "data", None))
+        if exc is None:
+            return None
+        detail: Dict[str, Any] = cemit.error_detail(exc)
+        return detail
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: could not read the failure: %s", exc)
+        return None
+
+
+def _held_exception(data: Any) -> Optional[BaseException]:
+    """
+    The exception a state's data holds in memory, without loading anything.
+
+    :param data: `state.data`
+    :return: the exception, or None
+    """
+    if isinstance(data, BaseException):
+        return data
+    # Read off the instance's own storage, not through attributes: a result
+    # that is not in memory may load it from storage on attribute access.
+    # Pydantic 2 keeps a private attribute such as `_cache` apart.
+    fields: Dict[str, Any] = {}
+    for store in ("__dict__", "__pydantic_private__"):
+        try:
+            fields.update(object.__getattribute__(data, store) or {})
+        except (AttributeError, TypeError, ValueError):
+            continue
+    for name in ("result", "_cache"):
+        value = fields.get(name)
+        if isinstance(value, BaseException):
+            return value
+    return None

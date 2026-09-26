@@ -39,7 +39,7 @@ public final class Emitter {
 
   private static final Logger LOG = Logger.getLogger(Emitter.class.getName());
   private static final Charset UTF8 = Charset.forName("UTF-8");
-  private static final String OBSERVATIONS_PATH = "/v1/observations";
+  static final String OBSERVATIONS_PATH = "/v1/observations";
   private static final String BODY_OPEN = "{\"observations\":[";
   private static final String BODY_CLOSE = "]}";
 
@@ -147,7 +147,7 @@ public final class Emitter {
     Observation observation = new Observation(tool, event, payloadJson, toolVersion);
     byte[] bytes = observation.toJson().getBytes(UTF8);
     int overhead = BODY_OPEN.length() + BODY_CLOSE.length();
-    if (bytes.length + overhead > config.maxBodyBytes()) {
+    if (!fits(bytes.length)) {
       LOG.warning(
           "convalesce: "
               + tool
@@ -181,6 +181,27 @@ public final class Emitter {
     if (ready) {
       flush();
     }
+  }
+
+  /**
+   * Whether one observation fits in a request of its own.
+   *
+   * <p>For a caller that can shrink what it sends and would rather do that than have the whole
+   * observation refused.
+   *
+   * @param tool which tool produced this
+   * @param event which callback fired
+   * @param payloadJson the tool's own output, already JSON
+   * @param toolVersion the tool's version, where it could be read
+   * @return whether it is within the receiver's body limit
+   */
+  public boolean fits(String tool, String event, String payloadJson, String toolVersion) {
+    Observation observation = new Observation(tool, event, payloadJson, toolVersion);
+    return fits(observation.toJson().getBytes(UTF8).length);
+  }
+
+  private boolean fits(int observationBytes) {
+    return observationBytes + BODY_OPEN.length() + BODY_CLOSE.length() <= config.maxBodyBytes();
   }
 
   /** Sends whatever is queued, logging rather than throwing on failure. */
@@ -323,6 +344,21 @@ public final class Emitter {
   }
 
   private void attempt(String url, byte[] body) throws TransportException {
+    post(config, url, body);
+  }
+
+  /**
+   * Makes one HTTP request with a configuration's key, without retrying.
+   *
+   * <p>Shared with {@link Check}, so the check sends exactly the headers, compression and path a
+   * real batch does.
+   *
+   * @param config whose key and timeout to use
+   * @param url where to post
+   * @param body the gzip-compressed batch
+   * @throws TransportException on any HTTP or connection failure
+   */
+  static void post(Config config, String url, byte[] body) throws TransportException {
     HttpURLConnection connection = null;
     try {
       connection = (HttpURLConnection) new URL(url).openConnection();
@@ -357,11 +393,11 @@ public final class Emitter {
     }
   }
 
-  private static String trimTrailingSlash(String value) {
+  static String trimTrailingSlash(String value) {
     return value.endsWith("/") ? value.substring(0, value.length() - 1) : value;
   }
 
-  private static byte[] gzip(byte[] data) throws java.io.IOException {
+  static byte[] gzip(byte[] data) throws java.io.IOException {
     java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(data.length);
     java.util.zip.GZIPOutputStream zipped = new java.util.zip.GZIPOutputStream(out);
     try {

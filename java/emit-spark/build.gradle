@@ -5,6 +5,12 @@ ext {
   // resolved reflectively at runtime, so this pins what we compile against, not what we support.
   sparkVersion = '3.5.0'
   scalaBinary = '2.12'
+  // Compiled against the newest; the transport API it touches (Transport, TransportBuilder,
+  // TransportConfig, OpenLineageClientUtils.toJson) has not changed shape since 1.13.
+  openLineageVersion = '1.53.0'
+  // Only read, never loaded: its facet classes are listed by OpenLineageFacetInventoryTest. It
+  // bundles its own openlineage-java, so on a classpath it would shadow the one above.
+  openLineageSparkVersion = '1.50.0'
 }
 
 // Spark 3.3 is the last release whose JsonProtocol returns a json4s JValue rather than a String.
@@ -13,9 +19,21 @@ ext {
 // event because `render` needs an implicit its reflective caller cannot supply.
 ext.legacySparkVersion = '3.3.4'
 
+// The OpenLineage transport is tested in its own source set with no Spark on it: openlineage-java
+// wants a newer Jackson than Spark 3.5's jackson-module-scala accepts, and on a shared test
+// classpath one of them would be run against a Jackson it was never built for. It also proves the
+// transport needs nothing from Spark. The listener's own `legacyTest` has no OpenLineage on its
+// classpath, which proves the converse.
 sourceSets {
   legacyTest {
     java.srcDir 'src/legacyTest/java'
+    compileClasspath += sourceSets.main.output
+    runtimeClasspath += sourceSets.main.output
+  }
+  openLineageTest {
+    java.srcDir 'src/openLineageTest/java'
+    // openlineage-facets.yml lives beside the other inventories, where collect's copy points.
+    resources.srcDir 'src/test/resources'
     compileClasspath += sourceSets.main.output
     runtimeClasspath += sourceSets.main.output
   }
@@ -23,6 +41,8 @@ sourceSets {
 
 configurations {
   legacyTestImplementation.extendsFrom implementation
+  openLineageTestImplementation.extendsFrom implementation
+  openLineageSparkJar { transitive = false }
 }
 
 dependencies {
@@ -31,6 +51,17 @@ dependencies {
   // plugin breaks the job it is watching.
   compileOnly "org.apache.spark:spark-core_${scalaBinary}:${sparkVersion}"
   testImplementation "org.apache.spark:spark-core_${scalaBinary}:${sparkVersion}"
+  // Only so SparkEventInventoryTest sees the SQL, catalog and streaming events too.
+  testImplementation "org.apache.spark:spark-sql_${scalaBinary}:${sparkVersion}"
+  // compileOnly for the same reason: openlineage-spark brings its own copy, and a job without it
+  // must not be handed one. Nothing outside the transport classes names an OpenLineage type.
+  compileOnly "io.openlineage:openlineage-java:${openLineageVersion}"
+  openLineageTestImplementation 'junit:junit:4.13.2'
+  openLineageTestImplementation "io.openlineage:openlineage-java:${openLineageVersion}"
+  // Its pom scopes Jackson to runtime, and javac warns (and -Werror fails) on the annotations it
+  // cannot resolve on the builder classes the tests call.
+  openLineageTestCompileOnly 'com.fasterxml.jackson.core:jackson-databind:2.18.9'
+  openLineageSparkJar "io.openlineage:openlineage-spark_${scalaBinary}:${openLineageSparkVersion}"
   legacyTestImplementation 'junit:junit:4.13.2'
   legacyTestImplementation "org.apache.spark:spark-core_${scalaBinary}:${legacySparkVersion}"
 }
@@ -43,7 +74,20 @@ tasks.register('legacyTest', Test) {
   useJUnit()
 }
 
+tasks.register('openLineageTest', Test) {
+  description = 'Runs the OpenLineage transport against openlineage-java, without Spark.'
+  group = 'verification'
+  testClassesDirs = sourceSets.openLineageTest.output.classesDirs
+  classpath = sourceSets.openLineageTest.runtimeClasspath
+  useJUnit()
+  def sparkJar = configurations.openLineageSparkJar
+  inputs.files(sparkJar)
+  doFirst { systemProperty 'openlineage.spark.jar', sparkJar.singleFile.absolutePath }
+}
+
 tasks.named('check') { dependsOn 'legacyTest' }
+// `test` is the gate the Makefile and CI name, so the transport's tests ride with it.
+tasks.named('test') { dependsOn 'openLineageTest' }
 
 publishing.publications.maven.pom {
   name = 'convalesce-emit-spark'

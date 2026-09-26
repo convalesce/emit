@@ -163,6 +163,13 @@ public class EmitterTest {
     assertEquals(3, total);
   }
 
+  @Test
+  public void fitsSaysWhetherAnObservationWouldGoWithinTheLimit() {
+    Emitter emitter = new Emitter(Config.of(url, "secret-key", 50, 0, 4000));
+    assertTrue(emitter.fits("spark", "small", "{\"a\":1}", null));
+    assertFalse(emitter.fits("spark", "huge", "{\"plan\":\"" + repeat("x", 8000) + "\"}", null));
+  }
+
   private static String repeat(String unit, int times) {
     StringBuilder out = new StringBuilder(unit.length() * times);
     for (int i = 0; i < times; i++) {
@@ -173,7 +180,7 @@ public class EmitterTest {
 
   @Test
   public void closeFlushesAPartialBatch() {
-    Emitter emitter = emitter(100, 0);
+    Emitter emitter = emitter(Config.RECEIVER_MAX_OBSERVATIONS, 0);
     emitter.emit("spark", "e", "{}", null);
     assertEquals(0, bodies.size());
     emitter.close();
@@ -220,6 +227,14 @@ public class EmitterTest {
   @Test
   public void usableConfigValidatesClean() {
     assertNull(Config.of(url, "k", 1, 0).validate());
+  }
+
+  @Test
+  public void limitsBeyondTheReceiverAreReported() {
+    // The receiver refuses such a request whole with a 400, which is not retried.
+    assertNotNull(Config.of(url, "k", Config.RECEIVER_MAX_OBSERVATIONS + 1, 0).validate());
+    assertNotNull(Config.of(url, "k", 1, 0, Config.RECEIVER_MAX_BODY_BYTES + 1).validate());
+    assertNull(Config.of(url, "k", Config.RECEIVER_MAX_OBSERVATIONS, 0).validate());
   }
 
   private String spoolDir() {

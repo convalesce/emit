@@ -160,3 +160,85 @@ class Test_redact_extra_keys1(unittest.TestCase):
         out, excluded = ceredact.redact_samples(payload)
         self.assertEqual(out, payload)
         self.assertEqual(excluded, [])
+
+
+# #############################################################################
+# Test_redact_secrets1
+# #############################################################################
+
+
+class Test_redact_secrets1(unittest.TestCase):
+    """
+    Test that credentials never survive secret redaction while the text
+    around them does.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that values under credential-named keys are replaced, in any
+        casing or separator style, and declared.
+        """
+        payload = {
+            "conn": {
+                "password": "hunter2",
+                "clientSecret": "s3",
+                "API-KEY": "k",
+                "access_token": "t",
+                "host": "db",
+            }
+        }
+        out, excluded = ceredact.redact_secrets(payload, path="run_event")
+        self.assertEqual(out["conn"]["host"], "db")
+        for key in ("password", "clientSecret", "API-KEY", "access_token"):
+            self.assertEqual(out["conn"][key], {"redacted": True})
+        text = json.dumps(out)
+        for secret in ("hunter2", '"s3"', '"k"', '"t"'):
+            self.assertNotIn(secret, text)
+        self.assertIn(
+            {"path": "run_event.conn.password", "reason": "secret redacted"},
+            excluded,
+        )
+        self.assertEqual(len(excluded), 4)
+
+    def test2(self) -> None:
+        """
+        Test that a password inside a URI is masked and the user, host and
+        path are kept.
+        """
+        payload = {
+            "facets": [{"uri": "postgresql://etl:pa55@db.internal:5432/orders"}]
+        }
+        out, excluded = ceredact.redact_secrets(payload)
+        self.assertEqual(
+            out["facets"][0]["uri"],
+            "postgresql://etl:***@db.internal:5432/orders",
+        )
+        self.assertEqual(
+            excluded,
+            [{"path": "facets[0].uri", "reason": "credential masked"}],
+        )
+
+    def test3(self) -> None:
+        """
+        Test that `password=` in a connection string is masked in place.
+        """
+        text = "jdbc:sqlserver://h;user=etl;password=pa55;db=x"
+        out, _ = ceredact.redact_secrets({"url": text})
+        self.assertEqual(
+            out["url"], "jdbc:sqlserver://h;user=etl;password=***;db=x"
+        )
+
+    def test4(self) -> None:
+        """
+        Test that SQL and names that only resemble a credential cross
+        untouched, and an empty credential is left as it was.
+        """
+        payload = {
+            "sql": {"query": "SELECT id FROM orders WHERE total > 5"},
+            "tokenizer": "bpe",
+            "uri": "postgres://db:5432/orders",
+            "password": None,
+        }
+        out, excluded = ceredact.redact_secrets(payload)
+        self.assertEqual(out, payload)
+        self.assertEqual(excluded, [])

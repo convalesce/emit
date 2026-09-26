@@ -38,7 +38,7 @@ jobs:
           EOF
           cat > .isort.cfg <<'EOF'
           [settings]
-          known_first_party=convalesce_emit,convalesce_emit_airflow,convalesce_emit_dagster,convalesce_emit_gx,convalesce_emit_prefect,harness
+          known_first_party=convalesce_emit,convalesce_emit_airflow,convalesce_emit_dagster,convalesce_emit_gx,convalesce_emit_prefect,convalesce_emit_pyspark,harness
           treat_all_comments_as_code=True
           line_length=81
           profile=black
@@ -107,7 +107,7 @@ jobs:
       # that has already broken once.
       - name: Install every distribution
         working-directory: python
-        run: pip install . plugins/airflow plugins/dagster plugins/prefect plugins/gx
+        run: pip install . plugins/airflow plugins/dagster plugins/prefect plugins/gx plugins/pyspark
       - name: Test
         working-directory: python
         run: pytest
@@ -168,19 +168,45 @@ jobs:
           - tool: airflow
             spec: "apache-airflow==3.0.3"
             python: "3.12"
+          # 3.2 turned `airflow.utils.context.KNOWN_CONTEXT_KEYS` into a
+          # deprecation shim, which silently broke every listener event once.
+          - tool: airflow
+            spec: "apache-airflow==3.2.2"
+            python: "3.12"
           # The two Great Expectations majors need two different action
           # classes; one cannot satisfy both.
+          # The backward test runs real checkpoints over SQLite and a CSV, so
+          # it needs SQLAlchemy and pandas; 0.18 and 1.22 do not import with
+          # SQLAlchemy 2.1 or pandas 3.
+          # 0.18 cannot serialise SQLAlchemy 2 result rows in its COMPLETE
+          # result format, so it gets the 1.4 line it was built against.
           - tool: gx
             spec: "great-expectations==0.18.22"
             python: "3.11"
+            extras: '"sqlalchemy<2" "pandas<2.2"'
           - tool: gx
             spec: "great-expectations==1.22.0"
             python: "3.12"
+            extras: '"sqlalchemy<2.1" "pandas<3"'
+          - tool: gx
+            spec: "great-expectations==1.23.2"
+            python: "3.12"
+            extras: "sqlalchemy pandas"
           - tool: dagster
             spec: "dagster==1.7.16"
             python: "3.11"
+          # 1.9 is where `assets_defs_by_key` moved off the asset graph, which
+          # silently emptied every asset group once.
+          - tool: dagster
+            spec: "dagster==1.9.13"
+            python: "3.11"
+          # 1.13 stopped copying definition metadata onto the job snapshot.
+          # 1.13.21 is also a required check on main, so it stays by name.
           - tool: dagster
             spec: "dagster==1.13.21"
+            python: "3.12"
+          - tool: dagster
+            spec: "dagster==1.13.24"
             python: "3.12"
           # Prefect 2 calls state hooks by keyword and Prefect 3 positionally.
           - tool: prefect
@@ -215,6 +241,21 @@ jobs:
         env:
           CONVALESCE_DRY_RUN: "true"
         run: python ../.github/scripts/probe_${{ matrix.tool }}.py
+      # The other half of the contract check. Collect's payload coverage
+      # proves everything we send is read or deliberately ignored; this
+      # proves everything the installed tool offers is sent or deliberately
+      # excluded, so a release that adds a hook, an event type or a field we
+      # do not handle fails here instead of going missing in production.
+      - name: Backward coverage
+        working-directory: python
+        run: |
+          pip install pytest pytest-timeout pyyaml ${{ matrix.extras }}
+          tests=$(ls plugins/${{ matrix.tool }}/src/*/test/test_backward.py 2>/dev/null || true)
+          if [ -z "$tests" ]; then
+            echo "no backward test for ${{ matrix.tool }} yet"
+            exit 0
+          fi
+          AIRFLOW_HOME=$(mktemp -d) pytest -p no:cacheprovider $tests
 
   spark:
     # Spark serialises its own events, and which method does it moved in 3.4.

@@ -56,4 +56,17 @@ public class LegacyJsonProtocolTest {
     assertTrue(json.contains("\"Job ID\":7"));
     assertTrue(json.contains("JobSucceeded"));
   }
+
+  @Test
+  public void theListenerNeedsNoOpenLineage() {
+    // This classpath has no openlineage-java; the transport's service file must not matter here.
+    try {
+      Class.forName("io.openlineage.client.transports.Transport");
+      throw new AssertionError("openlineage-java leaked onto the legacy classpath");
+    } catch (ClassNotFoundException expected) {
+      // As intended.
+    }
+    ConvalesceSparkListener listener = new ConvalesceSparkListener();
+    listener.onApplicationEnd(new SparkListenerApplicationEnd(1L));
+  }
 }

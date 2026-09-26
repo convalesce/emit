@@ -1,0 +1,360 @@
+{
+  "fields": [
+    {
+      "path": "checkpoint_describe.*",
+      "because": "describe_dict() is derived by GX from run_results: its success and statistics are recomputed from each result's success and statistics, and its expectations are the results themselves, all of which cross"
+    },
+    {
+      "path": "kwargs.checkpoint_result.run_results.{key}.batch_id",
+      "because": "GX's own serialiser leaves it out; meta.active_batch_definition names the same batch"
+    },
+    {
+      "path": "kwargs.checkpoint_result.run_results.{key}.result_url",
+      "because": "GX's own serialiser leaves it out; the action sends each GX Cloud page beside the results, as result_urls"
+    },
+    {
+      "path": "kwargs.validation_result_suite.batch_id",
+      "because": "GX's own serialiser leaves it out; meta.active_batch_definition names the same batch"
+    },
+    {
+      "path": "kwargs.validation_result_suite.result_url",
+      "because": "GX's own serialiser leaves it out; forward_validation_result sends the GX Cloud page beside the result, as result_urls"
+    },
+    {
+      "path": "kwargs.validation_result_suite.ge_cloud_id",
+      "because": "0.x GX Cloud id, unset outside GX Cloud; crosses when set"
+    },
+    {
+      "path": "*.expectation_config.ge_cloud_id",
+      "because": "0.x GX Cloud id, unset outside GX Cloud; crosses when set"
+    },
+    {
+      "path": "*.expectation_config.rendered_content",
+      "because": "Data Docs and GX Cloud presentation of the expectation, derived from its type and kwargs; set only while rendering, and crosses when set"
+    },
+    {
+      "path": "*.results[].rendered_content",
+      "because": "Data Docs and GX Cloud presentation of the result, derived from the result; set only while rendering, and crosses when set"
+    },
+    {
+      "path": "*.expectation_config.expectation_context",
+      "because": "the author's free-form context for an expectation, unset unless written; crosses when set"
+    },
+    {
+      "path": "kwargs.validation_result_suite.results[].expectation_config.description",
+      "because": "0.x: unset unless the author writes one, and crosses when set; the 1.x run here sets one and checks it is sent"
+    },
+    {
+      "path": "kwargs.data_asset",
+      "because": "0.x hands the action the live Validator, which owns the data context, the engine and the frame it validated; left behind on purpose, the batch it names crosses in the result's meta"
+    }
+  ],
+  "datasource_types": {
+    "alloy": {
+      "named_by": "table",
+      "because": "Postgres underneath; the receiver names it on the postgres platform"
+    },
+    "aurora": {
+      "named_by": "table",
+      "because": "Postgres underneath; the receiver names it on the postgres platform"
+    },
+    "bigquery": {
+      "named_by": "table",
+      "because": "a SQL engine: its type, database and default schema cross as `datasources`; the batch's table_name and schema_name name the table; the project is the database and the dataset the schema"
+    },
+    "citus": {
+      "named_by": "table",
+      "because": "Postgres underneath; the receiver names it on the postgres platform"
+    },
+    "databricks_sql": {
+      "named_by": "table",
+      "because": "a SQL engine: its type, database and default schema cross as `datasources`; the batch's table_name and schema_name name the table; Unity Catalog's catalog is the database"
+    },
+    "fabric": {
+      "named_by": "table",
+      "because": "a SQL Server-compatible Fabric warehouse; named on the fabric platform, which no pull connector shares yet"
+    },
+    "fabric_powerbi": {
+      "named_by": "table",
+      "because": "a Power BI semantic model with no SQL engine: its type crosses and the asset names the dataset, on a platform no pull connector shares yet"
+    },
+    "neon": {
+      "named_by": "table",
+      "because": "Postgres underneath; the receiver names it on the postgres platform"
+    },
+    "pandas": {
+      "named_by": "none",
+      "because": "in-memory frames, or pandas read_* assets whose batch spec reader_options name the file or table read"
+    },
+    "pandas_abs": {
+      "named_by": "path",
+      "because": "reads files: the batch spec's path names the dataset on s3, gcs, abs, dbfs or file"
+    },
+    "pandas_dbfs": {
+      "named_by": "path",
+      "because": "reads files: the batch spec's path names the dataset on s3, gcs, abs, dbfs or file"
+    },
+    "pandas_filesystem": {
+      "named_by": "path",
+      "because": "reads files: the batch spec's path names the dataset on s3, gcs, abs, dbfs or file"
+    },
+    "pandas_gcs": {
+      "named_by": "path",
+      "because": "reads files: the batch spec's path names the dataset on s3, gcs, abs, dbfs or file"
+    },
+    "pandas_s3": {
+      "named_by": "path",
+      "because": "reads files: the batch spec's path names the dataset on s3, gcs, abs, dbfs or file"
+    },
+    "postgres": {
+      "named_by": "table",
+      "because": "a SQL engine: its type, database and default schema cross as `datasources`; the batch's table_name and schema_name name the table"
+    },
+    "redshift": {
+      "named_by": "table",
+      "because": "a SQL engine: its type, database and default schema cross as `datasources`; the batch's table_name and schema_name name the table"
+    },
+    "snowflake": {
+      "named_by": "table",
+      "because": "a SQL engine: its type, database and default schema cross as `datasources`; the batch's table_name and schema_name name the table; names are lower-cased as the Snowflake connector does"
+    },
+    "spark": {
+      "named_by": "none",
+      "because": "an in-memory Spark dataframe: nothing names a dataset but the asset"
+    },
+    "spark_abs": {
+      "named_by": "path",
+      "because": "reads files: the batch spec's path names the dataset on s3, gcs, abs, dbfs or file"
+    },
+    "spark_dbfs": {
+      "named_by": "path",
+      "because": "reads files: the batch spec's path names the dataset on s3, gcs, abs, dbfs or file"
+    },
+    "spark_filesystem": {
+      "named_by": "path",
+      "because": "reads files: the batch spec's path names the dataset on s3, gcs, abs, dbfs or file"
+    },
+    "spark_gcs": {
+      "named_by": "path",
+      "because": "reads files: the batch spec's path names the dataset on s3, gcs, abs, dbfs or file"
+    },
+    "spark_s3": {
+      "named_by": "path",
+      "because": "reads files: the batch spec's path names the dataset on s3, gcs, abs, dbfs or file"
+    },
+    "sql": {
+      "named_by": "table",
+      "because": "generic SQL: the platform is read from the engine's dialect"
+    },
+    "sql_server": {
+      "named_by": "table",
+      "because": "a SQL engine: its type, database and default schema cross as `datasources`; the batch's table_name and schema_name name the table; the receiver names it on the mssql platform"
+    },
+    "sqlite": {
+      "named_by": "table",
+      "because": "a SQL engine: its type, database and default schema cross as `datasources`; the batch's table_name and schema_name name the table; a file path names no database"
+    }
+  },
+  "asset_types": {
+    "clipboard": {
+      "named_by": "none",
+      "because": "the clipboard: nothing to name"
+    },
+    "csv": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "dataframe": {
+      "named_by": "none",
+      "because": "an in-memory frame: named only by the asset"
+    },
+    "delta": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "directory_csv": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "directory_delta": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "directory_json": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "directory_orc": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "directory_parquet": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "directory_text": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "excel": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "feather": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "fwf": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "gbq": {
+      "named_by": "table",
+      "because": "pandas read_gbq: the query or table in reader_options; named by the asset"
+    },
+    "hdf": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "html": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "iceberg": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "json": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "orc": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "parquet": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "pickle": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "powerbi_dax": {
+      "named_by": "table",
+      "because": "a Power BI semantic model object: named by the asset"
+    },
+    "powerbi_measure": {
+      "named_by": "table",
+      "because": "a Power BI semantic model object: named by the asset"
+    },
+    "powerbi_table": {
+      "named_by": "table",
+      "because": "a Power BI semantic model object: named by the asset"
+    },
+    "query": {
+      "named_by": "query",
+      "because": "batch_spec.query: a query over one table names that table, otherwise the asset"
+    },
+    "sas": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "spss": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "sql": {
+      "named_by": "table",
+      "because": "pandas read_sql: reader_options.con and the query or table"
+    },
+    "sql_query": {
+      "named_by": "query",
+      "because": "pandas read_sql_query: named by the asset; the connection string is masked before sending"
+    },
+    "sql_table": {
+      "named_by": "table",
+      "because": "pandas read_sql_table: reader_options.table_name through reader_options.con, whose password is masked before sending"
+    },
+    "stata": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "table": {
+      "named_by": "table",
+      "because": "batch_spec.table_name and schema_name"
+    },
+    "text": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    },
+    "xml": {
+      "named_by": "path",
+      "because": "a file or directory: batch_spec.path on a file datasource, reader_options.filepath_or_buffer on a pandas one"
+    }
+  },
+  "batch_specs": {
+    "AzureBatchSpec": {
+      "named_by": "path",
+      "because": "path, as wasbs://container@account... or account.blob.core.windows.net/container/..."
+    },
+    "BatchMarkers": {
+      "named_by": "none",
+      "because": "not a spec: markers such as ge_load_time and the pandas fingerprint, forwarded under meta.batch_markers"
+    },
+    "BatchSpec": {
+      "named_by": "none",
+      "because": "the base class"
+    },
+    "GCSBatchSpec": {
+      "named_by": "path",
+      "because": "path, as gs://bucket/key"
+    },
+    "GlueDataCatalogBatchSpec": {
+      "named_by": "table",
+      "because": "database_name and table_name of a Glue catalog table; the receiver reads table_name only, so the Glue database is lost"
+    },
+    "PandasBatchSpec": {
+      "named_by": "path",
+      "because": "reader_method and reader_options: filepath_or_buffer, or table_name and con"
+    },
+    "PathBatchSpec": {
+      "named_by": "path",
+      "because": "path"
+    },
+    "RuntimeDataBatchSpec": {
+      "named_by": "none",
+      "because": "an in-memory frame"
+    },
+    "RuntimeQueryBatchSpec": {
+      "named_by": "query",
+      "because": "query"
+    },
+    "S3BatchSpec": {
+      "named_by": "path",
+      "because": "path, as s3a://bucket/key"
+    },
+    "SqlAlchemyDatasourceBatchSpec": {
+      "named_by": "table",
+      "because": "table_name and schema_name, or query"
+    }
+  },
+  "execution_engines": {
+    "ExecutionEngine": {
+      "named_by": "none",
+      "because": "the base class"
+    },
+    "SqlAlchemyExecutionEngine": {
+      "named_by": "table",
+      "because": "0.x: its dialect and database are read before the runtime is dropped, as dialect_name and datasources"
+    },
+    "PandasExecutionEngine": {
+      "named_by": "none",
+      "because": "no platform: the batch spec names the file"
+    },
+    "SparkDFExecutionEngine": {
+      "named_by": "none",
+      "because": "no platform: the batch spec names the file"
+    }
+  }
+}

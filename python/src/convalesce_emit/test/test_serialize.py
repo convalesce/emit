@@ -613,6 +613,35 @@ class Test_dump_property1(unittest.TestCase):
             [{"path": "steps", "reason": "unreadable: RuntimeError"}],
         )
 
+    def test6(self) -> None:
+        """
+        Test that a value raising when merely inspected loses only itself.
+
+        Airflow's lazy `triggering_dataset_events` is a proxy whose
+        `__class__` runs a session merge, so `isinstance` raises; it sits
+        in the context a `**context` task keeps in `op_kwargs`, and used
+        to lose that task's whole success event.
+        """
+
+        class Proxy:
+            """Stands in for a lazy proxy whose target cannot be built."""
+
+            @property  # type: ignore[misc]
+            def __class__(self) -> type:
+                raise RuntimeError("merge() with load=False")
+
+        budget = ceserial.new_budget()
+        out = ceserial.dump(
+            {"op_kwargs": {"events": Proxy(), "ds": "2026-09-20"}},
+            budget=budget,
+        )
+        self.assertEqual(out["op_kwargs"]["ds"], "2026-09-20")
+        self.assertEqual(out["op_kwargs"]["events"], "<Proxy: unreadable>")
+        self.assertIn(
+            {"path": "op_kwargs.events", "reason": "unreadable: RuntimeError"},
+            budget.excluded,
+        )
+
 
 # #############################################################################
 # Test_dump_keys1

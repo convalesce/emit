@@ -43,6 +43,33 @@ action_list=[
 
 Set `CONVALESCE_INGEST_KEY` where the checkpoint runs.
 
+### Validating outside a checkpoint
+
+Great Expectations runs actions only from a checkpoint.
+`ValidationDefinition.run()`, `Batch.validate()` and a 0.x
+`Validator.validate()` fire nothing, so send their result yourself:
+
+```python
+from convalesce_emit_gx import forward_validation_result
+
+result = validation_definition.run()
+forward_validation_result(result)
+```
+
+On 0.x, pass the validator too, `forward_validation_result(result,
+validator=validator)`, so the platform is named from its engine.
+
+## What crosses
+
+- Every field of the checkpoint result, each validation result and each
+  expectation result, under every result format.
+- Each datasource's platform, database and default schema. Never its
+  connection string; a password inside a batch spec is masked.
+- Each result's GX Cloud page, when GX Cloud stored it.
+- Not the rows: sampled failing values, and the values a distinct-values or
+  most-common-value expectation observed, cross as counts. Set
+  `CONVALESCE_GX_SEND_SAMPLES=true` to send them.
+
 ## Supported
 
 Great Expectations 0.17 through 1.x, on Python 3.9 and later. Verified on

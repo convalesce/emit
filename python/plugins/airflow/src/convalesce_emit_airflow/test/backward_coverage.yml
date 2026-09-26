@@ -1,0 +1,279 @@
+# What the installed Airflow provides that this plugin does not forward, and
+# why. Read by test_backward.py, which fails on anything Airflow offers that is
+# neither forwarded nor listed here.
+#
+# Two kinds of entry, kept apart because they mean different things:
+#
+# - excluded: deliberately not sent, or not reachable by the dump.
+# - uncaptured: sent whole, but no capture behind contract.json has shown it
+#   yet, so collect's forward check cannot see it either. Recapture (see
+#   scripts/generate_contract.py) with a DAG that exercises it to clear one.
+#
+# An entry that becomes forwarded fails the test too, so this file cannot rot.
+
+hooks:
+  excluded:
+    on_starting: "process lifecycle (scheduler, worker, triggerer started); nothing about a run"
+    before_stopping: "process lifecycle, the pair of on_starting; nothing about a run"
+    on_new_dag_import_error: "DAG processor parse failure; not about a run and no receiver decodes it yet. Candidate for detection (a DAG that stops parsing stops running)"
+    on_existing_dag_import_error: "the same parse failure seen again; see on_new_dag_import_error"
+    on_dataset_created: "Airflow 2 only: a dataset row first registered; collect ignores its Airflow 3 twin (asset.*), and a task's datasets already arrive on task.inlets/outlets"
+    on_dataset_changed: "Airflow 2 only: a dataset updated; the task that updated it already carries it on task.outlets, and collect ignores the Airflow 3 twin (asset.*)"
+    on_asset_alias_created: "Airflow 3: an alias declared, with no asset resolved yet; the resolution arrives on on_asset_event_emitted and task_instance.asset_aliases"
+  uncaptured:
+    on_dag_run_success: "forwarded (generated from the hookspec, same payload as on_dag_run_failed); no released capture has a successful dag run end yet"
+    on_task_instance_skipped: "Airflow 3 only; forwarded, never captured"
+    on_asset_created: "Airflow 3 only; forwarded, never captured (fires once per asset, on first registration)"
+
+# Each object a hook hands over, where in a payload it lands, and the fields
+# the dump sends of it. `classes` lists every place a supported Airflow keeps
+# it; whichever import in the running Airflow are checked. `at` is where it
+# appears in a payload, `*` matching one path segment.
+objects:
+  TaskInstance:
+    required: true
+    classes:
+      - airflow.models.taskinstance.TaskInstance
+      - airflow.sdk.execution_time.task_runner.RuntimeTaskInstance
+    at:
+      - task_instance
+      - dag_run.task_instances
+    excluded:
+      dag_model: &lazy "lazy ORM relationship: the dump walks what the object already holds and never issues a query from inside the scheduler's transaction (on Airflow 3's worker a query raises). Sent whenever Airflow had loaded it"
+      queued_by_job: *lazy
+      task_instance_note: *lazy
+      trigger: *lazy
+      dag_version: *lazy
+      hitl_detail: "noload relationship (Airflow 3.1+ human-in-the-loop row); Airflow never fills it on the instance a hook receives"
+      _task_display_property_value: &display "storage behind the display-name property; the same value is sent as task_instance.task.task_display_name"
+    uncaptured: {}
+
+  DagRun:
+    required: true
+    classes:
+      - airflow.models.dagrun.DagRun
+      - airflow.sdk.api.datamodels._generated.DagRun
+    at:
+      - dag_run
+      - task_instance.dag_run
+    excluded:
+      creating_job: *lazy
+      dag_run_note: *lazy
+      serialized_dag: *lazy
+      created_dag_version: *lazy
+      deadlines: *lazy
+      task_instances_histories: *lazy
+      consumed_dataset_events: *lazy
+    uncaptured: {}
+
+  DAG:
+    required: true
+    classes:
+      - airflow.models.dag.DAG
+      - airflow.sdk.definitions.dag.DAG
+      - airflow.serialization.definitions.dag.SerializedDAG
+    at:
+      - dag_run.dag
+      - task_instance.dag_run.dag
+      - task_instance.task.dag
+      - dag_run.task_instances.task.dag
+    excluded:
+      concurrency: "Airflow 2 deprecated alias of max_active_tasks, which is sent"
+      full_filepath: "Airflow 2 deprecated alias of fileloc, which is sent"
+      _dag_display_property_value: "storage behind dag_display_name, which is sent"
+    uncaptured: {}
+
+  DagModel:
+    required: true
+    classes:
+      - airflow.models.dag.DagModel
+    at:
+      - dag_run.dag_model
+    excluded:
+      dag_owner_links: *lazy
+      serialized_dag: *lazy
+      tags: *lazy  # the DAG's own tags are sent on dag_run.dag.tags
+      dag_versions: *lazy
+      parent_dag: *lazy
+      schedule_asset_alias_references: *lazy
+      schedule_asset_name_references: *lazy
+      schedule_asset_references: *lazy
+      schedule_asset_uri_references: *lazy
+      task_inlet_asset_references: *lazy
+      task_outlet_asset_references: *lazy
+      schedule_dataset_alias_references: *lazy
+      schedule_dataset_references: *lazy
+      task_outlet_dataset_references: *lazy
+      _dag_display_property_value: "storage behind dag_display_name, sent on dag_run.dag"
+      dataset_expression: &dagmodel2 "Airflow 2 column, gone in 3. A 2.x dag run never has its dag model loaded, so the model is only ever sent from Airflow 3 (dag_run.dag_model)"
+      default_view: *dagmodel2
+      is_active: *dagmodel2
+      is_subdag: *dagmodel2
+      last_pickled: *dagmodel2
+      pickle_id: *dagmodel2
+      processor_subdir: *dagmodel2
+      root_dag_id: *dagmodel2
+      schedule_interval: *dagmodel2
+      scheduler_lock: *dagmodel2
+    uncaptured: {}
+
+  BaseOperator:
+    required: true
+    classes:
+      - airflow.models.baseoperator.BaseOperator
+      - airflow.sdk.bases.operator.BaseOperator
+    at:
+      - task_instance.task
+      - dag_run.task_instances.task
+      - "dag_run.dag.task_dict.*"
+      - "task_instance.dag_run.dag.task_dict.*"
+      - "task_instance.task.dag.task_dict.*"
+    excluded:
+      default_args: "consumed by the constructor, which applies each default to the field it names; those fields are sent"
+      _logger_name: &logging "logging plumbing, not the task"
+      logger_name: *logging
+      _log_config_logger_name: *logging
+      _log: *logging
+      _needs_expansion: "private bookkeeping for dynamic task mapping; is_mapped/map_index carry the fact"
+      _pre_execute_hook: &hookfn "a user callable run around execute; functions are described, not sent, and nothing about the run is in one"
+      _post_execute_hook: *hookfn
+      pre_execute: *hookfn
+      post_execute: *hookfn
+      _task_display_property_value: "storage behind task_display_name, which is sent"
+      subdag: "Airflow 2 class default, set only on a SubDagOperator (removed in 3)"
+      task_concurrency: "Airflow 2 deprecated alias of max_active_tis_per_dag, which is sent"
+      has_on_execute_callback: &hascb "Airflow 3 serialisation-only flag computed when the DAG is serialised; the callbacks themselves are sent (on_*_callback)"
+      has_on_failure_callback: *hascb
+      has_on_retry_callback: *hascb
+      has_on_skipped_callback: *hascb
+      has_on_success_callback: *hascb
+    uncaptured: {}
+
+  Asset:
+    required: true
+    classes:
+      - airflow.datasets.Dataset
+      - airflow.sdk.definitions.asset.Asset
+      - airflow.serialization.definitions.assets.SerializedAsset
+    at:
+      - asset
+      - asset_event.asset
+      - task_instance.task.inlets
+      - task_instance.task.outlets
+      - "dag_run.dag.task_dict.*.inlets"
+      - "dag_run.dag.task_dict.*.outlets"
+      - "task_instance.dag_run.dag.task_dict.*.inlets"
+      - "task_instance.dag_run.dag.task_dict.*.outlets"
+    excluded: {}
+    uncaptured: {}
+
+  AssetAlias:
+    classes:
+      - airflow.datasets.DatasetAlias
+      - airflow.sdk.definitions.asset.AssetAlias
+      - airflow.serialization.definitions.assets.SerializedAssetAlias
+    at:
+      - asset_event.source_aliases
+      - task_instance.task.outlets
+      - "dag_run.dag.task_dict.*.outlets"
+      - "task_instance.dag_run.dag.task_dict.*.outlets"
+    excluded: {}
+    uncaptured: {}
+
+  AssetAliasEvent:
+    classes:
+      - airflow.datasets.DatasetAliasEvent
+      - airflow.sdk.definitions.asset.AssetAliasEvent
+    at:
+      - task_instance.asset_aliases
+    excluded: {}
+    uncaptured: {}
+
+  AssetEvent:
+    classes:
+      - airflow.listeners.types.AssetEvent
+    at:
+      - asset_event
+    excluded: {}
+    uncaptured: {}
+
+  AssetEventRow:
+    classes:
+      - airflow.models.dataset.DatasetEvent
+      - airflow.models.asset.AssetEvent
+    at:
+      - task_instance.asset_aliases
+    excluded: {}
+    uncaptured:
+      id: &aliasrow "the ORM row the alias fallback reads (Airflow 2.10 only; on Airflow 3 the task sandbox refuses the query, and the context path is used instead). Forwarded whole, but no capture has a 2.10 alias resolution yet"
+      timestamp: *aliasrow
+      source_aliases: *aliasrow
+      source_dag_id: *aliasrow
+      source_run_id: *aliasrow
+      source_task_id: *aliasrow
+      source_map_index: *aliasrow
+      source_dag_run: *aliasrow
+      source_task_instance: *aliasrow
+      created_dagruns: *aliasrow
+      dataset: *aliasrow
+      dataset_id: *aliasrow
+      asset: *aliasrow
+      asset_id: *aliasrow
+      partition_key: *aliasrow
+
+# The OpenLineage provider's own facet classes. Every attrs class the
+# provider's facets module defines must be catalogued here, so a provider
+# release that adds one fails until it is.
+openlineage_facets:
+  module: airflow.providers.openlineage.plugins.facets
+  objects:
+    AirflowRunFacet:
+      at: [run_event.run.facets.airflow]
+      excluded: {}
+      uncaptured: {}
+    AirflowStateRunFacet:
+      at: [run_event.run.facets.airflowState]
+      excluded: {}
+      uncaptured:
+        tasksDuration: "provider 2.x on Airflow 3 adds it to the DAG COMPLETE/FAIL event; no Airflow 3 OpenLineage capture exists yet"
+    AirflowDagRunFacet:
+      at: [run_event.run.facets.airflowDagRun]
+      excluded: {}
+      uncaptured:
+        dag: &dagstart "on the DAG-level START event, which the provider sends and this transport forwards; no capture has one yet"
+        dagRun: *dagstart
+        _producer: *dagstart
+        _schemaURL: *dagstart
+    AirflowJobFacet:
+      at: [run_event.job.facets.airflow]
+      excluded:
+        _deleted: "the client's facet-deletion marker, None unless a facet is being removed; Serde drops None"
+      uncaptured:
+        taskTree: *dagstart
+        taskGroups: *dagstart
+        tasks: *dagstart
+        _producer: *dagstart
+        _schemaURL: *dagstart
+    AirflowMappedTaskRunFacet:
+      at: [run_event.run.facets.airflow_mappedTask]
+      excluded: {}
+      uncaptured:
+        mapIndex: &mapped "only on a mapped task's events; forwarded, never captured"
+        operatorClass: *mapped
+        _producer: *mapped
+        _schemaURL: *mapped
+    AirflowDebugRunFacet:
+      at: [run_event.run.facets.debug]
+      excluded: {}
+      uncaptured:
+        packages: &debug "only with [openlineage] debug_mode on; forwarded, never captured"
+        _producer: *debug
+        _schemaURL: *debug
+    UnknownOperatorAttributeRunFacet:
+      at: [run_event.run.facets.unknownSourceAttribute]
+      excluded: {}
+      uncaptured: {}
+    UnknownOperatorInstance:
+      at: [run_event.run.facets.unknownSourceAttribute.unknownItems]
+      excluded: {}
+      uncaptured: {}

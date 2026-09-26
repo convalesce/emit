@@ -52,7 +52,8 @@ REFUSED_STATUS = frozenset({400, 413, 422})
 # long outage's backlog can hold up the caller that finally got through.
 _DRAIN_PER_SEND = 20
 
-_OBSERVATIONS_PATH = "/v1/observations"
+OBSERVATIONS_PATH = "/v1/observations"
+_OBSERVATIONS_PATH = OBSERVATIONS_PATH
 # What wrapping a batch costs on the wire, beyond the observations and the
 # commas between them: `{"observations":[` and `]}`.
 _BODY_OVERHEAD = len(b'{"observations":[]}')
@@ -399,32 +400,48 @@ class Emitter:
         :return: nothing
         :raises TransportError: on any HTTP or connection failure
         """
-        # The key is the only thing here that says who is calling. No
-        # header names an account: one that did would be an unauthenticated
-        # claim sitting next to the credential that actually proves it.
-        headers: Dict[str, str] = {
-            "Content-Type": "application/json",
-            "Content-Encoding": "gzip",
-            "Authorization": f"Bearer {self.config.ingest_key}",
-            "User-Agent": f"convalesce-emit/{ceversio.__version__}",
-        }
-        # The endpoint is validated as http(s) in Config.validate.
-        request = urllib.request.Request(  # nosec B310
-            url, data=body, method="POST", headers=headers
-        )
-        try:
-            with urllib.request.urlopen(  # nosec B310
-                request, timeout=self.config.timeout
-            ):
-                return
-        except urllib.error.HTTPError as exc:
-            raise ceerrors.TransportError(
-                f"HTTP {exc.code} from {url}", status=exc.code
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise ceerrors.TransportError(
-                f"could not reach {url}: {exc.reason}"
-            ) from exc
+        post(self.config, url, body)
+
+
+def post(config: ceconfig.Config, url: str, body: bytes) -> None:
+    """
+    Make one HTTP request with a configuration's key, without retrying.
+
+    Shared by the emitter and by `convalesce-emit check`, so the check
+    sends exactly the headers, compression and path a real batch does.
+
+    :param config: whose key and timeout to use
+    :param url: where to post
+    :param body: the gzip-compressed batch
+    :return: nothing
+    :raises TransportError: on any HTTP or connection failure
+    """
+    # The key is the only thing here that says who is calling. No header
+    # names an account: one that did would be an unauthenticated claim
+    # sitting next to the credential that actually proves it.
+    headers: Dict[str, str] = {
+        "Content-Type": "application/json",
+        "Content-Encoding": "gzip",
+        "Authorization": f"Bearer {config.ingest_key}",
+        "User-Agent": f"convalesce-emit/{ceversio.__version__}",
+    }
+    # The endpoint is validated as http(s) in Config.validate.
+    request = urllib.request.Request(  # nosec B310
+        url, data=body, method="POST", headers=headers
+    )
+    try:
+        with urllib.request.urlopen(  # nosec B310
+            request, timeout=config.timeout
+        ):
+            return
+    except urllib.error.HTTPError as exc:
+        raise ceerrors.TransportError(
+            f"HTTP {exc.code} from {url}", status=exc.code
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise ceerrors.TransportError(
+            f"could not reach {url}: {exc.reason}"
+        ) from exc
 
 
 def _flush_at_exit(ref: "weakref.ReferenceType[Emitter]") -> None:

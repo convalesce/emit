@@ -21,6 +21,10 @@ requires-python = ">=3.9"
 # works in someone else's pipeline. Transport is urllib from the stdlib.
 dependencies = []
 
+[project.scripts]
+# Run where the tool runs, to prove its key and endpoint reach Convalesce.
+convalesce-emit = "convalesce_emit.cli:main"
+
 [dependency-groups]
 dev = [
   { include-group = "lint" },
@@ -39,8 +43,8 @@ test = [
 ]
 
 [project.urls]
-Homepage = "https://convalesce.com"
-Documentation = "https://docs.convalesce.com"
+Homepage = "https://convalesce.io"
+Documentation = "https://docs.convalesce.io"
 Source = "https://github.com/convalesce/emit"
 
 [build-system]
