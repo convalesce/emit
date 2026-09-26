@@ -4,7 +4,8 @@ Validation action for Great Expectations Core 1.x.
 In 1.x an action is a pydantic model discriminated on `type`, and GX calls
 `run(checkpoint_result, action_context)`. `run` takes `*args` because we do
 not read the result: a signature change within 1.x cannot break us, only a
-rename of the method itself.
+rename of the method itself. The one thing read is which datasources it
+names, to look their platform and database up while they are still live.
 
 Import as:
 
@@ -51,7 +52,12 @@ class ConvalesceValidationAction(ValidationAction):  # type: ignore[misc]
             redacted
         """
         payload = {"args": list(args), "kwargs": kwargs}
-        return cegxcom.forward(payload, getattr(self, "_emitter", None))
+        result = kwargs.get("checkpoint_result", args[0] if args else None)
+        return cegxcom.forward(
+            payload,
+            getattr(self, "_emitter", None),
+            datasources=cegxcom.datasources_v1(result),
+        )
 
     def set_emitter(self, emitter: Optional[cemit.EmitterLike]) -> None:
         """

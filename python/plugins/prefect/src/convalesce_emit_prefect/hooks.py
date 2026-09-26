@@ -21,9 +21,11 @@ import convalesce_emit_prefect.hooks as cephooks
 import logging
 import os
 import re
+import traceback
 from typing import Any, Dict, List, Optional
 
 import convalesce_emit as cemit
+import convalesce_emit_prefect._lineage as celin
 
 _LOG = logging.getLogger(__name__)
 
@@ -55,6 +57,10 @@ _TASK_RUN_PAGE_BACKSTOP = 50
 
 # A Prefect Cloud API URL names the account and the workspace in its own
 # path; nothing about a run has to be read to find them.
+# The tail of a traceback is where it failed; the head is Prefect's own
+# engine calling into the task.
+_TRACEBACK_LIMIT = 16000
+
 _CLOUD_URL_RE = re.compile(
     r"^https://api\.prefect\.cloud/api/accounts/(?P<account>[^/]+)"
     r"/workspaces/(?P<workspace>[^/]+)/?"
@@ -399,6 +405,12 @@ def emit_task_run(
     :return: nothing
     """
     payload = {"task": task, "task_run": task_run, "state": state, **kwargs}
+    declared = celin.take(task_run)
+    if declared is not None:
+        payload.setdefault("lineage", declared)
+    detail = error_detail(state)
+    if detail is not None:
+        payload.setdefault("error_detail", detail)
     # The hook's own arguments win: what the context holds is a fallback for
     # what the task run does not name, never a replacement for it.
     for name, value in running_flow().items():
@@ -406,3 +418,72 @@ def emit_task_run(
         if payload[name] is None:
             payload[name] = value
     _emit("task_run", payload, emitter)
+
+
+# #############################################################################
+# Failure detail
+# #############################################################################
+
+
+def error_detail(state: Any) -> Optional[Dict[str, str]]:
+    """
+    The exception a failed state holds, where it is already in memory.
+
+    A failed state's `message` names the exception but not where it was
+    raised. The exception itself is the state's data: on Prefect 3 a result
+    record whose `result` is the exception, on Prefect 2 a result holding it
+    in its cache, or on either the bare exception. `state.result()` is
+    deliberately not called: where results are persisted it reads them back
+    from storage, which is the customer's, and may be remote.
+
+    :param state: the state the hook was given
+    :return: `type`, `message` and `traceback` (its last 16000 characters),
+        or None when the state is not a failure or holds no exception here
+    """
+    try:
+        for check in ("is_failed", "is_crashed"):
+            method = getattr(state, check, None)
+            if callable(method) and method():
+                break
+        else:
+            if callable(getattr(state, "is_failed", None)):
+                return None
+        exc = _held_exception(getattr(state, "data", None))
+        if exc is None:
+            return None
+        text = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        return {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": text[-_TRACEBACK_LIMIT:],
+        }
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: could not read the failure: %s", exc)
+        return None
+
+
+def _held_exception(data: Any) -> Optional[BaseException]:
+    """
+    The exception a state's data holds in memory, without loading anything.
+
+    :param data: `state.data`
+    :return: the exception, or None
+    """
+    if isinstance(data, BaseException):
+        return data
+    # Read off the instance's own storage, not through attributes: a result
+    # that is not in memory may load it from storage on attribute access.
+    # Pydantic 2 keeps a private attribute such as `_cache` apart.
+    fields: Dict[str, Any] = {}
+    for store in ("__dict__", "__pydantic_private__"):
+        try:
+            fields.update(object.__getattribute__(data, store) or {})
+        except (AttributeError, TypeError, ValueError):
+            continue
+    for name in ("result", "_cache"):
+        value = fields.get(name)
+        if isinstance(value, BaseException):
+            return value
+    return None

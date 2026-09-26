@@ -13,7 +13,7 @@ import convalesce_emit_dagster.sensor as cedsens
 
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
 
@@ -63,13 +63,16 @@ _SNAPSHOT_NOISE = ("config_schema_snapshot", "dagster_type_namespace_snapshot")
 # The event types the event log is read for: what an asset materialised or
 # observed, what an IO manager handled or loaded, and a resource coming up --
 # the facts the run's stats and snapshots above say nothing about, because
-# none of them is a step's own output.
+# none of them is a step's own output. A step failure is here for its error:
+# the run's own failure event usually carries none, only "steps failed", and
+# the exception each step raised is on its `STEP_FAILURE` alone.
 _EVENT_LOG_TYPE_NAMES = (
     "ASSET_MATERIALIZATION",
     "ASSET_OBSERVATION",
     "HANDLED_OUTPUT",
     "LOADED_INPUT",
     "RESOURCE_INIT_SUCCESS",
+    "STEP_FAILURE",
 )
 
 # The metadata on a materialisation or observation event is free text an
@@ -79,6 +82,36 @@ _EVENT_LOG_TYPE_NAMES = (
 # sample is, scoped to this call so no other package's "metadata" field is
 # touched.
 _EVENT_LOG_SAMPLE_KEYS = frozenset({"metadata"})
+
+# Where materialisation events cross: the event log, and each step's stats,
+# which carry the same events again under `materialization_events`.
+_EVENT_CARRIERS = ("event_log", "step_stats")
+
+# The metadata entries that describe a table rather than hold its rows: the
+# ones Dagster itself writes for a materialisation, and the urns an asset's
+# author sets to say which dataset it is. These cross as they are, alongside
+# the redaction marker for whatever else the entry carried.
+_METADATA_ALLOWED = frozenset(
+    {
+        "dagster/row_count",
+        "row_count",
+        "dagster/table_name",
+        "table_name",
+        "dagster/uri",
+        "uri",
+        "path",
+        "dagster/relation_identifier",
+        "size_in_bytes",
+        "dagster/code_version",
+        "convalesce_urn",
+        "datahub_urn",
+        "dagster/column_schema",
+    }
+)
+
+# Of a column schema, what names a column; a column's tags are the author's
+# free text, like the metadata around them.
+_SCHEMA_COLUMN_FIELDS = ("name", "type", "description", "constraints")
 
 # Dagster Cloud's own build of the deployment: which one, and from which
 # commit. Name-prefixed rather than read off any tool object, the same as
@@ -153,13 +186,11 @@ def convalesce_sensor(
     excluded = budget.excluded
     if isinstance(body, dict) and "job_snapshot" in body:
         body["job_snapshot"] = prune_snapshot(body["job_snapshot"])
-    if isinstance(body, dict) and "event_log" in body:
-        body["event_log"], redacted = cemit.redact_samples(
-            body["event_log"],
-            path="event_log",
-            extra_keys=_EVENT_LOG_SAMPLE_KEYS,
-        )
-        excluded = excluded + redacted
+    for name in _EVENT_CARRIERS:
+        if isinstance(body, dict) and name in body:
+            events, withheld = redact_metadata(body[name], name)
+            body[name], redacted = cemit.redact_samples(events, path=name)
+            excluded = excluded + withheld + redacted
     cemit.send_one(
         tool=TOOL,
         event="run_status",
@@ -169,6 +200,97 @@ def convalesce_sensor(
         excluded=excluded,
     )
     target.flush()
+
+
+def redact_metadata(value: Any, path: str) -> Tuple[Any, List[Dict[str, str]]]:
+    """
+    Redact every `metadata` entry but the ones that describe a table.
+
+    A `metadata` mapping keeps its allowed entries as they are; the rest are
+    counted into the same marker a fully redacted one carries, so a receiver
+    reads `redacted` and `count` wherever it did before. Anything else under
+    that key is redacted whole, the way `cemit.redact_samples` does it.
+
+    :param value: the dumped event log, or part of one
+    :param path: dotted path of `value` from the envelope root
+    :return: the same shape, redacted, and what was redacted, by path and
+        reason
+    """
+    excluded: List[Dict[str, str]] = []
+    if isinstance(value, list):
+        items = []
+        for i, item in enumerate(value):
+            kept, withheld = redact_metadata(item, f"{path}[{i}]")
+            items.append(kept)
+            excluded.extend(withheld)
+        return items, excluded
+    if not isinstance(value, dict):
+        return value, excluded
+    out: Dict[str, Any] = {}
+    for key, item in value.items():
+        child = f"{path}.{key}" if path else str(key)
+        if key in _EVENT_LOG_SAMPLE_KEYS and isinstance(item, dict):
+            out[key] = _allowed_metadata(item)
+            if "redacted" in out[key]:
+                excluded.append({"path": child, "reason": "sample redacted"})
+        elif key in _EVENT_LOG_SAMPLE_KEYS:
+            summary, withheld = cemit.redact_samples(
+                {key: item}, path=path, extra_keys=_EVENT_LOG_SAMPLE_KEYS
+            )
+            out[key] = summary[key]
+            excluded.extend(withheld)
+        else:
+            out[key], withheld = redact_metadata(item, child)
+            excluded.extend(withheld)
+    return out, excluded
+
+
+def _allowed_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    One `metadata` mapping, down to the entries that describe a table.
+
+    :param metadata: the dumped mapping, entry name to value
+    :return: the allowed entries, plus `redacted` and `count` for the rest
+        when there were any
+    """
+    out: Dict[str, Any] = {}
+    for name, entry in metadata.items():
+        if name == "dagster/column_schema":
+            out[name] = _schema_only(entry)
+        elif name in _METADATA_ALLOWED:
+            out[name] = entry
+    withheld = len(metadata) - len(out)
+    if withheld:
+        out.update({"redacted": True, "count": withheld})
+    return out
+
+
+def _schema_only(entry: Any) -> Any:
+    """
+    A column schema's columns, each down to what names it.
+
+    Dagster's `TableSchemaMetadataValue` dumps as `{"schema": {"columns":
+    [...]}}`, or `{"columns": [...]}` as a bare `TableSchema`; both are
+    walked for `columns` and anything else in them is left behind.
+
+    :param entry: the dumped metadata value
+    :return: `{"schema": {"columns": [...]}}`, or `{"redacted": True}` when
+        no columns could be found
+    """
+    schema = entry.get("schema", entry) if isinstance(entry, dict) else None
+    columns = schema.get("columns") if isinstance(schema, dict) else None
+    if not isinstance(columns, list):
+        return {"redacted": True}
+    kept = [
+        {
+            field: column[field]
+            for field in _SCHEMA_COLUMN_FIELDS
+            if field in column
+        }
+        for column in columns
+        if isinstance(column, dict)
+    ]
+    return {"schema": {"columns": kept}}
 
 
 def reach_instance(context: Any, run: Any) -> Dict[str, Any]:

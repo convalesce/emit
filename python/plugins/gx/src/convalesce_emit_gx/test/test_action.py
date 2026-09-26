@@ -243,12 +243,26 @@ class _Dialect:
         self.name = name
 
 
+class _Url:
+    """Stands in for a SQLAlchemy URL, credentials and all."""
+
+    def __init__(self, drivername: str, host: str, database: str) -> None:
+        self.drivername = drivername
+        self.username = "user"
+        self.password = "s3cret"
+        self.host = host
+        self.database = database
+
+    def __str__(self) -> str:
+        return f"{self.drivername}://user:s3cret@{self.host}/{self.database}"
+
+
 class _SqlAlchemyEngine:
     """Stands in for a live SQLAlchemy engine, credentials and all."""
 
     def __init__(self, dialect_name: str) -> None:
         self.dialect = _Dialect(dialect_name)
-        self.url = f"{dialect_name}://user:s3cret@warehouse/orders"
+        self.url = _Url(dialect_name, "warehouse", "orders")
 
 
 class _SqlExecutionEngine:
@@ -273,7 +287,7 @@ class Test_runtime_platform1(unittest.TestCase):
             """Stands in for the 0.x `data_asset`."""
 
             def __init__(self) -> None:
-                self.execution_engine = _SqlExecutionEngine("sqlite")
+                self.execution_engine = _SqlExecutionEngine("mysql")
 
         recorder = _Recorder()
         cegxcom.forward(
@@ -287,11 +301,13 @@ class Test_runtime_platform1(unittest.TestCase):
             recorder,
         )
         payload = recorder.sent[0]["payload"]
-        self.assertEqual(payload["dialect_name"], "sqlite")
+        self.assertEqual(payload["dialect_name"], "mysql")
+        self.assertEqual(payload["database"], "orders")
         self.assertEqual(
             payload["execution_engine_class"], "_SqlExecutionEngine"
         )
         self.assertNotIn("s3cret", json.dumps(payload))
+        self.assertNotIn("warehouse", json.dumps(payload))
 
     def test2(self) -> None:
         """
@@ -325,3 +341,228 @@ class Test_runtime_platform1(unittest.TestCase):
         payload = recorder.sent[0]["payload"]
         self.assertNotIn("execution_engine_class", payload)
         self.assertNotIn("dialect_name", payload)
+
+    def test4(self) -> None:
+        """
+        Test that a 0.x engine names the datasource's platform and database
+        under the datasource the result names, and nothing more of its URL.
+        """
+
+        class Validator:
+            """Stands in for the 0.x `data_asset`."""
+
+            def __init__(self) -> None:
+                self.execution_engine = _SqlExecutionEngine("postgresql")
+
+        suite = {
+            "results": [_RESULT],
+            "meta": {"active_batch_definition": {"datasource_name": "shop"}},
+        }
+        recorder = _Recorder()
+        cegxcom.forward(
+            {
+                "args": [],
+                "kwargs": {
+                    "validation_result_suite": suite,
+                    "data_asset": Validator(),
+                },
+            },
+            recorder,
+        )
+        payload = recorder.sent[0]["payload"]
+        self.assertEqual(
+            payload["datasources"],
+            {"shop": {"type": "postgres", "database": "orders"}},
+        )
+        self.assertNotIn("s3cret", json.dumps(payload))
+
+    def test5(self) -> None:
+        """
+        Test that BigQuery's project, the URL's host, is its database.
+        """
+
+        class Validator:
+            """Stands in for the 0.x `data_asset`."""
+
+            def __init__(self) -> None:
+                self.execution_engine = _SqlExecutionEngine("bigquery")
+                self.execution_engine.engine.url = _Url(
+                    "bigquery", "my-project", "my_dataset"
+                )
+
+        recorder = _Recorder()
+        cegxcom.forward(
+            {"args": [], "kwargs": {"data_asset": Validator()}}, recorder
+        )
+        self.assertEqual(recorder.sent[0]["payload"]["database"], "my-project")
+
+
+# #############################################################################
+# Test_datasources_v1
+# #############################################################################
+
+
+class _Datasource:
+    """Stands in for a GX 1.x fluent datasource."""
+
+    def __init__(self, name: str, kind: str, url: Any = None) -> None:
+        self.name = name
+        self.type = kind
+        self.connection_string = "postgresql://user:s3cret@db:5432/shop"
+        self._url = url
+
+    def get_engine(self) -> Any:
+        """Return the engine the datasource validated with."""
+        if self._url is None:
+            raise RuntimeError("no engine")
+
+        class Engine:
+            """Stands in for a SQLAlchemy engine."""
+
+            url = self._url
+
+        return Engine()
+
+
+class _Definition:
+    """Stands in for a 1.x `ValidationDefinition`."""
+
+    def __init__(self, source: Any) -> None:
+        self._source = source
+
+    @property
+    def data_source(self) -> Any:
+        """Reach the datasource, or fail as a detached definition does."""
+        if self._source is None:
+            raise ValueError("detached")
+        return self._source
+
+
+def _checkpoint_result(names: List[str], sources: List[Any]) -> Any:
+    """
+    Build a 1.x `CheckpointResult` whose validations ran on `names`.
+
+    :param names: each validation's datasource name
+    :param sources: the datasources the checkpoint's definitions hold
+    :return: the result
+    """
+
+    class Checkpoint:
+        """Stands in for the 1.x `Checkpoint` on the result."""
+
+        validation_definitions = [_Definition(s) for s in sources]
+
+    class Batch:
+        """Stands in for a `LegacyBatchDefinition`."""
+
+        def __init__(self, name: str) -> None:
+            self.datasource_name = name
+
+    class Result:
+        """Stands in for a 1.x `CheckpointResult`."""
+
+        checkpoint_config = Checkpoint()
+        success = False
+        run_results = {
+            f"id-{i}": {
+                "meta": {"active_batch_definition": Batch(name)},
+                "results": [_RESULT],
+            }
+            for i, name in enumerate(names)
+        }
+
+    return Result()
+
+
+class Test_datasources_v1(unittest.TestCase):
+    """
+    Test that each 1.x datasource is named by platform and database, and
+    that its connection never crosses.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a postgres datasource names its type and database.
+        """
+        url = _Url("postgresql+psycopg2", "db", "shop")
+        result = _checkpoint_result(
+            ["shop", "shop"], [_Datasource("shop", "postgres", url)]
+        )
+        recorder = _Recorder()
+        cegxcom.forward(
+            {"args": [], "kwargs": {"checkpoint_result": result}},
+            recorder,
+            datasources=cegxcom.datasources_v1(result),
+        )
+        payload = recorder.sent[0]["payload"]
+        self.assertEqual(
+            payload["datasources"],
+            {"shop": {"type": "postgres", "database": "shop"}},
+        )
+        wire = json.dumps(payload, default=str)
+        self.assertNotIn("s3cret", wire)
+        self.assertNotIn("connection_string", wire)
+
+    def test2(self) -> None:
+        """
+        Test that each type is mapped to the platform datasets are named on.
+        """
+        cases = [
+            ("snowflake", _Url("snowflake", "acct", "DB/PUBLIC"), "DB"),
+            ("databricks_sql", _Url("databricks", "h", "main"), "main"),
+            ("sql", _Url("mysql+pymysql", "h", "shop"), "shop"),
+            ("sqlite", _Url("sqlite", "", "/tmp/x.db"), None),
+        ]
+        expected = ["snowflake", "databricks", "mysql", "sqlite"]
+        for (kind, url, database), platform in zip(cases, expected):
+            facts = cegxcom.datasource_facts(_Datasource("d", kind, url))
+            assert facts is not None
+            self.assertEqual(facts["type"], platform)
+            self.assertEqual(facts["database"], database)
+
+    def test3(self) -> None:
+        """
+        Test that a datasource with no SQL engine behind it is left out.
+        """
+        self.assertIsNone(
+            cegxcom.datasource_facts(_Datasource("frames", "pandas"))
+        )
+
+    def test4(self) -> None:
+        """
+        Test that a datasource whose engine cannot be built still names its
+        type, with no database.
+        """
+        facts = cegxcom.datasource_facts(_Datasource("wh", "redshift"))
+        self.assertEqual(facts, {"type": "redshift", "database": None})
+
+    def test5(self) -> None:
+        """
+        Test that a datasource the checkpoint does not hold is looked up on
+        the data context, and a missing one is skipped.
+        """
+        url = _Url("postgresql", "db", "ops")
+        result = _checkpoint_result(["ops", "gone"], [None])
+        by_name = {"ops": _Datasource("ops", "postgres", url)}
+        with unittest.mock.patch.object(
+            cegxcom, "project_datasource", side_effect=by_name.get
+        ):
+            out = cegxcom.datasources_v1(result)
+        self.assertEqual(out, {"ops": {"type": "postgres", "database": "ops"}})
+
+    def test6(self) -> None:
+        """
+        Test that a result this cannot read yields nothing and raises
+        nothing: a checkpoint must not fail over it.
+        """
+
+        class Broken:
+            """A result whose run results cannot be read."""
+
+            @property
+            def run_results(self) -> Any:
+                """Fail the way an unexpected GX release might."""
+                raise RuntimeError("renamed")
+
+        self.assertEqual(cegxcom.datasources_v1(Broken()), {})
+        self.assertEqual(cegxcom.datasources_v1(None), {})

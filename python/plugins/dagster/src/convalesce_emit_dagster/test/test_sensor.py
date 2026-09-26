@@ -233,6 +233,7 @@ _EVENT_TYPE_NAMES = (
     "HANDLED_OUTPUT",
     "LOADED_INPUT",
     "RESOURCE_INIT_SUCCESS",
+    "STEP_FAILURE",
 )
 
 
@@ -298,7 +299,8 @@ class Test_event_log1(unittest.TestCase):
         ]["materialization"]
         self.assertEqual(materialization["asset_key"], "orders")
         self.assertEqual(
-            materialization["metadata"], {"redacted": True, "count": 2}
+            materialization["metadata"],
+            {"row_count": 1000, "redacted": True, "count": 1},
         )
         self.assertNotIn("alice@x.com", str(payload))
         excluded = recorder.sent[0]["excluded"]
@@ -334,6 +336,205 @@ class Test_event_log1(unittest.TestCase):
         cedsens.convalesce_sensor(_ReachableContext(), emitter=recorder)
         payload = recorder.sent[0]["payload"]
         self.assertNotIn("event_log", payload)
+
+
+# #############################################################################
+# Test_redact_metadata1
+# #############################################################################
+
+
+class Test_redact_metadata1(unittest.TestCase):
+    """
+    Test that the metadata entries which describe a table cross as they are,
+    and every other entry stays redacted.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that each allowed entry is kept, the rest counted, and the
+        redaction declared.
+        """
+        allowed = {
+            "dagster/row_count": {"value": 5},
+            "dagster/table_name": {"text": "shop.orders"},
+            "dagster/uri": {"text": "s3://b/orders"},
+            "path": {"path": "/data/orders.parquet"},
+            "dagster/relation_identifier": {"text": "db.shop.orders"},
+            "size_in_bytes": {"value": 10},
+            "dagster/code_version": {"text": "abc"},
+            "convalesce_urn": {"text": "urn:li:dataset:x"},
+            "datahub_urn": {"text": "urn:li:dataset:y"},
+            "row_count": 5,
+            "table_name": "orders",
+            "uri": "s3://b/orders",
+        }
+        metadata = {**allowed, "preview": "alice@x.com", "sql": "select 1"}
+        log = [{"materialization": {"metadata": metadata}}]
+        out, excluded = cedsens.redact_metadata(log, "event_log")
+        self.assertEqual(
+            out[0]["materialization"]["metadata"],
+            {**allowed, "redacted": True, "count": 2},
+        )
+        self.assertNotIn("alice@x.com", str(out))
+        self.assertEqual(
+            excluded,
+            [
+                {
+                    "path": "event_log[0].materialization.metadata",
+                    "reason": "sample redacted",
+                }
+            ],
+        )
+
+    def test2(self) -> None:
+        """
+        Test that a column schema crosses as its columns' names and types,
+        without their tags.
+        """
+        schema = {
+            "schema": {
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "int",
+                        "description": None,
+                        "constraints": {"nullable": False},
+                        "tags": {"pii": "secret-tag"},
+                    }
+                ],
+                "constraints": {"other": ["a"]},
+            }
+        }
+        out, excluded = cedsens.redact_metadata(
+            {"metadata": {"dagster/column_schema": schema}}, "x"
+        )
+        self.assertEqual(
+            out["metadata"]["dagster/column_schema"],
+            {
+                "schema": {
+                    "columns": [
+                        {
+                            "name": "id",
+                            "type": "int",
+                            "description": None,
+                            "constraints": {"nullable": False},
+                        }
+                    ]
+                }
+            },
+        )
+        self.assertNotIn("secret-tag", str(out))
+        self.assertEqual(excluded, [])
+
+    def test3(self) -> None:
+        """
+        Test that metadata which is not a mapping is redacted whole, and a
+        column schema with no columns is not sent.
+        """
+        out, excluded = cedsens.redact_metadata(
+            {
+                "a": {"metadata": ["alice@x.com", "bob@x.com"]},
+                "b": {"metadata": {"dagster/column_schema": "rows"}},
+            },
+            "",
+        )
+        self.assertEqual(out["a"]["metadata"], {"redacted": True, "count": 2})
+        self.assertEqual(
+            out["b"]["metadata"], {"dagster/column_schema": {"redacted": True}}
+        )
+        self.assertEqual([e["path"] for e in excluded], ["a.metadata"])
+
+    def test4(self) -> None:
+        """
+        Test that the materialisations a step's stats repeat are redacted
+        the same way as the event log's.
+        """
+
+        class Instance(_Instance):
+            """An instance whose step stats carry a materialisation."""
+
+            def get_run_step_stats(self, run_id: str) -> List[Dict[str, Any]]:
+                """A step's stats, with the events it materialised."""
+                metadata = {"dagster/row_count": 5, "preview": "alice@x.com"}
+                event = {"materialization": {"metadata": metadata}}
+                return [{"step_key": "load", "materialization_events": [event]}]
+
+        recorder = _Recorder()
+        cedsens.convalesce_sensor(
+            _ReachableContext(Instance()), emitter=recorder
+        )
+        sent = recorder.sent[0]
+        event = sent["payload"]["step_stats"][0]["materialization_events"][0]
+        self.assertEqual(
+            event["materialization"]["metadata"],
+            {"dagster/row_count": 5, "redacted": True, "count": 1},
+        )
+        self.assertNotIn("alice@x.com", str(sent["payload"]))
+        self.assertIn(
+            "step_stats[0].materialization_events[0].materialization.metadata",
+            [e["path"] for e in sent["excluded"]],
+        )
+
+
+# #############################################################################
+# Test_step_failure1
+# #############################################################################
+
+
+class Test_step_failure1(unittest.TestCase):
+    """
+    Test that a failed step's error crosses whole.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the event log is read for step failures, and the error
+        each carries is forwarded with its class, message, stack and cause.
+        """
+        error = {
+            "cls_name": "ValueError",
+            "message": "ValueError: bad row\n",
+            "stack": ['  File "x.py", line 1\n'],
+            "cause": {"cls_name": "KeyError", "message": "k", "stack": []},
+        }
+
+        class Instance(_Instance):
+            """An instance whose event log holds one step failure."""
+
+            def get_records_for_run(
+                self, run_id: str, of_type: Any = None
+            ) -> types.SimpleNamespace:
+                """The event log, the shape `EventLogConnection` has."""
+                self.asked.append(run_id)
+                self.of_type = of_type
+                record = {
+                    "event_log_entry": {
+                        "step_key": "load",
+                        "dagster_event": {
+                            "event_type_value": "STEP_FAILURE",
+                            "event_specific_data": {"error": error},
+                        },
+                    }
+                }
+                return types.SimpleNamespace(records=[record])
+
+        instance = Instance()
+        fake_module = types.SimpleNamespace(
+            DagsterEventType=_fake_dagster_event_type()
+        )
+        recorder = _Recorder()
+        with unittest.mock.patch.dict(sys.modules, {"dagster": fake_module}):
+            cedsens.convalesce_sensor(
+                _ReachableContext(instance), emitter=recorder
+            )
+        self.assertIn("STEP_FAILURE", instance.of_type)
+        entry = recorder.sent[0]["payload"]["event_log"][0]
+        self.assertEqual(
+            entry["event_log_entry"]["dagster_event"]["event_specific_data"][
+                "error"
+            ],
+            error,
+        )
 
 
 # #############################################################################

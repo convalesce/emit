@@ -481,3 +481,123 @@ class Test_api_reads_enabled1(unittest.TestCase):
             env = {_API_READS_ENV: value}
             with mock.patch.dict(os.environ, env, clear=False):
                 self.assertFalse(cephooks.api_reads_enabled(), value)
+
+
+# #############################################################################
+# Test_error_detail1
+# #############################################################################
+
+
+def _raised() -> ValueError:
+    """
+    A ValueError that was raised, so it carries a traceback.
+
+    :return: the exception
+    """
+    try:
+        try:
+            raise KeyError("id")
+        except KeyError as cause:
+            raise ValueError("bad row") from cause
+    except ValueError as exc:
+        return exc
+
+
+class _State:
+    """Stands in for a Prefect state."""
+
+    def __init__(self, failed: bool, data: Any) -> None:
+        self._failed = failed
+        self.data = data
+
+    def is_failed(self) -> bool:
+        """Whether the run failed."""
+        return self._failed
+
+    def is_crashed(self) -> bool:
+        """Whether the run crashed."""
+        return False
+
+
+class _ResultRecord:
+    """Stands in for Prefect 3's `ResultRecord`, holding its result."""
+
+    def __init__(self, result: Any) -> None:
+        self.result = result
+
+
+class _PersistedResult:
+    """A result that would read from storage if asked for its value."""
+
+    def __init__(self) -> None:
+        self.storage_key = "s3://bucket/key"
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(f"read {name} from storage")
+
+
+class Test_error_detail1(unittest.TestCase):
+    """
+    Test that a failed task's exception crosses with its traceback.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the exception a Prefect 3 result record holds is sent as
+        `error_detail`, its traceback included.
+        """
+        recorder = _Recorder()
+        state = _State(True, _ResultRecord(_raised()))
+        with mock.patch.dict(sys.modules, {"prefect.context": None}):
+            cephooks.emit_task_run(
+                task="T", task_run=_TaskRun(), state=state, emitter=recorder
+            )
+        detail = recorder.sent[0]["payload"]["error_detail"]
+        self.assertEqual(detail["type"], "ValueError")
+        self.assertEqual(detail["message"], "bad row")
+        self.assertIn("KeyError", detail["traceback"])
+        self.assertIn("_raised", detail["traceback"])
+
+    def test2(self) -> None:
+        """
+        Test that a bare exception, or one in a Prefect 2 result's cache,
+        is found too.
+        """
+
+        class Cached:
+            """Stands in for a Prefect 2 result with its value cached."""
+
+            def __init__(self, value: Any) -> None:
+                self._cache = value
+
+        for data in (_raised(), Cached(_raised())):
+            detail = cephooks.error_detail(_State(True, data))
+            assert detail is not None
+            self.assertEqual(detail["type"], "ValueError")
+
+    def test3(self) -> None:
+        """
+        Test that a long traceback keeps its tail, where it failed.
+        """
+        exc = _raised()
+        with mock.patch.object(
+            cephooks.traceback,
+            "format_exception",
+            return_value=["head" + "x" * 20000, "tail"],
+        ):
+            detail = cephooks.error_detail(_State(True, exc))
+        assert detail is not None
+        self.assertEqual(len(detail["traceback"]), 16000)
+        self.assertTrue(detail["traceback"].endswith("tail"))
+
+    def test4(self) -> None:
+        """
+        Test that nothing is added for a success, a failure whose result is
+        not in memory, or a state that is not Prefect's.
+        """
+        self.assertIsNone(cephooks.error_detail(_State(False, _raised())))
+        self.assertIsNone(
+            cephooks.error_detail(_State(True, _PersistedResult()))
+        )
+        self.assertIsNone(cephooks.error_detail("S"))
+        self.assertIsNone(cephooks.error_detail(None))
