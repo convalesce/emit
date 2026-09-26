@@ -21,7 +21,7 @@ import convalesce_emit_prefect.hooks as cephooks
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
 import convalesce_emit_prefect._lineage as celin
@@ -59,6 +59,18 @@ _TASK_RUN_PAGE_BACKSTOP = 50
 # as `error_detail` instead. The run objects carry their own copy of it.
 _SKIP = frozenset({"state.data", "flow_run.state.data", "task_run.state.data"})
 
+# A flow's parameters are whatever launched the run typed -- a customer id, a
+# date range, a bucket -- and nothing a receiver reads. Their names and types
+# cross; their values only when a customer opts in.
+_SEND_PARAMETERS_ENV = "CONVALESCE_PREFECT_SEND_PARAMETERS"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_PARAMETER_VALUES = (("flow_run", "parameters"), ("api_flow_run", "parameters"))
+# The flow's own parameter schema carries each parameter's default value.
+_PARAMETER_SCHEMA = ("flow", "parameters", "properties")
+_PARAMETERS_WITHHELD = "parameter values withheld"
+# Stamped by `cemit.dump` on a mapping something else points at; kept as is.
+_REF_ID = "$id"
+
 # A Prefect Cloud API URL names the account and the workspace in its own
 # path; nothing about a run has to be read to find them.
 _CLOUD_URL_RE = re.compile(
@@ -83,14 +95,89 @@ def _emit(
     payload = {**payload, **api_state(payload)}
     budget = cemit.new_budget(skip=_SKIP)
     dumped = cemit.dump(payload, budget=budget)
+    withheld: List[Dict[str, str]] = []
+    if not send_parameters():
+        dumped, withheld = withhold_parameters(dumped)
+    # A run's job variables and, when sent, its parameters are whatever
+    # launched it typed, and either can hold a literal credential.
+    dumped, secrets = cemit.redact_secrets(dumped)
     cemit.send_one(
         tool=TOOL,
         event=event,
         payload=dumped,
         emitter=emitter,
         tool_version=cemit.version_of("prefect"),
-        excluded=budget.excluded,
+        excluded=budget.excluded + withheld + secrets,
     )
+
+
+# #############################################################################
+# Parameters
+# #############################################################################
+
+
+def send_parameters() -> bool:
+    """
+    Whether flow parameter values cross, off by default.
+
+    :return: whether `CONVALESCE_PREFECT_SEND_PARAMETERS` is set truthy
+    """
+    raw = os.environ.get(_SEND_PARAMETERS_ENV, "")
+    return raw.strip().lower() in _TRUTHY
+
+
+def withhold_parameters(
+    body: Any,
+) -> Tuple[Any, List[Dict[str, str]]]:
+    """
+    Replace each flow parameter's value, and each default, with its type.
+
+    The names survive, so a receiver still sees what a run was called with,
+    just not with what.
+
+    :param body: the dumped payload
+    :return: the same payload, values replaced, and what was withheld, by
+        path and reason
+    """
+    excluded: List[Dict[str, str]] = []
+    if not isinstance(body, dict):
+        return body, excluded
+    for carrier, name in _PARAMETER_VALUES:
+        holder = body.get(carrier)
+        if not isinstance(holder, dict) or not isinstance(
+            holder.get(name), dict
+        ):
+            continue
+        holder[name] = {
+            key: value if key == _REF_ID else _type_marker(value)
+            for key, value in holder[name].items()
+        }
+        excluded.append(
+            {"path": f"{carrier}.{name}", "reason": _PARAMETERS_WITHHELD}
+        )
+    properties: Any = body
+    for step in _PARAMETER_SCHEMA:
+        properties = (
+            properties.get(step) if isinstance(properties, dict) else None
+        )
+    if not isinstance(properties, dict):
+        return body, excluded
+    for key, schema in properties.items():
+        if isinstance(schema, dict) and "default" in schema:
+            schema["default"] = _type_marker(schema["default"])
+            path = ".".join(_PARAMETER_SCHEMA + (str(key), "default"))
+            excluded.append({"path": path, "reason": _PARAMETERS_WITHHELD})
+    return body, excluded
+
+
+def _type_marker(value: Any) -> str:
+    """
+    What stands in for a withheld value.
+
+    :param value: the dumped value
+    :return: its type, as `<str>`, `<int>` and so on
+    """
+    return f"<{type(value).__name__}>"
 
 
 # #############################################################################
@@ -454,7 +541,8 @@ def error_detail(state: Any) -> Optional[Dict[str, Any]]:
         exc = _held_exception(getattr(state, "data", None))
         if exc is None:
             return None
-        return cemit.error_detail(exc)
+        detail: Dict[str, Any] = cemit.error_detail(exc)
+        return detail
     except Exception as exc:  # pylint: disable=broad-exception-caught
         _LOG.debug("convalesce: could not read the failure: %s", exc)
         return None

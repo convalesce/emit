@@ -30,6 +30,10 @@ def nightly():
 
 Set `CONVALESCE_INGEST_KEY` where the flow runs.
 
+Both functions also serve `on_running`, and `emit_flow_run` serves
+`on_crashed` and `on_cancellation`. Wire those too: a flow that crashes or
+is cancelled never fires `on_failure`, so without them its run never ends.
+
 ## Declare lineage
 
 Prefect knows which task fed which, not which tables a task read or wrote.
@@ -49,6 +53,11 @@ def load():
 
 Each dataset is a urn, or a `platform` and `name` with an optional `env`
 (`PROD` by default).
+
+On Prefect 3, a task's own assets need none of this: the task-run hook of
+an `@materialize` task sends the assets it writes and the `asset_deps` it
+reads, and the receiver follows assets handed on by upstream task runs the
+way Prefect does.
 
 A failed task's hook also sends the exception and its traceback, when
 Prefect holds it in memory; a result persisted to storage is not read back.
@@ -70,3 +79,9 @@ configuration beyond `CONVALESCE_INGEST_KEY`; set
 `CONVALESCE_PREFECT_API_READS=false` to turn it off if this process's
 Prefect API is locked down, and still get everything the hook's own
 arguments already carry.
+
+A flow's parameters are what launched the run typed, and can be customer
+data. Only their names and types are sent (`{"since": "<str>"}`), for the
+run and for the flow's defaults, and the payload says so in `excluded`. Set
+`CONVALESCE_PREFECT_SEND_PARAMETERS=true` to send the values; anything named
+like a credential is still redacted.

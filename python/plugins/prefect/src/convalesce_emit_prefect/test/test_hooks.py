@@ -60,6 +60,7 @@ class _TaskRun:
         self.name = "extract-12f"
         self.flow_run_id = "a64690f5"
         self.state_name = "Completed"
+        self.state: Any = None
 
 
 class _ContextModule:
@@ -623,3 +624,138 @@ class Test_error_detail1(unittest.TestCase):
             {"path": "state.data", "reason": "excluded by name"},
             sent["excluded"],
         )
+
+
+# #############################################################################
+# Test_withhold_parameters1
+# #############################################################################
+
+
+# Restated for the same reason as `_API_READS_ENV`.
+_SEND_PARAMETERS_ENV = "CONVALESCE_PREFECT_SEND_PARAMETERS"
+
+
+class _ParameterisedFlow(_Flow):
+    """Stands in for a flow whose schema carries a default."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {
+            "type": "object",
+            "properties": {
+                "customer": {"type": "string", "default": "acme-corp"},
+                "limit": {"type": "integer"},
+            },
+        }
+
+
+class _ParameterisedRun(_FlowRun):
+    """Stands in for a flow run launched with customer values."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {"customer": "acme-corp", "limit": 10}
+        self.job_variables = {"env": {"DB_PASSWORD": "hunter2"}}
+
+
+class Test_withhold_parameters1(unittest.TestCase):
+    """
+    Test that a flow's parameter values stay behind unless opted in.
+    """
+
+    def _send(self, env: Dict[str, str]) -> Dict[str, Any]:
+        """
+        Fire the flow hook for a run launched with customer values.
+
+        :param env: the environment to fire it under
+        :return: the observation sent
+        """
+        recorder = _Recorder()
+        with mock.patch.dict(os.environ, env, clear=True):
+            cephooks.emit_flow_run(
+                flow=_ParameterisedFlow(),
+                flow_run=_ParameterisedRun(),
+                state="S",
+                emitter=recorder,
+            )
+        return recorder.sent[0]
+
+    def test1(self) -> None:
+        """
+        Test that by default the names and types cross, never the values.
+        """
+        sent = self._send({})
+        payload = sent["payload"]
+        self.assertEqual(
+            payload["flow_run"]["parameters"],
+            {"customer": "<str>", "limit": "<int>"},
+        )
+        schema = payload["flow"]["parameters"]["properties"]
+        self.assertEqual(schema["customer"]["default"], "<str>")
+        self.assertNotIn("default", schema["limit"])
+        self.assertNotIn("acme-corp", json.dumps(payload))
+        reason = "parameter values withheld"
+        self.assertIn(
+            {"path": "flow_run.parameters", "reason": reason}, sent["excluded"]
+        )
+        self.assertIn(
+            {
+                "path": "flow.parameters.properties.customer.default",
+                "reason": reason,
+            },
+            sent["excluded"],
+        )
+
+    def test2(self) -> None:
+        """
+        Test that opting in sends the values as they are.
+        """
+        sent = self._send({_SEND_PARAMETERS_ENV: "true"})
+        payload = sent["payload"]
+        self.assertEqual(
+            payload["flow_run"]["parameters"],
+            {"customer": "acme-corp", "limit": 10},
+        )
+        self.assertEqual(
+            payload["flow"]["parameters"]["properties"]["customer"]["default"],
+            "acme-corp",
+        )
+        self.assertNotIn(
+            "parameter values withheld",
+            [entry["reason"] for entry in sent["excluded"]],
+        )
+
+    def test3(self) -> None:
+        """
+        Test that a credential in a run's job variables never crosses, in
+        either mode.
+        """
+        for env in ({}, {_SEND_PARAMETERS_ENV: "true"}):
+            sent = self._send(env)
+            self.assertNotIn("hunter2", json.dumps(sent["payload"]))
+            self.assertIn(
+                {
+                    "path": "flow_run.job_variables.env.DB_PASSWORD",
+                    "reason": "secret redacted",
+                },
+                sent["excluded"],
+            )
+
+    def test4(self) -> None:
+        """
+        Test that the API's copy of the run is withheld the same way, and a
+        payload with no parameters anywhere is left alone.
+        """
+        body = {"api_flow_run": {"parameters": {"since": "2026-01-01"}}}
+        out, excluded = cephooks.withhold_parameters(body)
+        self.assertEqual(out["api_flow_run"]["parameters"], {"since": "<str>"})
+        self.assertEqual(
+            excluded,
+            [
+                {
+                    "path": "api_flow_run.parameters",
+                    "reason": "parameter values withheld",
+                }
+            ],
+        )
+        self.assertEqual(cephooks.withhold_parameters({"a": 1}), ({"a": 1}, []))
