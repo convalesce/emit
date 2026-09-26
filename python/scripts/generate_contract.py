@@ -89,7 +89,9 @@ def load_captures(
         for row in rows:
             by_event[row["event"]] |= field_paths(row["payload"])
         for event, paths in by_event.items():
-            per_version[tool][event][version] = paths
+            # Several captures of one version (a DAG's own events beside a
+            # probe's OpenLineage ones) add up rather than replace each other.
+            per_version[tool][event].setdefault(version, set()).update(paths)
     return per_version
 
 

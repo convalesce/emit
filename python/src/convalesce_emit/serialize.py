@@ -264,6 +264,16 @@ def dump(
             raise
         active.exclude(path, "recursion backstop")
         return "...(excluded: recursion backstop)"
+    except Exception:  # pylint: disable=broad-exception-caught
+        # A value that runs the tool's code merely by being looked at. An
+        # Airflow `PythonOperator` taking `**context` keeps the context in
+        # `op_kwargs` after it runs, and its lazy `triggering_dataset_events`
+        # merges a dag run into a session that refuses it; `isinstance` alone
+        # fires that. Found on a live Airflow 2.10 losing every success event
+        # of such a task, not by reading. One unreadable value, not the whole
+        # observation. `type()` does not resolve a proxy, so naming it is safe.
+        active.exclude(path, "unreadable")
+        return f"<{type(obj).__name__}: unreadable>"
 
 
 def _dump(  # pylint: disable=too-many-return-statements

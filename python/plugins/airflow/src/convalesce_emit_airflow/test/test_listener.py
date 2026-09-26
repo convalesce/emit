@@ -477,6 +477,66 @@ class Test_listener_task_group1(unittest.TestCase):
 
 
 # #############################################################################
+# Test_listener_context_kwargs1
+# #############################################################################
+
+
+class Test_listener_context_kwargs1(unittest.TestCase):
+    """
+    Test that a task's template context is not walked through `op_kwargs`.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the context is dropped and the task's own kwargs kept.
+
+        A `**context` callable leaves the whole context in `op_kwargs`
+        after it runs, lazy values included; one of those raised on being
+        looked at and lost the task's success event on a live Airflow.
+        """
+
+        class Task:
+            """Stands in for a `PythonOperator` after it ran."""
+
+            def __init__(self) -> None:
+                self.task_id = "load"
+                self.op_kwargs = {
+                    "table": "orders",
+                    "conf": object(),
+                    "triggering_dataset_events": object(),
+                }
+
+        class TaskInstance:
+            """Stands in for the task instance Airflow passes."""
+
+            def __init__(self) -> None:
+                self.task_id = "load"
+                self.task = Task()
+
+        cealist.context_keys.cache_clear()
+        with unittest.mock.patch.object(
+            cealist,
+            "_CONTEXT_KEY_MODULES",
+            ("convalesce_emit_airflow.test.test_listener",),
+        ):
+            payload, excluded = cealist.shape({"task_instance": TaskInstance()})
+        cealist.context_keys.cache_clear()
+        op_kwargs = payload["task_instance"]["task"]["op_kwargs"]
+        self.assertEqual(op_kwargs, {"table": "orders"})
+        self.assertIn(
+            {
+                "path": "task_instance.task.op_kwargs.conf",
+                "reason": "excluded by name",
+            },
+            excluded,
+        )
+
+
+# Read by Test_listener_context_kwargs1 in place of Airflow's own module.
+KNOWN_CONTEXT_KEYS = {"conf", "triggering_dataset_events", "ti"}
+
+
+# #############################################################################
 # Test_connection_coordinates1
 # #############################################################################
 

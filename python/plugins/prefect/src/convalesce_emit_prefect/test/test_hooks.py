@@ -4,6 +4,7 @@ Tests for the flow and task state hooks.
 Run with `make test`.
 """
 
+import json
 import logging
 import os
 import sys
@@ -586,3 +587,39 @@ class Test_error_detail1(unittest.TestCase):
         )
         self.assertIsNone(cephooks.error_detail("S"))
         self.assertIsNone(cephooks.error_detail(None))
+
+    def test4(self) -> None:
+        """
+        Test that a failed flow run sends its exception too, not only the
+        failed task run.
+        """
+        recorder = _Recorder()
+        state = _State(True, _ResultRecord(_raised()))
+        cephooks.emit_flow_run(
+            flow=_Flow(), flow_run=_FlowRun(), state=state, emitter=recorder
+        )
+        detail = recorder.sent[0]["payload"]["error_detail"]
+        self.assertEqual(detail["type"], "builtins.ValueError")
+        self.assertIn("_raised", detail["traceback"])
+
+    def test5(self) -> None:
+        """
+        Test that what a task returned never crosses: a state's data is the
+        customer's own, on the state and on the run's copy of it alike.
+        """
+        recorder = _Recorder()
+        task_run = _TaskRun()
+        task_run.state = _State(False, _ResultRecord("customer@example.com"))
+        with mock.patch.dict(sys.modules, {"prefect.context": None}):
+            cephooks.emit_task_run(
+                task="T",
+                task_run=task_run,
+                state=_State(False, _ResultRecord("customer@example.com")),
+                emitter=recorder,
+            )
+        sent = recorder.sent[0]
+        self.assertNotIn("customer@example.com", json.dumps(sent["payload"]))
+        self.assertIn(
+            {"path": "state.data", "reason": "excluded by name"},
+            sent["excluded"],
+        )

@@ -198,13 +198,17 @@ def convalesce_sensor(
             events, withheld = redact_metadata(body[name], name)
             body[name], redacted = cemit.redact_samples(events, path=name)
             excluded = excluded + withheld + redacted
+    # A run's config and tags are whatever launched it typed, and a step's
+    # error or an asset's `Query` can quote a connection string: any of them
+    # can hold a literal credential.
+    body, secrets = cemit.redact_secrets(body)
     cemit.send_one(
         tool=TOOL,
         event="run_status",
         payload=body,
         emitter=target,
         tool_version=cemit.version_of("dagster"),
-        excluded=excluded,
+        excluded=excluded + secrets,
     )
     target.flush()
 
@@ -410,9 +414,13 @@ def asset_group_names(context: Any) -> Dict[str, str]:
     if repository_def is None:
         return {}
     try:
-        assets_defs = repository_def.asset_graph.assets_defs_by_key.values()
+        # On the repository, not its `asset_graph`: the graph dropped
+        # `assets_defs_by_key` by 1.9, which the repository still carries
+        # from 1.7 to 1.13. Found on a live 1.9 daemon, where every run had
+        # crossed without a group.
+        assets_defs = repository_def.assets_defs_by_key.values()
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        _LOG.debug("convalesce: could not read the asset graph: %s", exc)
+        _LOG.debug("convalesce: could not read the asset definitions: %s", exc)
         return {}
     out: Dict[str, str] = {}
     seen: set = set()

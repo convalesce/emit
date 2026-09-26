@@ -7,7 +7,7 @@ import sys
 import types
 import unittest
 import unittest.mock
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import convalesce_emit_dagster.sensor as cedsens
 
@@ -29,17 +29,21 @@ class _Recorder:
 class _Context:
     """The shape of a run-status context: private state, public properties."""
 
-    def __init__(self) -> None:
-        self._run = {"job_name": "nightly", "run_id": "abc"}
-        self._event = {"event_type_value": "PIPELINE_FAILURE"}
+    def __init__(
+        self,
+        run: Optional[Dict[str, Any]] = None,
+        event: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._run = run or {"job_name": "nightly", "run_id": "abc"}
+        self._event = event or {"event_type_value": "PIPELINE_FAILURE"}
 
     @property
-    def dagster_run(self) -> Dict[str, str]:
+    def dagster_run(self) -> Dict[str, Any]:
         """The run, as Dagster exposes it."""
         return self._run
 
     @property
-    def dagster_event(self) -> Dict[str, str]:
+    def dagster_event(self) -> Dict[str, Any]:
         """The event, as Dagster exposes it."""
         return self._event
 
@@ -89,6 +93,40 @@ class Test_convalesce_sensor1(unittest.TestCase):
         cedsens.convalesce_sensor({"job_name": "nightly"}, emitter=recorder)
         payload = recorder.sent[0]["payload"]
         self.assertEqual(payload["context"]["job_name"], "nightly")
+
+    def test3(self) -> None:
+        """
+        Test that a credential in the run's config or in a step's error does
+        not cross, and that the redaction is declared.
+        """
+        context = _Context(
+            run={
+                "job_name": "nightly",
+                "run_id": "abc",
+                "run_config": {
+                    "resources": {"db": {"config": {"password": "hunter2"}}}
+                },
+            },
+            event={
+                "event_type_value": "PIPELINE_FAILURE",
+                "message": "could not reach postgresql://etl:hunter2@db/shop",
+            },
+        )
+        recorder = _Recorder()
+        cedsens.convalesce_sensor(context, emitter=recorder)
+        sent = recorder.sent[0]
+        self.assertNotIn("hunter2", repr(sent["payload"]))
+        self.assertEqual(
+            sent["payload"]["dagster_event"]["message"],
+            "could not reach postgresql://etl:***@db/shop",
+        )
+        self.assertEqual(
+            {entry["path"] for entry in sent["excluded"]},
+            {
+                "dagster_run.run_config.resources.db.config.password",
+                "dagster_event.message",
+            },
+        )
 
 
 class _Instance:
@@ -574,15 +612,10 @@ class Test_asset_group_names1(unittest.TestCase):
         agg_key = Key("daily", "totals")
         combined = AssetsDef({raw_key: "core", agg_key: "core"})
 
-        class AssetGraph:
-            """Stands in for the repository's asset graph."""
-
-            assets_defs_by_key = {raw_key: combined, agg_key: combined}
-
         class Repository:
             """Stands in for the sensor's `RepositoryDefinition`."""
 
-            asset_graph = AssetGraph()
+            assets_defs_by_key = {raw_key: combined, agg_key: combined}
 
         class Context:
             """A context exposing only what this reads."""
@@ -600,14 +633,14 @@ class Test_asset_group_names1(unittest.TestCase):
 
     def test3(self) -> None:
         """
-        Test that an asset graph that cannot be read loses only the groups.
+        Test that asset definitions that cannot be read lose only the groups.
         """
 
         class Repository:
-            """A repository whose asset graph is unreadable."""
+            """A repository whose asset definitions are unreadable."""
 
             @property
-            def asset_graph(self) -> Any:
+            def assets_defs_by_key(self) -> Any:
                 """Fail, the way an unloaded repository does."""
                 raise RuntimeError("not loaded")
 

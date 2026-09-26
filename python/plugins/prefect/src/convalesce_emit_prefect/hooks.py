@@ -54,6 +54,11 @@ _FALSY = frozenset({"0", "false", "no", "off"})
 _TASK_RUN_PAGE_SIZE = 200
 _TASK_RUN_PAGE_BACKSTOP = 50
 
+# A state's data is what the flow or task returned -- the customer's own
+# data, which never crosses -- or, on a failure, the exception, which crosses
+# as `error_detail` instead. The run objects carry their own copy of it.
+_SKIP = frozenset({"state.data", "flow_run.state.data", "task_run.state.data"})
+
 # A Prefect Cloud API URL names the account and the workspace in its own
 # path; nothing about a run has to be read to find them.
 _CLOUD_URL_RE = re.compile(
@@ -76,7 +81,7 @@ def _emit(
     :return: nothing
     """
     payload = {**payload, **api_state(payload)}
-    budget = cemit.new_budget()
+    budget = cemit.new_budget(skip=_SKIP)
     dumped = cemit.dump(payload, budget=budget)
     cemit.send_one(
         tool=TOOL,
@@ -350,6 +355,9 @@ def emit_flow_run(
     :return: nothing
     """
     payload = {"flow": flow, "flow_run": flow_run, "state": state, **kwargs}
+    detail = error_detail(state)
+    if detail is not None:
+        payload.setdefault("error_detail", detail)
     _emit("flow_run", payload, emitter)
 
 

@@ -67,6 +67,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    FrozenSet,
     List,
     Mapping,
     Optional,
@@ -129,6 +130,20 @@ _SKIP_ARGS = frozenset({"session"})
 # A task group holds the DAG it belongs to, which arrives on the task and on
 # the dag run as well, plus the group bookkeeping Airflow's UI draws with.
 _SUMMARISE = frozenset({"task_group"})
+
+# A `PythonOperator` whose callable takes `**context` keeps what it was
+# called with in `op_kwargs` once it has run: its own kwargs and all of
+# Airflow's template context. The context is the run's plumbing -- the
+# configuration parser, variable and connection accessors, and lazy values
+# that query the metadata database, or raise, merely by being looked at --
+# and the task instance and dag run it names are already in the payload. A
+# live Airflow 2.10 lost every success event of such a task to it. The
+# task's own kwargs are kept.
+_OP_KWARGS = "task_instance.task.op_kwargs"
+_CONTEXT_KEY_MODULES = (
+    "airflow.utils.context",
+    "airflow.sdk.definitions.context",
+)
 
 # Used when the spec modules cannot be read; the shape these have carried
 # since the listener API landed in Airflow 2.5.
@@ -247,7 +262,10 @@ def shape(
     :param payload: the hook's own arguments
     :return: what to send, and everything left out of it, by path and reason
     """
-    budget = cemit.new_budget(summarise=_SUMMARISE)
+    budget = cemit.new_budget(
+        summarise=_SUMMARISE,
+        skip=frozenset(f"{_OP_KWARGS}.{key}" for key in context_keys()),
+    )
     out = {
         name: cemit.dump(value, budget=budget, path=name)
         for name, value in payload.items()
@@ -293,6 +311,28 @@ def shape(
             aliases, budget=budget, path="task_instance.asset_aliases"
         )
     return out, budget.excluded
+
+
+@functools.lru_cache(maxsize=1)
+def context_keys() -> FrozenSet[str]:
+    """
+    The names Airflow puts in a task's template context.
+
+    Read from Airflow rather than listed here, so a release that adds one
+    is covered without a release of this plugin.
+
+    :return: the names; empty where Airflow is absent or keeps none
+    """
+    for module_name in _CONTEXT_KEY_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Moved in another Airflow major; the other module may have it.
+            continue
+        keys = getattr(module, "KNOWN_CONTEXT_KEYS", None)
+        if keys:
+            return frozenset(str(key) for key in keys)
+    return frozenset()
 
 
 # #############################################################################

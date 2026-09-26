@@ -40,6 +40,10 @@ import org.apache.spark.scheduler.SparkListenerTaskEnd;
  * it came from, and a receiver seeing two drivers at once had to guess. The id is remembered from
  * whichever event names it and stamped on every event that does not.
  *
+ * <p><b>Which values.</b> A job start carries the job's whole Spark configuration, credentials
+ * included, and Spark redacts them only on the way into its own event log. They are redacted here
+ * by the same rule before anything leaves the driver.
+ *
  * <p>Nothing may escape into the customer's job. Every override wraps its body, and a failure to
  * emit is logged and dropped.
  */
@@ -51,6 +55,7 @@ public class ConvalesceSparkListener extends SparkListener {
   private final Emitter emitter;
   private final String sparkVersion;
   private final SparkEvents events = SparkEvents.fromEnvironment();
+  private final Redaction redaction;
   // Written by the listener bus thread and read by it; volatile so a later event on another
   // thread, which Spark does not promise against, still sees it.
   private volatile String appId;
@@ -61,12 +66,16 @@ public class ConvalesceSparkListener extends SparkListener {
   }
 
   /**
-   * Built by Spark when {@code spark.extraListeners} names a class taking a conf.
+   * Built by Spark when {@code spark.extraListeners} names a class taking a conf, which Spark
+   * prefers.
    *
-   * @param conf the running job's configuration, unused but required by Spark's contract
+   * @param conf the running job's configuration, read for its {@code spark.redaction.regex}
    */
   public ConvalesceSparkListener(SparkConf conf) {
-    this(SharedEmitter.emitter(), SharedEmitter.sparkVersion());
+    this(
+        SharedEmitter.emitter(),
+        SharedEmitter.sparkVersion(),
+        Redaction.of(conf == null ? null : conf.get(Redaction.REGEX_KEY, null)));
   }
 
   /**
@@ -76,8 +85,13 @@ public class ConvalesceSparkListener extends SparkListener {
    * @param sparkVersion the version to record on each observation
    */
   public ConvalesceSparkListener(Emitter emitter, String sparkVersion) {
+    this(emitter, sparkVersion, Redaction.of(null));
+  }
+
+  private ConvalesceSparkListener(Emitter emitter, String sparkVersion, Redaction redaction) {
     this.emitter = emitter;
     this.sparkVersion = sparkVersion;
+    this.redaction = redaction;
     if (!SparkEventJson.available()) {
       LOG.warning("convalesce: this Spark has no serialiser we recognise; nothing will be sent");
     }
@@ -145,7 +159,7 @@ public class ConvalesceSparkListener extends SparkListener {
       if (json == null) {
         return;
       }
-      json = SparkEventJson.withAppId(json, remember(json));
+      json = SparkEventJson.withAppId(redaction.apply(json), remember(json));
       emitter.emit(TOOL, name, json, sparkVersion);
     } catch (Throwable t) {
       // A job must not fail because we could not report on it.
