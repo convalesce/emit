@@ -12,6 +12,7 @@ from typing import Any, ClassVar, List
 from airflow.plugins_manager import AirflowPlugin
 
 import convalesce_emit_airflow.listener as cealist
+import convalesce_emit_airflow.openlineage as cealol
 
 _LOG = logging.getLogger(__name__)
 
@@ -22,9 +23,14 @@ _LOG = logging.getLogger(__name__)
 
 
 class ConvalescePlugin(AirflowPlugin):  # type: ignore[misc]
-    """Registers the Convalesce listener with Airflow."""
+    """
+    Registers the Convalesce listener with Airflow, and the OpenLineage
+    provider's listener when this plugin is what switched it on.
+    """
 
     name = "convalesce_emit"
     # filter(None, ...) so a listener that could not be built registers
     # nothing rather than putting a None into Airflow's plugin manager.
-    listeners: ClassVar[List[Any]] = list(filter(None, [cealist.get_listener()]))
+    listeners: ClassVar[List[Any]] = (
+        list(filter(None, [cealist.get_listener()])) + cealol.enable()
+    )

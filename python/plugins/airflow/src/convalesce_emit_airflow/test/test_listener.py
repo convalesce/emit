@@ -774,3 +774,58 @@ class Test_asset_aliases1(unittest.TestCase):
             },
         ):
             self.assertEqual(cealist.asset_aliases(TaskInstance()), [])
+
+
+def _failed_load() -> BaseException:
+    """
+    An exception raised from another, as a task's would be.
+
+    :return: the outer exception, as caught
+    """
+    try:
+        try:
+            raise ConnectionError("db refused")
+        except ConnectionError as exc:
+            raise RuntimeError("load failed") from exc
+    except RuntimeError as caught:
+        return caught
+
+
+# #############################################################################
+# Test_listener_error_detail1
+# #############################################################################
+
+
+class Test_listener_error_detail1(unittest.TestCase):
+    """
+    Test that a failure carries the exception's class and traceback.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that an exception passed as `error` is described alongside
+        its message.
+        """
+        error = _failed_load()
+        recorder = _Recorder()
+        listener = cealist.build_listener_class(_FAILED_SPEC)(emitter=recorder)
+        getattr(listener, _FAILED)("running", "TI", error, None)
+        payload = recorder.sent[0]["payload"]
+        self.assertEqual(payload["error"], "load failed")
+        detail = payload["error_detail"]
+        self.assertEqual(detail["type"], "builtins.RuntimeError")
+        self.assertEqual(detail["message"], "load failed")
+        self.assertIn("RuntimeError: load failed", detail["traceback"])
+        self.assertEqual(detail["cause"]["type"], "builtins.ConnectionError")
+
+    def test2(self) -> None:
+        """
+        Test that a message string, which is all Airflow's scheduler passes
+        for a task it found dead, is sent without a made-up detail.
+        """
+        recorder = _Recorder()
+        listener = cealist.build_listener_class(_FAILED_SPEC)(emitter=recorder)
+        getattr(listener, _FAILED)("running", "TI", "zombie", None)
+        getattr(listener, _FAILED)("running", "TI", None, None)
+        for sent in recorder.sent:
+            self.assertNotIn("error_detail", sent["payload"])

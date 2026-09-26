@@ -31,6 +31,17 @@ than about reading a tool's state:
   is on the context the API server sent, and it is spliced in under the name
   Airflow 2 puts it at, so a receiver has one path for both.
 
+A failure's `error` is dumped as its message, like any exception, and the
+exception itself is described alongside it as `error_detail`: class,
+traceback and cause, which a receiver cannot recover from the message. Only
+where Airflow hands over the exception. On Airflow 2.10 the task process
+does (`_run_raw_task` passes what the task raised), but the scheduler, the
+backfill runner and the DAG processor fail a task they found dead or timed
+out with a message string, and nothing on the task instance keeps an
+exception to recover instead; `sys.exc_info()` there would be whatever the
+scheduler last caught, not the task's failure, so it is not read. Those
+failures carry `error` alone.
+
 And one field is named rather than walked. A task belongs to a task group,
 and a task group holds its own copy of the whole DAG, so it was 40% of a
 task event and every byte of it appeared elsewhere already.
@@ -242,6 +253,9 @@ def shape(
         for name, value in payload.items()
         if name not in _SKIP_ARGS
     }
+    error = payload.get("error")
+    if isinstance(error, BaseException):
+        out["error_detail"] = cemit.error_detail(error)
     task_instance = payload.get("task_instance")
     dumped = out.get("task_instance")
     if task_instance is None or not isinstance(dumped, dict):
