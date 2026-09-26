@@ -133,6 +133,7 @@ objects:
       _logger_name: &logging "logging plumbing, not the task"
       logger_name: *logging
       _log_config_logger_name: *logging
+      _log: *logging
       _needs_expansion: "private bookkeeping for dynamic task mapping; is_mapped/map_index carry the fact"
       _pre_execute_hook: &hookfn "a user callable run around execute; functions are described, not sent, and nothing about the run is in one"
       _post_execute_hook: *hookfn
