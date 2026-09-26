@@ -531,9 +531,167 @@ class Test_listener_context_kwargs1(unittest.TestCase):
             excluded,
         )
 
+    def test2(self) -> None:
+        """
+        Test that a module whose `KNOWN_CONTEXT_KEYS` is not a collection is
+        passed over for the next, rather than raising.
+
+        Airflow 3.2's deprecation shim resolves the name to a module, and
+        iterating that raised inside `shape`, losing every listener event.
+        """
+        shim = types.ModuleType("_convalesce_shim_context")
+        shim.KNOWN_CONTEXT_KEYS = types.ModuleType("airflow.sdk.x")  # type: ignore[attr-defined]
+        cealist.context_keys.cache_clear()
+        modules = (
+            "_convalesce_shim_context",
+            "convalesce_emit_airflow.test.test_listener",
+        )
+        with unittest.mock.patch.dict(
+            sys.modules, {"_convalesce_shim_context": shim}
+        ):
+            with unittest.mock.patch.object(
+                cealist, "_CONTEXT_KEY_MODULES", modules
+            ):
+                keys = cealist.context_keys()
+        cealist.context_keys.cache_clear()
+        self.assertEqual(keys, frozenset(KNOWN_CONTEXT_KEYS))
+
 
 # Read by Test_listener_context_kwargs1 in place of Airflow's own module.
 KNOWN_CONTEXT_KEYS = {"conf", "triggering_dataset_events", "ti"}
+
+
+# #############################################################################
+# Test_listener_redaction1
+# #############################################################################
+
+
+class _EnvVar:
+    """Stands in for a Kubernetes `V1EnvVar`, which dumps via `to_dict`."""
+
+    def __init__(self, name: str, value: str) -> None:
+        self.name = name
+        self.value = value
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the fields as the Kubernetes client does."""
+        return {"name": self.name, "value": self.value, "value_from": None}
+
+
+class _Task:
+    """Stands in for an operator carrying what its author typed."""
+
+    def __init__(self) -> None:
+        self.task_id = "load"
+        self.sql = (
+            "INSERT INTO analytics.orders SELECT * FROM raw.orders "
+            "WHERE note = 'password=hunter2'"
+        )
+        self.op_kwargs = {"table": "orders", "api_key": "sk-live-123"}
+        self.params = {"target": "prod", "db_password": "pa55"}
+        self.env_vars = [
+            _EnvVar("DB_PASSWORD", "pa55"),
+            _EnvVar("REGION", "us-east-1"),
+        ]
+        self.image = "registry/etl:1"
+
+
+class _DagRun:
+    """Stands in for a dag run triggered with credentials in its conf."""
+
+    def __init__(self) -> None:
+        self.run_id = "manual__1"
+        self.conf = {
+            "snowflake_token": "tok",
+            "source": "postgresql://etl:s3cret@db:5432/shop",
+        }
+
+
+class _TaskInstance:
+    """Stands in for the task instance Airflow passes."""
+
+    def __init__(self) -> None:
+        self.task_id = "load"
+        self.task = _Task()
+        self.dag_run = _DagRun()
+
+
+class Test_listener_redaction1(unittest.TestCase):
+    """
+    Test that credentials an author typed into a task never leave the worker.
+    """
+
+    def _shape(self) -> Any:
+        with unittest.mock.patch.object(
+            cealist, "connection_coordinates", return_value={}
+        ):
+            return cealist.shape({"task_instance": _TaskInstance()})
+
+    def test1(self) -> None:
+        """
+        Test that credential-named keys in `op_kwargs`, `params` and a run's
+        `conf` are withheld, and the rest of each kept.
+        """
+        payload, excluded = self._shape()
+        task = payload["task_instance"]["task"]
+        conf = payload["task_instance"]["dag_run"]["conf"]
+        self.assertEqual(task["op_kwargs"]["api_key"], {"redacted": True})
+        self.assertEqual(task["op_kwargs"]["table"], "orders")
+        self.assertEqual(task["params"]["db_password"], {"redacted": True})
+        self.assertEqual(conf["snowflake_token"], {"redacted": True})
+        paths = {item["path"] for item in excluded}
+        self.assertIn("task_instance.task.op_kwargs.api_key", paths)
+        self.assertIn("task_instance.dag_run.conf.snowflake_token", paths)
+
+    def test2(self) -> None:
+        """
+        Test that a pod's environment variable named like a credential has
+        its value withheld, and others are kept.
+        """
+        payload, excluded = self._shape()
+        env = payload["task_instance"]["task"]["env_vars"]
+        self.assertEqual(env[0]["name"], "DB_PASSWORD")
+        self.assertEqual(env[0]["value"], {"redacted": True})
+        self.assertEqual(env[1]["value"], "us-east-1")
+        self.assertIn(
+            {
+                "path": "task_instance.task.env_vars[0].value",
+                "reason": "secret redacted",
+            },
+            excluded,
+        )
+
+    def test3(self) -> None:
+        """
+        Test that SQL crosses with only an embedded password masked, and a
+        URI keeps its user and host.
+        """
+        payload, _ = self._shape()
+        sql = payload["task_instance"]["task"]["sql"]
+        source = payload["task_instance"]["dag_run"]["conf"]["source"]
+        self.assertTrue(sql.startswith("INSERT INTO analytics.orders SELECT"))
+        self.assertNotIn("hunter2", sql)
+        self.assertEqual(source, "postgresql://etl:***@db:5432/shop")
+
+    def test4(self) -> None:
+        """
+        Test that the forwarded event carries the redactions in `excluded`.
+        """
+        recorder = _Recorder()
+        listener = cealist.build_listener_class(
+            {"on_task_instance_running": ("previous_state", "task_instance")}
+        )(emitter=recorder)
+        with unittest.mock.patch.object(
+            cealist, "connection_coordinates", return_value={}
+        ):
+            getattr(listener, "on_task_instance_running")(
+                previous_state=None, task_instance=_TaskInstance()
+            )
+        sent = recorder.sent[0]
+        self.assertNotIn("sk-live-123", str(sent["payload"]))
+        self.assertNotIn("pa55", str(sent["payload"]))
+        reasons = {item["reason"] for item in sent["excluded"]}
+        self.assertEqual(reasons, {"secret redacted", "credential masked"})
 
 
 # #############################################################################

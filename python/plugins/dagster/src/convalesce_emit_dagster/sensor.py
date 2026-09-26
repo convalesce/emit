@@ -61,12 +61,15 @@ _FROM_INSTANCE = (
 _SNAPSHOT_NOISE = ("config_schema_snapshot", "dagster_type_namespace_snapshot")
 
 # The event types the event log is read for: what an asset materialised or
-# observed, what an IO manager handled or loaded, and a resource coming up --
-# the facts the run's stats and snapshots above say nothing about, because
-# none of them is a step's own output. A step failure is here for its error:
-# the run's own failure event usually carries none, only "steps failed", and
-# the exception each step raised is on its `STEP_FAILURE` alone.
-_EVENT_LOG_TYPE_NAMES = (
+# observed, what an IO manager handled or loaded, a resource coming up, and
+# what an asset check found -- the facts the run's stats and snapshots above
+# say nothing about, because none of them is a step's own output. A step
+# failure is here for its error: the run's own failure event usually carries
+# none, only "steps failed", and the exception each step raised is on its
+# `STEP_FAILURE` alone. Every other type is accounted for, with its reason,
+# in `test/backward_exclusions.json`.
+EVENT_LOG_TYPE_NAMES = (
+    "ASSET_CHECK_EVALUATION",
     "ASSET_MATERIALIZATION",
     "ASSET_OBSERVATION",
     "HANDLED_OUTPUT",
@@ -91,7 +94,7 @@ _EVENT_CARRIERS = ("event_log", "step_stats")
 # ones Dagster itself writes for a materialisation, and the urns an asset's
 # author sets to say which dataset it is. These cross as they are, alongside
 # the redaction marker for whatever else the entry carried.
-_METADATA_ALLOWED = frozenset(
+METADATA_ALLOWED = frozenset(
     {
         "dagster/row_count",
         "row_count",
@@ -101,6 +104,13 @@ _METADATA_ALLOWED = frozenset(
         "uri",
         "path",
         "dagster/relation_identifier",
+        "dagster/storage_kind",
+        "dagster/partition_row_count",
+        # Which upstream column feeds which of this asset's: asset keys and
+        # column names, the same kind of fact as the column schema.
+        "dagster/column_lineage",
+        # How many rows a dbt test found failing: a count, never the rows.
+        "dagster_dbt/failed_row_count",
         "size_in_bytes",
         "dagster/code_version",
         "convalesce_urn",
@@ -182,6 +192,9 @@ def convalesce_sensor(
     groups = asset_group_names(context)
     if groups:
         parts["asset_group_names"] = groups
+    definitions = asset_metadata(context)
+    if definitions:
+        parts["asset_metadata"] = definitions
     cloud_env = cloud_environment()
     if cloud_env:
         parts["cloud_environment"] = cloud_env
@@ -193,6 +206,11 @@ def convalesce_sensor(
     excluded = budget.excluded
     if isinstance(body, dict) and "job_snapshot" in body:
         body["job_snapshot"] = prune_snapshot(body["job_snapshot"])
+    if isinstance(body, dict) and isinstance(body.get("asset_metadata"), dict):
+        body["asset_metadata"] = {
+            key: _allowed_metadata(entry) if isinstance(entry, dict) else entry
+            for key, entry in body["asset_metadata"].items()
+        }
     for name in _EVENT_CARRIERS:
         if isinstance(body, dict) and name in body:
             events, withheld = redact_metadata(body[name], name)
@@ -268,7 +286,7 @@ def _allowed_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
     for name, entry in metadata.items():
         if name == "dagster/column_schema":
             out[name] = _schema_only(entry)
-        elif name in _METADATA_ALLOWED:
+        elif name in METADATA_ALLOWED:
             out[name] = entry
     withheld = len(metadata) - len(out)
     if withheld:
@@ -391,7 +409,7 @@ def _event_log_types() -> Optional[Any]:
         return None
     members = {
         getattr(DagsterEventType, name)
-        for name in _EVENT_LOG_TYPE_NAMES
+        for name in EVENT_LOG_TYPE_NAMES
         if hasattr(DagsterEventType, name)
     }
     return members or None
@@ -410,6 +428,43 @@ def asset_group_names(context: Any) -> Dict[str, str]:
     :return: dot-joined asset key to group name, for every asset a group
         could be read for; empty when the context carries no repository
     """
+    return _by_asset_key(context, "group_names_by_key")
+
+
+def asset_metadata(context: Any) -> Dict[str, Dict[str, Any]]:
+    """
+    Asset key to the definition metadata that names its table.
+
+    What an asset was declared with -- `dagster/table_name`, a dbt model's
+    `dagster/storage_kind` and column schema -- is on its definition, not on
+    its materialisation. Dagster 1.7 and 1.9 copied it onto the job
+    snapshot's outputs as well; 1.13 does not, so without this a dbt model
+    arrives as an asset with no table. Only the allowed entries are taken:
+    a dbt definition also holds the whole manifest and its translator.
+
+    :param context: Dagster's run-status context
+    :return: dot-joined asset key to its allowed definition metadata, for
+        every asset that has any
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for key, metadata in _by_asset_key(context, "metadata_by_key").items():
+        items = metadata.items() if hasattr(metadata, "items") else ()
+        kept = {name: value for name, value in items if name in METADATA_ALLOWED}
+        if kept:
+            out[key] = kept
+    return out
+
+
+def _by_asset_key(context: Any, attribute: str) -> Dict[str, Any]:
+    """
+    One per-key mapping of every asset definition in the sensor's repository.
+
+    :param context: Dagster's run-status context
+    :param attribute: the `AssetsDefinition` mapping to read, keyed by
+        `AssetKey`
+    :return: dot-joined asset key to its value; empty when the context
+        carries no repository or its definitions cannot be read
+    """
     repository_def = getattr(context, "repository_def", None)
     if repository_def is None:
         return {}
@@ -422,20 +477,20 @@ def asset_group_names(context: Any) -> Dict[str, str]:
     except Exception as exc:  # pylint: disable=broad-exception-caught
         _LOG.debug("convalesce: could not read the asset definitions: %s", exc)
         return {}
-    out: Dict[str, str] = {}
+    out: Dict[str, Any] = {}
     seen: set = set()
     for assets_def in assets_defs:
         if id(assets_def) in seen:
             # One multi-asset `AssetsDefinition` is the value for every key
-            # it defines; reading its groups once is enough.
+            # it defines; reading it once is enough.
             continue
         seen.add(id(assets_def))
         try:
-            groups = assets_def.group_names_by_key
+            values = dict(getattr(assets_def, attribute))
         except Exception:  # pylint: disable=broad-exception-caught
             continue
-        for key, group in groups.items():
-            out[_asset_key_text(key)] = group
+        for key, value in values.items():
+            out[_asset_key_text(key)] = value
     return out
 
 

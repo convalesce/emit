@@ -42,6 +42,9 @@ exception to recover instead; `sys.exc_info()` there would be whatever the
 scheduler last caught, not the task's failure, so it is not read. Those
 failures carry `error` alone.
 
+Credentials are withheld after the dump, the same as for the OpenLineage
+events; see `redact`.
+
 And one field is named rather than walked. A task belongs to a task group,
 and a task group holds its own copy of the whole DAG, so it was 40% of a
 task event and every byte of it appeared elsewhere already.
@@ -140,9 +143,13 @@ _SUMMARISE = frozenset({"task_group"})
 # live Airflow 2.10 lost every success event of such a task to it. The
 # task's own kwargs are kept.
 _OP_KWARGS = "task_instance.task.op_kwargs"
+# The SDK module first: Airflow 3.2's deprecation shim in `airflow.utils.context`
+# resolves `KNOWN_CONTEXT_KEYS` to the SDK module itself rather than to the
+# set in it, and iterating that raised inside `shape`, losing every listener
+# event a 3.2.2 task sent.
 _CONTEXT_KEY_MODULES = (
-    "airflow.utils.context",
     "airflow.sdk.definitions.context",
+    "airflow.utils.context",
 )
 
 # Used when the spec modules cannot be read; the shape these have carried
@@ -277,7 +284,7 @@ def shape(
     task_instance = payload.get("task_instance")
     dumped = out.get("task_instance")
     if task_instance is None or not isinstance(dumped, dict):
-        return out, budget.excluded
+        return redact(out, budget.excluded)
     if dumped.get("dag_run") is None:
         dag_run = find_dag_run(task_instance)
         if dag_run is not None:
@@ -310,7 +317,75 @@ def shape(
         dumped["asset_aliases"] = cemit.dump(
             aliases, budget=budget, path="task_instance.asset_aliases"
         )
-    return out, budget.excluded
+    return redact(out, budget.excluded)
+
+
+def redact(
+    out: Dict[str, Any], excluded: List[Dict[str, str]]
+) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
+    """
+    Withhold credentials from a shaped payload, declaring each one.
+
+    A task carries what its author typed: `op_kwargs`, `params`, a run's
+    `conf`, a pod's `env_vars`, templated SQL. Any of them can hold a
+    literal credential. Values under credential-named keys are replaced and
+    passwords inside URIs and connection strings masked, the SQL around them
+    kept. A connection's `extra` is never read in the first place (see
+    `connection_coordinates`).
+
+    :param out: the payload as shaped
+    :param excluded: what the dump already left out
+    :return: the payload with credentials withheld, and everything left out
+    """
+    redacted, secrets = cemit.redact_secrets(out)
+    pairs: List[Dict[str, str]] = []
+    redacted = _redact_named_values(redacted, "", pairs)
+    return redacted, excluded + secrets + pairs
+
+
+def _redact_named_values(
+    value: Any, path: str, excluded: List[Dict[str, str]]
+) -> Any:
+    """
+    Redact the value of a `{"name": ..., "value": ...}` pair named like a
+    credential.
+
+    Kubernetes keeps a pod's environment as a list of those
+    (`V1EnvVar`), so `DB_PASSWORD` is a value rather than a key and the
+    key-based pass cannot see it.
+
+    :param value: the value being walked
+    :param path: dotted path of `value` from the payload root
+    :param excluded: accumulator every redaction is appended to
+    :return: the same shape, with credential values replaced
+    """
+    if isinstance(value, list):
+        return [
+            _redact_named_values(item, f"{path}[{i}]", excluded)
+            for i, item in enumerate(value)
+        ]
+    if not isinstance(value, dict):
+        return value
+    name = value.get("name")
+    secret = value.get("value")
+    if isinstance(name, str) and secret not in (None, ""):
+        # The core decides what a credential's name looks like; asking it
+        # with the name as a key keeps that rule in one place.
+        _, hits = cemit.redact_secrets({name: secret})
+        if hits:
+            excluded.append(
+                {
+                    "path": f"{path}.value" if path else "value",
+                    "reason": "secret redacted",
+                }
+            )
+            value = {**value, "value": {"redacted": True}}
+    return {
+        key: _redact_named_values(
+            item, f"{path}.{key}" if path else key, excluded
+        )
+        for key, item in value.items()
+    }
 
 
 @functools.lru_cache(maxsize=1)
@@ -330,7 +405,9 @@ def context_keys() -> FrozenSet[str]:
             # Moved in another Airflow major; the other module may have it.
             continue
         keys = getattr(module, "KNOWN_CONTEXT_KEYS", None)
-        if keys:
+        # Only a real collection of names: anything else is a shim that
+        # resolved to the wrong object, and the next module may do better.
+        if keys and isinstance(keys, (set, frozenset, list, tuple)):
             return frozenset(str(key) for key in keys)
     return frozenset()
 

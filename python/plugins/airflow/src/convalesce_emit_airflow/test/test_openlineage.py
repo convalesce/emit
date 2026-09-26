@@ -338,3 +338,43 @@ class Test_enable1(unittest.TestCase):
         with self.assertLogs(cealol.__name__, level="WARNING"):
             self.assertEqual(cealol.enable(env, read), [])
         self.assertEqual(env, {})
+
+
+# #############################################################################
+# Test_hook_lineage_readers1
+# #############################################################################
+
+
+class Test_hook_lineage_readers1(unittest.TestCase):
+    """
+    Test that Airflow's hook lineage reader is found wherever it lives.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the first module carrying the reader wins, and a module
+        that is missing is passed over.
+        """
+        reader = type("HookLineageReader", (), {})
+        module = types.ModuleType("_convalesce_lineage")
+        module.HookLineageReader = reader  # type: ignore[attr-defined]
+        with unittest.mock.patch.dict(
+            "sys.modules", {"_convalesce_lineage": module}
+        ):
+            with unittest.mock.patch.object(
+                cealol,
+                "_HOOK_LINEAGE_READER_MODULES",
+                ("_convalesce_absent_lineage", "_convalesce_lineage"),
+            ):
+                self.assertEqual(cealol.hook_lineage_readers(), [reader])
+
+    def test2(self) -> None:
+        """
+        Test that an Airflow older than 2.10, which has no reader, gets none.
+        """
+        with unittest.mock.patch.object(
+            cealol,
+            "_HOOK_LINEAGE_READER_MODULES",
+            ("_convalesce_absent_lineage",),
+        ):
+            self.assertEqual(cealol.hook_lineage_readers(), [])

@@ -32,6 +32,15 @@ lineage event the provider builds (tables read and written, parsed SQL,
 columns) is forwarded as observation `openlineage`. It does this by setting
 `AIRFLOW__OPENLINEAGE__TRANSPORT` when the plugin loads.
 
+On Airflow 2.10 and later it also registers Airflow's hook lineage reader, so
+files and tables a hook touches from inside a task (S3, GCS, object storage,
+SQL run through a hook) reach the same events.
+
+To link a Spark job an Airflow task submits to that task, set
+`AIRFLOW__OPENLINEAGE__SPARK_INJECT_PARENT_JOB_INFO=true`. The provider then
+names the task as the Spark job's parent; it changes the job's Spark
+configuration, so it is left for you to switch on.
+
 It never replaces a setup you made: any of `[openlineage] transport`,
 `[openlineage] config_path`, `[openlineage] disabled`, `OPENLINEAGE_URL`,
 `OPENLINEAGE_CONFIG`, `OPENLINEAGE_DISABLED`, `OPENLINEAGE__TRANSPORT__*` or an

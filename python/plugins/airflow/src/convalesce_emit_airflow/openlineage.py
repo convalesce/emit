@@ -65,6 +65,8 @@ _PROVIDER = "airflow.providers.openlineage"
 PROVIDER_CONF = "airflow.providers.openlineage.conf"
 _PROVIDER_LISTENER = "airflow.providers.openlineage.plugins.listener"
 _SECTION = "openlineage"
+# Airflow 3, then 2.10; absent before 2.10.
+_HOOK_LINEAGE_READER_MODULES = ("airflow.sdk.lineage", "airflow.lineage.hook")
 _FALSY = frozenset({"0", "false", "no", "off"})
 _TRUTHY = frozenset({"1", "true", "t", "yes", "on"})
 
@@ -401,6 +403,35 @@ def _clear_provider_cache() -> None:
                 clear()
             except Exception:  # pylint: disable=broad-exception-caught
                 continue
+
+
+def hook_lineage_readers() -> List[Any]:
+    """
+    Airflow's hook lineage reader, for this plugin to register.
+
+    Hooks (S3, GCS, object storage, SQL run from a `@task`) report what they
+    read and wrote to Airflow's hook lineage collector, and the provider
+    folds that into the task's OpenLineage event when no extractor covers
+    the operator. The collector is a no-op unless some plugin registers a
+    reader. The provider registers one in the same class body that decides
+    it is disabled, so when its plugin loads before this one, found by
+    importing it first on Airflow 2.10.5 and 3.2.2, the collector stays a
+    no-op and every hook-level dataset is lost. Registering the same reader
+    from here is harmless where the provider did too: Airflow only asks
+    whether any reader is registered.
+
+    :return: the reader class, or none on an Airflow older than 2.10
+    """
+    for module_name in _HOOK_LINEAGE_READER_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Moved in another Airflow major; the other module may have it.
+            continue
+        reader = getattr(module, "HookLineageReader", None)
+        if reader is not None:
+            return [reader]
+    return []
 
 
 def _provider_listener() -> Any:

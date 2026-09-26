@@ -266,6 +266,7 @@ class Test_reach_instance1(unittest.TestCase):
 # filter on -- restated here, not imported from the module under test, so
 # this stays a test of the public contract rather than the private constant.
 _EVENT_TYPE_NAMES = (
+    "ASSET_CHECK_EVALUATION",
     "ASSET_MATERIALIZATION",
     "ASSET_OBSERVATION",
     "HANDLED_OUTPUT",
@@ -276,7 +277,7 @@ _EVENT_TYPE_NAMES = (
 
 
 def _fake_dagster_event_type() -> types.SimpleNamespace:
-    """A stand-in `DagsterEventType` carrying the five names this reads."""
+    """A stand-in `DagsterEventType` carrying the names this reads."""
     return types.SimpleNamespace(**{name: name for name in _EVENT_TYPE_NAMES})
 
 
@@ -517,6 +518,97 @@ class Test_redact_metadata1(unittest.TestCase):
             [e["path"] for e in sent["excluded"]],
         )
 
+    def test5(self) -> None:
+        """
+        Test that the column lineage, storage kind, a partition's row count
+        and a dbt test's failing row count cross: names and counts, not rows.
+        """
+        allowed = {
+            "dagster/column_lineage": {
+                "lineage": {
+                    "deps_by_column": {
+                        "total": [
+                            {
+                                "asset_key": {"parts": ["raw"]},
+                                "column_name": "amount",
+                            }
+                        ]
+                    }
+                }
+            },
+            "dagster/storage_kind": {"text": "snowflake"},
+            "dagster/partition_row_count": {"value": 3},
+            "dagster_dbt/failed_row_count": {"value": 1},
+        }
+        out, _ = cedsens.redact_metadata(
+            {"metadata": {**allowed, "status": {"text": "fail"}}}, ""
+        )
+        self.assertEqual(
+            out["metadata"], {**allowed, "redacted": True, "count": 1}
+        )
+
+
+# #############################################################################
+# Test_asset_check1
+# #############################################################################
+
+
+class Test_asset_check1(unittest.TestCase):
+    """
+    Test that an asset check's evaluation crosses from the event log.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that `ASSET_CHECK_EVALUATION` is asked for, and its record
+        crosses with its outcome and its author's metadata redacted.
+        """
+        evaluation = {
+            "asset_key": {"parts": ["orders"]},
+            "check_name": "not_empty",
+            "passed": False,
+            "severity": "WARN",
+            "metadata": {"failing": {"text": "alice@x.com"}},
+        }
+
+        class Instance(_Instance):
+            """An instance whose event log holds one check evaluation."""
+
+            def get_records_for_run(
+                self, run_id: str, of_type: Any = None
+            ) -> types.SimpleNamespace:
+                """The event log, the shape `EventLogConnection` has."""
+                self.asked.append(run_id)
+                self.of_type = of_type
+                record = {
+                    "event_log_entry": {
+                        "step_key": "orders_not_empty",
+                        "dagster_event": {
+                            "event_type_value": "ASSET_CHECK_EVALUATION",
+                            "event_specific_data": dict(evaluation),
+                        },
+                    }
+                }
+                return types.SimpleNamespace(records=[record])
+
+        instance = Instance()
+        fake_module = types.SimpleNamespace(
+            DagsterEventType=_fake_dagster_event_type()
+        )
+        recorder = _Recorder()
+        with unittest.mock.patch.dict(sys.modules, {"dagster": fake_module}):
+            cedsens.convalesce_sensor(
+                _ReachableContext(instance), emitter=recorder
+            )
+        self.assertIn("ASSET_CHECK_EVALUATION", instance.of_type)
+        data = recorder.sent[0]["payload"]["event_log"][0]["event_log_entry"][
+            "dagster_event"
+        ]["event_specific_data"]
+        self.assertEqual(data["check_name"], "not_empty")
+        self.assertFalse(data["passed"])
+        self.assertEqual(data["metadata"], {"redacted": True, "count": 1})
+        self.assertNotIn("alice@x.com", str(recorder.sent[0]["payload"]))
+
 
 # #############################################################################
 # Test_step_failure1
@@ -650,6 +742,85 @@ class Test_asset_group_names1(unittest.TestCase):
             repository_def = Repository()
 
         self.assertEqual(cedsens.asset_group_names(Context()), {})
+
+
+# #############################################################################
+# Test_asset_metadata1
+# #############################################################################
+
+
+class Test_asset_metadata1(unittest.TestCase):
+    """
+    Test that an asset's definition metadata crosses, down to what names
+    its table.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the allowed entries are kept per asset, a dbt manifest is
+        left behind, and an asset with none is left out.
+        """
+
+        class Key:
+            """Stands in for an `AssetKey`."""
+
+            def __init__(self, *path: str) -> None:
+                self.path = list(path)
+
+        orders, raw = Key("shop", "orders"), Key("raw")
+
+        class AssetsDef:
+            """Stands in for a dbt multi-asset `AssetsDefinition`."""
+
+            metadata_by_key = {
+                orders: {
+                    "dagster/table_name": "db.main.orders",
+                    "dagster/storage_kind": "duckdb",
+                    "dagster_dbt/manifest": {"nodes": ["huge"]},
+                },
+                raw: {"dagster_dbt/unique_id": "model.raw"},
+            }
+
+        combined = AssetsDef()
+
+        class Repository:
+            """Stands in for the sensor's `RepositoryDefinition`."""
+
+            assets_defs_by_key = {orders: combined, raw: combined}
+
+        class Context(_ReachableContext):
+            """A context whose repository defines the dbt assets."""
+
+            repository_def = Repository()
+
+        self.assertEqual(
+            cedsens.asset_metadata(Context()),
+            {
+                "shop.orders": {
+                    "dagster/table_name": "db.main.orders",
+                    "dagster/storage_kind": "duckdb",
+                }
+            },
+        )
+        recorder = _Recorder()
+        cedsens.convalesce_sensor(Context(), emitter=recorder)
+        payload = recorder.sent[0]["payload"]
+        self.assertEqual(
+            payload["asset_metadata"],
+            {
+                "shop.orders": {
+                    "dagster/table_name": "db.main.orders",
+                    "dagster/storage_kind": "duckdb",
+                }
+            },
+        )
+        self.assertNotIn("huge", str(payload))
+
+    def test2(self) -> None:
+        """
+        Test that a context with no repository yields nothing, not a raise.
+        """
+        self.assertEqual(cedsens.asset_metadata(_Context()), {})
 
 
 # #############################################################################

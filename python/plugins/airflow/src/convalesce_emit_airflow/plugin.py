@@ -29,8 +29,14 @@ class ConvalescePlugin(AirflowPlugin):  # type: ignore[misc]
     """
 
     name = "convalesce_emit"
+    _openlineage: ClassVar[List[Any]] = cealol.enable()
     # filter(None, ...) so a listener that could not be built registers
     # nothing rather than putting a None into Airflow's plugin manager.
     listeners: ClassVar[List[Any]] = (
-        list(filter(None, [cealist.get_listener()])) + cealol.enable()
+        list(filter(None, [cealist.get_listener()])) + _openlineage
+    )
+    # Only where this plugin switched OpenLineage on; a user's own setup
+    # leaves the provider's plugin enabled, and it registers its own.
+    hook_lineage_readers: ClassVar[List[Any]] = (
+        cealol.hook_lineage_readers() if _openlineage else []
     )
