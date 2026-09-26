@@ -368,7 +368,11 @@ class Test_redact_metadata1(unittest.TestCase):
             "table_name": "orders",
             "uri": "s3://b/orders",
         }
-        metadata = {**allowed, "preview": "alice@x.com", "sql": "select 1"}
+        metadata = {
+            **allowed,
+            "preview": "alice@x.com",
+            "owner_email": "bob@x.com",
+        }
         log = [{"materialization": {"metadata": metadata}}]
         out, excluded = cedsens.redact_metadata(log, "event_log")
         self.assertEqual(
