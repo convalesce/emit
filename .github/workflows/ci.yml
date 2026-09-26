@@ -181,11 +181,11 @@ jobs:
           - tool: gx
             spec: "great-expectations==0.18.22"
             python: "3.11"
-            extras: "sqlalchemy<2.1 pandas<3"
+            extras: '"sqlalchemy<2.1" "pandas<3"'
           - tool: gx
             spec: "great-expectations==1.22.0"
             python: "3.12"
-            extras: "sqlalchemy<2.1 pandas<3"
+            extras: '"sqlalchemy<2.1" "pandas<3"'
           - tool: gx
             spec: "great-expectations==1.23.2"
             python: "3.12"
