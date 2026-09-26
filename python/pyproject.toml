@@ -43,8 +43,8 @@ test = [
 ]
 
 [project.urls]
-Homepage = "https://convalesce.com"
-Documentation = "https://docs.convalesce.com"
+Homepage = "https://convalesce.io"
+Documentation = "https://docs.convalesce.io"
 Source = "https://github.com/convalesce/emit"
 
 [build-system]
