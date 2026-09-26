@@ -201,6 +201,10 @@ jobs:
             spec: "dagster==1.9.13"
             python: "3.11"
           # 1.13 stopped copying definition metadata onto the job snapshot.
+          # 1.13.21 is also a required check on main, so it stays by name.
+          - tool: dagster
+            spec: "dagster==1.13.21"
+            python: "3.12"
           - tool: dagster
             spec: "dagster==1.13.24"
             python: "3.12"
