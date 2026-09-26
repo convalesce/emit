@@ -154,6 +154,13 @@ public class EmitterTest {
     assertEquals(3, total);
   }
 
+  @Test
+  public void fitsSaysWhetherAnObservationWouldGoWithinTheLimit() {
+    Emitter emitter = new Emitter(Config.of(url, "secret-key", 50, 0, 4000));
+    assertTrue(emitter.fits("spark", "small", "{\"a\":1}", null));
+    assertFalse(emitter.fits("spark", "huge", "{\"plan\":\"" + repeat("x", 8000) + "\"}", null));
+  }
+
   private static String repeat(String unit, int times) {
     StringBuilder out = new StringBuilder(unit.length() * times);
     for (int i = 0; i < times; i++) {

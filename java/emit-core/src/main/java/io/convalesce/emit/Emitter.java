@@ -85,7 +85,7 @@ public final class Emitter {
     Observation observation = new Observation(tool, event, payloadJson, toolVersion);
     byte[] bytes = observation.toJson().getBytes(UTF8);
     int overhead = BODY_OPEN.length() + BODY_CLOSE.length();
-    if (bytes.length + overhead > config.maxBodyBytes()) {
+    if (!fits(bytes.length)) {
       LOG.warning(
           "convalesce: "
               + tool
@@ -119,6 +119,27 @@ public final class Emitter {
     if (ready) {
       flush();
     }
+  }
+
+  /**
+   * Whether one observation fits in a request of its own.
+   *
+   * <p>For a caller that can shrink what it sends and would rather do that than have the whole
+   * observation refused.
+   *
+   * @param tool which tool produced this
+   * @param event which callback fired
+   * @param payloadJson the tool's own output, already JSON
+   * @param toolVersion the tool's version, where it could be read
+   * @return whether it is within the receiver's body limit
+   */
+  public boolean fits(String tool, String event, String payloadJson, String toolVersion) {
+    Observation observation = new Observation(tool, event, payloadJson, toolVersion);
+    return fits(observation.toJson().getBytes(UTF8).length);
+  }
+
+  private boolean fits(int observationBytes) {
+    return observationBytes + BODY_OPEN.length() + BODY_CLOSE.length() <= config.maxBodyBytes();
   }
 
   /** Sends whatever is queued, logging rather than throwing on failure. */

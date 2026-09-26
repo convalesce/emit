@@ -57,7 +57,7 @@ public class ConvalesceSparkListener extends SparkListener {
 
   /** Built by Spark when no constructor takes a SparkConf. */
   public ConvalesceSparkListener() {
-    this(new Emitter(), readSparkVersion());
+    this(SharedEmitter.emitter(), SharedEmitter.sparkVersion());
   }
 
   /**
@@ -66,7 +66,7 @@ public class ConvalesceSparkListener extends SparkListener {
    * @param conf the running job's configuration, unused but required by Spark's contract
    */
   public ConvalesceSparkListener(SparkConf conf) {
-    this(new Emitter(), readSparkVersion());
+    this(SharedEmitter.emitter(), SharedEmitter.sparkVersion());
   }
 
   /**
@@ -165,14 +165,5 @@ public class ConvalesceSparkListener extends SparkListener {
       appId = found;
     }
     return appId;
-  }
-
-  private static String readSparkVersion() {
-    try {
-      return org.apache.spark.package$.MODULE$.SPARK_VERSION();
-    } catch (Throwable t) {
-      // A version is a nicety, never a blocker.
-      return null;
-    }
   }
 }
