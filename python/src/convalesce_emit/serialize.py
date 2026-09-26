@@ -265,9 +265,15 @@ def dump(
         active.exclude(path, "recursion backstop")
         return "...(excluded: recursion backstop)"
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        # One value that cannot be walked -- a dict another thread changes
-        # mid-iteration, a lazy proxy whose load fails -- costs that value,
-        # not the whole event it sits in.
+        # One value that cannot be walked costs that value, not the whole
+        # event it sits in: a dict another thread changes mid-iteration, or a
+        # value that runs the tool's code merely by being looked at. An
+        # Airflow `PythonOperator` taking `**context` keeps the context in
+        # `op_kwargs` after it runs, and its lazy `triggering_dataset_events`
+        # merges a dag run into a session that refuses it; `isinstance` alone
+        # fires that. Found on a live Airflow 2.10 losing every success event
+        # of such a task, not by reading. `type()` does not resolve a proxy,
+        # so naming it is safe.
         active.exclude(path, f"unreadable: {type(exc).__name__}")
         return f"<{type(obj).__name__}: unreadable>"
 

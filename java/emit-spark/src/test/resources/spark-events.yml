@@ -1,0 +1,15 @@
+# Spark listener events ConvalesceSparkListener never receives, on purpose.
+#
+# Every other concrete SparkListenerEvent in the Spark jars the tests run
+# against is either forwarded by default (the application, its jobs and its
+# SQL executions) or forwarded when CONVALESCE_SPARK_EVENTS names it or says
+# `all`. SparkEventInventoryTest fails on an event that is in neither place,
+# and on an entry here that the listener does receive or that this Spark no
+# longer has.
+excluded:
+  SparkListenerExecutorBlacklisted: "deprecated since Spark 3.1, which posts SparkListenerExecutorExcluded beside it; forwarding both would say everything twice"
+  SparkListenerExecutorBlacklistedForStage: "as above, twin of SparkListenerExecutorExcludedForStage"
+  SparkListenerExecutorUnblacklisted: "as above, twin of SparkListenerExecutorUnexcluded"
+  SparkListenerNodeBlacklisted: "as above, twin of SparkListenerNodeExcluded"
+  SparkListenerNodeBlacklistedForStage: "as above, twin of SparkListenerNodeExcludedForStage"
+  SparkListenerNodeUnblacklisted: "as above, twin of SparkListenerNodeUnexcluded"

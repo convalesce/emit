@@ -82,6 +82,9 @@ jobs:
           - { package: convalesce-emit-dagster, dir: plugins/dagster, env: "-dagster" }
           - { package: convalesce-emit-prefect, dir: plugins/prefect, env: "-prefect" }
           - { package: convalesce-emit-gx, dir: plugins/gx, env: "-gx" }
+          # convalesce-emit-pyspark ships from the next release: uncomment once
+          # its pending publisher and `pypi-pyspark` environment exist.
+          # - { package: convalesce-emit-pyspark, dir: plugins/pyspark, env: "-pyspark" }
     name: ${{ matrix.package }}
     environment: ${{ inputs.rehearse && 'testpypi' || 'pypi' }}${{ matrix.env }}
     permissions:

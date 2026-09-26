@@ -4,6 +4,7 @@ Tests for the flow and task state hooks.
 Run with `make test`.
 """
 
+import json
 import logging
 import os
 import sys
@@ -59,6 +60,7 @@ class _TaskRun:
         self.name = "extract-12f"
         self.flow_run_id = "a64690f5"
         self.state_name = "Completed"
+        self.state: Any = None
 
 
 class _ContextModule:
@@ -481,3 +483,279 @@ class Test_api_reads_enabled1(unittest.TestCase):
             env = {_API_READS_ENV: value}
             with mock.patch.dict(os.environ, env, clear=False):
                 self.assertFalse(cephooks.api_reads_enabled(), value)
+
+
+# #############################################################################
+# Test_error_detail1
+# #############################################################################
+
+
+def _raised() -> ValueError:
+    """
+    A ValueError that was raised, so it carries a traceback.
+
+    :return: the exception
+    """
+    try:
+        try:
+            raise KeyError("id")
+        except KeyError as cause:
+            raise ValueError("bad row") from cause
+    except ValueError as exc:
+        return exc
+
+
+class _State:
+    """Stands in for a Prefect state."""
+
+    def __init__(self, failed: bool, data: Any) -> None:
+        self._failed = failed
+        self.data = data
+
+    def is_failed(self) -> bool:
+        """Whether the run failed."""
+        return self._failed
+
+    def is_crashed(self) -> bool:
+        """Whether the run crashed."""
+        return False
+
+
+class _ResultRecord:
+    """Stands in for Prefect 3's `ResultRecord`, holding its result."""
+
+    def __init__(self, result: Any) -> None:
+        self.result = result
+
+
+class _PersistedResult:
+    """A result that would read from storage if asked for its value."""
+
+    def __init__(self) -> None:
+        self.storage_key = "s3://bucket/key"
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(f"read {name} from storage")
+
+
+class Test_error_detail1(unittest.TestCase):
+    """
+    Test that a failed task's exception crosses with its traceback.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the exception a Prefect 3 result record holds is sent as
+        `error_detail`, its traceback included.
+        """
+        recorder = _Recorder()
+        state = _State(True, _ResultRecord(_raised()))
+        with mock.patch.dict(sys.modules, {"prefect.context": None}):
+            cephooks.emit_task_run(
+                task="T", task_run=_TaskRun(), state=state, emitter=recorder
+            )
+        detail = recorder.sent[0]["payload"]["error_detail"]
+        self.assertEqual(detail["type"], "builtins.ValueError")
+        self.assertEqual(detail["message"], "bad row")
+        self.assertIn("_raised", detail["traceback"])
+        self.assertEqual(detail["cause"]["type"], "builtins.KeyError")
+
+    def test2(self) -> None:
+        """
+        Test that a bare exception, or one in a Prefect 2 result's cache,
+        is found too.
+        """
+
+        class Cached:
+            """Stands in for a Prefect 2 result with its value cached."""
+
+            def __init__(self, value: Any) -> None:
+                self._cache = value
+
+        for data in (_raised(), Cached(_raised())):
+            detail = cephooks.error_detail(_State(True, data))
+            assert detail is not None
+            self.assertEqual(detail["type"], "builtins.ValueError")
+
+    def test3(self) -> None:
+        """
+        Test that nothing is added for a success, a failure whose result is
+        not in memory, or a state that is not Prefect's.
+        """
+        self.assertIsNone(cephooks.error_detail(_State(False, _raised())))
+        self.assertIsNone(
+            cephooks.error_detail(_State(True, _PersistedResult()))
+        )
+        self.assertIsNone(cephooks.error_detail("S"))
+        self.assertIsNone(cephooks.error_detail(None))
+
+    def test4(self) -> None:
+        """
+        Test that a failed flow run sends its exception too, not only the
+        failed task run.
+        """
+        recorder = _Recorder()
+        state = _State(True, _ResultRecord(_raised()))
+        cephooks.emit_flow_run(
+            flow=_Flow(), flow_run=_FlowRun(), state=state, emitter=recorder
+        )
+        detail = recorder.sent[0]["payload"]["error_detail"]
+        self.assertEqual(detail["type"], "builtins.ValueError")
+        self.assertIn("_raised", detail["traceback"])
+
+    def test5(self) -> None:
+        """
+        Test that what a task returned never crosses: a state's data is the
+        customer's own, on the state and on the run's copy of it alike.
+        """
+        recorder = _Recorder()
+        task_run = _TaskRun()
+        task_run.state = _State(False, _ResultRecord("customer@example.com"))
+        with mock.patch.dict(sys.modules, {"prefect.context": None}):
+            cephooks.emit_task_run(
+                task="T",
+                task_run=task_run,
+                state=_State(False, _ResultRecord("customer@example.com")),
+                emitter=recorder,
+            )
+        sent = recorder.sent[0]
+        self.assertNotIn("customer@example.com", json.dumps(sent["payload"]))
+        self.assertIn(
+            {"path": "state.data", "reason": "excluded by name"},
+            sent["excluded"],
+        )
+
+
+# #############################################################################
+# Test_withhold_parameters1
+# #############################################################################
+
+
+# Restated for the same reason as `_API_READS_ENV`.
+_SEND_PARAMETERS_ENV = "CONVALESCE_PREFECT_SEND_PARAMETERS"
+
+
+class _ParameterisedFlow(_Flow):
+    """Stands in for a flow whose schema carries a default."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {
+            "type": "object",
+            "properties": {
+                "customer": {"type": "string", "default": "acme-corp"},
+                "limit": {"type": "integer"},
+            },
+        }
+
+
+class _ParameterisedRun(_FlowRun):
+    """Stands in for a flow run launched with customer values."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {"customer": "acme-corp", "limit": 10}
+        self.job_variables = {"env": {"DB_PASSWORD": "hunter2"}}
+
+
+class Test_withhold_parameters1(unittest.TestCase):
+    """
+    Test that a flow's parameter values stay behind unless opted in.
+    """
+
+    def _send(self, env: Dict[str, str]) -> Dict[str, Any]:
+        """
+        Fire the flow hook for a run launched with customer values.
+
+        :param env: the environment to fire it under
+        :return: the observation sent
+        """
+        recorder = _Recorder()
+        with mock.patch.dict(os.environ, env, clear=True):
+            cephooks.emit_flow_run(
+                flow=_ParameterisedFlow(),
+                flow_run=_ParameterisedRun(),
+                state="S",
+                emitter=recorder,
+            )
+        return recorder.sent[0]
+
+    def test1(self) -> None:
+        """
+        Test that by default the names and types cross, never the values.
+        """
+        sent = self._send({})
+        payload = sent["payload"]
+        self.assertEqual(
+            payload["flow_run"]["parameters"],
+            {"customer": "<str>", "limit": "<int>"},
+        )
+        schema = payload["flow"]["parameters"]["properties"]
+        self.assertEqual(schema["customer"]["default"], "<str>")
+        self.assertNotIn("default", schema["limit"])
+        self.assertNotIn("acme-corp", json.dumps(payload))
+        reason = "parameter values withheld"
+        self.assertIn(
+            {"path": "flow_run.parameters", "reason": reason}, sent["excluded"]
+        )
+        self.assertIn(
+            {
+                "path": "flow.parameters.properties.customer.default",
+                "reason": reason,
+            },
+            sent["excluded"],
+        )
+
+    def test2(self) -> None:
+        """
+        Test that opting in sends the values as they are.
+        """
+        sent = self._send({_SEND_PARAMETERS_ENV: "true"})
+        payload = sent["payload"]
+        self.assertEqual(
+            payload["flow_run"]["parameters"],
+            {"customer": "acme-corp", "limit": 10},
+        )
+        self.assertEqual(
+            payload["flow"]["parameters"]["properties"]["customer"]["default"],
+            "acme-corp",
+        )
+        self.assertNotIn(
+            "parameter values withheld",
+            [entry["reason"] for entry in sent["excluded"]],
+        )
+
+    def test3(self) -> None:
+        """
+        Test that a credential in a run's job variables never crosses, in
+        either mode.
+        """
+        for env in ({}, {_SEND_PARAMETERS_ENV: "true"}):
+            sent = self._send(env)
+            self.assertNotIn("hunter2", json.dumps(sent["payload"]))
+            self.assertIn(
+                {
+                    "path": "flow_run.job_variables.env.DB_PASSWORD",
+                    "reason": "secret redacted",
+                },
+                sent["excluded"],
+            )
+
+    def test4(self) -> None:
+        """
+        Test that the API's copy of the run is withheld the same way, and a
+        payload with no parameters anywhere is left alone.
+        """
+        body = {"api_flow_run": {"parameters": {"since": "2026-01-01"}}}
+        out, excluded = cephooks.withhold_parameters(body)
+        self.assertEqual(out["api_flow_run"]["parameters"], {"since": "<str>"})
+        self.assertEqual(
+            excluded,
+            [
+                {
+                    "path": "api_flow_run.parameters",
+                    "reason": "parameter values withheld",
+                }
+            ],
+        )
+        self.assertEqual(cephooks.withhold_parameters({"a": 1}), ({"a": 1}, []))

@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "task.cache_key_fn": "Computes a task's cache key from its inputs; it is called before the task runs and describes no state change.",
+    "task.on_commit": "A transaction hook, handed the transaction rather than the task run; the task's own completion crosses through on_completion.",
+    "task.on_rollback": "A transaction hook, as on_commit; a rolled-back task's failure crosses through on_failure.",
+    "task.retry_condition_fn": "Decides whether a failed task retries and must return a bool: a reporting hook here would switch retries off. The failure itself crosses through on_failure."
+  },
+  "fields": {
+    "Deployment": {
+      "*": "Never read: the flow run already names its deployment (deployment_id, deployment_version) and where it ran (work_pool_name, work_queue_name). The deployment record holds default parameters, job variables and pull steps, customer configuration that can carry credentials, and its schedules decode to nothing yet."
+    },
+    "WorkPool": {
+      "*": "Never read: the flow run names its pool (work_pool_id, work_pool_name). The pool's base job template is infrastructure configuration and can carry credentials."
+    }
+  },
+  "events": {
+    "artifact": "Not read. An artifact's body is customer-authored: a table artifact is rows, a markdown artifact free text, a link a URL that may be presigned. Its key and type alone decode to nothing.",
+    "automation": "Prefect Cloud automations acting on events; not a run of the customer's pipeline.",
+    "block": "A block (stored configuration, often credentials) being loaded or saved; its contents must not cross.",
+    "concurrency-limit": "Slot bookkeeping for concurrency limits; the run it gated crosses through its own hooks.",
+    "deployment": "A deployment created, updated or marked ready; configuration, not a run. The run names its deployment.",
+    "runner": "A local runner cancelling a flow run; the cancellation itself crosses through on_cancellation.",
+    "work-pool": "A work pool's status; infrastructure, not a run.",
+    "work-queue": "A work queue's status; infrastructure, not a run.",
+    "worker": "A worker submitting or finishing a flow run; the run's own hooks carry its outcome.",
+    "workspace": "The CLI moving a workspace's objects between servers; not a run."
+  }
+}

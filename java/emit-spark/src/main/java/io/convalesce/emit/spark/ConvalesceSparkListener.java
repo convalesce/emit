@@ -6,11 +6,33 @@ import org.apache.spark.SparkConf;
 import org.apache.spark.scheduler.SparkListener;
 import org.apache.spark.scheduler.SparkListenerApplicationEnd;
 import org.apache.spark.scheduler.SparkListenerApplicationStart;
+import org.apache.spark.scheduler.SparkListenerBlockManagerAdded;
+import org.apache.spark.scheduler.SparkListenerBlockManagerRemoved;
+import org.apache.spark.scheduler.SparkListenerBlockUpdated;
+import org.apache.spark.scheduler.SparkListenerEnvironmentUpdate;
 import org.apache.spark.scheduler.SparkListenerEvent;
+import org.apache.spark.scheduler.SparkListenerExecutorAdded;
+import org.apache.spark.scheduler.SparkListenerExecutorExcluded;
+import org.apache.spark.scheduler.SparkListenerExecutorExcludedForStage;
+import org.apache.spark.scheduler.SparkListenerExecutorMetricsUpdate;
+import org.apache.spark.scheduler.SparkListenerExecutorRemoved;
+import org.apache.spark.scheduler.SparkListenerExecutorUnexcluded;
 import org.apache.spark.scheduler.SparkListenerJobEnd;
 import org.apache.spark.scheduler.SparkListenerJobStart;
+import org.apache.spark.scheduler.SparkListenerNodeExcluded;
+import org.apache.spark.scheduler.SparkListenerNodeExcludedForStage;
+import org.apache.spark.scheduler.SparkListenerNodeUnexcluded;
+import org.apache.spark.scheduler.SparkListenerResourceProfileAdded;
+import org.apache.spark.scheduler.SparkListenerSpeculativeTaskSubmitted;
 import org.apache.spark.scheduler.SparkListenerStageCompleted;
+import org.apache.spark.scheduler.SparkListenerStageExecutorMetrics;
+import org.apache.spark.scheduler.SparkListenerStageSubmitted;
 import org.apache.spark.scheduler.SparkListenerTaskEnd;
+import org.apache.spark.scheduler.SparkListenerTaskGettingResult;
+import org.apache.spark.scheduler.SparkListenerTaskStart;
+import org.apache.spark.scheduler.SparkListenerUnpersistRDD;
+import org.apache.spark.scheduler.SparkListenerUnschedulableTaskSetAdded;
+import org.apache.spark.scheduler.SparkListenerUnschedulableTaskSetRemoved;
 
 /**
  * Forwards Spark's own listener events to Convalesce, unchanged.
@@ -40,6 +62,10 @@ import org.apache.spark.scheduler.SparkListenerTaskEnd;
  * it came from, and a receiver seeing two drivers at once had to guess. The id is remembered from
  * whichever event names it and stamped on every event that does not.
  *
+ * <p><b>Which values.</b> A job start carries the job's whole Spark configuration, credentials
+ * included, and Spark redacts them only on the way into its own event log. They are redacted here
+ * by the same rule before anything leaves the driver.
+ *
  * <p>Nothing may escape into the customer's job. Every override wraps its body, and a failure to
  * emit is logged and dropped.
  */
@@ -51,22 +77,27 @@ public class ConvalesceSparkListener extends SparkListener {
   private final Emitter emitter;
   private final String sparkVersion;
   private final SparkEvents events = SparkEvents.fromEnvironment();
+  private final Redaction redaction;
   // Written by the listener bus thread and read by it; volatile so a later event on another
   // thread, which Spark does not promise against, still sees it.
   private volatile String appId;
 
   /** Built by Spark when no constructor takes a SparkConf. */
   public ConvalesceSparkListener() {
-    this(new Emitter(), readSparkVersion());
+    this(SharedEmitter.emitter(), SharedEmitter.sparkVersion());
   }
 
   /**
-   * Built by Spark when {@code spark.extraListeners} names a class taking a conf.
+   * Built by Spark when {@code spark.extraListeners} names a class taking a conf, which Spark
+   * prefers.
    *
-   * @param conf the running job's configuration, unused but required by Spark's contract
+   * @param conf the running job's configuration, read for its {@code spark.redaction.regex}
    */
   public ConvalesceSparkListener(SparkConf conf) {
-    this(new Emitter(), readSparkVersion());
+    this(
+        SharedEmitter.emitter(),
+        SharedEmitter.sparkVersion(),
+        Redaction.of(conf == null ? null : conf.get(Redaction.REGEX_KEY, null)));
   }
 
   /**
@@ -76,8 +107,13 @@ public class ConvalesceSparkListener extends SparkListener {
    * @param sparkVersion the version to record on each observation
    */
   public ConvalesceSparkListener(Emitter emitter, String sparkVersion) {
+    this(emitter, sparkVersion, Redaction.of(null));
+  }
+
+  private ConvalesceSparkListener(Emitter emitter, String sparkVersion, Redaction redaction) {
     this.emitter = emitter;
     this.sparkVersion = sparkVersion;
+    this.redaction = redaction;
     if (!SparkEventJson.available()) {
       LOG.warning(
           "convalesce: this Spark has no serialiser we recognise; events will carry only their type");
@@ -138,6 +174,121 @@ public class ConvalesceSparkListener extends SparkListener {
     }
   }
 
+  // Every other callback Spark has, so that `CONVALESCE_SPARK_EVENTS` can ask for any event Spark
+  // posts: an event with a callback of its own never reaches `onOtherEvent`. Each is dropped by the
+  // default filter before it is serialised. The Blacklisted twins of the Excluded events are left
+  // out on purpose; see spark-events.yml beside the tests.
+
+  @Override
+  public void onStageSubmitted(SparkListenerStageSubmitted event) {
+    forward(event);
+  }
+
+  @Override
+  public void onTaskStart(SparkListenerTaskStart event) {
+    forward(event);
+  }
+
+  @Override
+  public void onTaskGettingResult(SparkListenerTaskGettingResult event) {
+    forward(event);
+  }
+
+  @Override
+  public void onEnvironmentUpdate(SparkListenerEnvironmentUpdate event) {
+    forward(event);
+  }
+
+  @Override
+  public void onBlockManagerAdded(SparkListenerBlockManagerAdded event) {
+    forward(event);
+  }
+
+  @Override
+  public void onBlockManagerRemoved(SparkListenerBlockManagerRemoved event) {
+    forward(event);
+  }
+
+  @Override
+  public void onUnpersistRDD(SparkListenerUnpersistRDD event) {
+    forward(event);
+  }
+
+  @Override
+  public void onExecutorMetricsUpdate(SparkListenerExecutorMetricsUpdate event) {
+    forward(event);
+  }
+
+  @Override
+  public void onStageExecutorMetrics(SparkListenerStageExecutorMetrics event) {
+    forward(event);
+  }
+
+  @Override
+  public void onExecutorAdded(SparkListenerExecutorAdded event) {
+    forward(event);
+  }
+
+  @Override
+  public void onExecutorRemoved(SparkListenerExecutorRemoved event) {
+    forward(event);
+  }
+
+  @Override
+  public void onExecutorExcluded(SparkListenerExecutorExcluded event) {
+    forward(event);
+  }
+
+  @Override
+  public void onExecutorExcludedForStage(SparkListenerExecutorExcludedForStage event) {
+    forward(event);
+  }
+
+  @Override
+  public void onNodeExcludedForStage(SparkListenerNodeExcludedForStage event) {
+    forward(event);
+  }
+
+  @Override
+  public void onExecutorUnexcluded(SparkListenerExecutorUnexcluded event) {
+    forward(event);
+  }
+
+  @Override
+  public void onNodeExcluded(SparkListenerNodeExcluded event) {
+    forward(event);
+  }
+
+  @Override
+  public void onNodeUnexcluded(SparkListenerNodeUnexcluded event) {
+    forward(event);
+  }
+
+  @Override
+  public void onBlockUpdated(SparkListenerBlockUpdated event) {
+    forward(event);
+  }
+
+  @Override
+  public void onSpeculativeTaskSubmitted(SparkListenerSpeculativeTaskSubmitted event) {
+    forward(event);
+  }
+
+  @Override
+  public void onUnschedulableTaskSetAdded(SparkListenerUnschedulableTaskSetAdded event) {
+    forward(event);
+  }
+
+  @Override
+  public void onUnschedulableTaskSetRemoved(SparkListenerUnschedulableTaskSetRemoved event) {
+    forward(event);
+  }
+
+  @Override
+  public void onResourceProfileAdded(SparkListenerResourceProfileAdded event) {
+    forward(event);
+  }
+
   /** The application this listener is reporting on, once anything has named it. */
   String applicationId() {
     return appId;
@@ -165,7 +316,7 @@ public class ConvalesceSparkListener extends SparkListener {
         return;
       }
       String json = SparkEventJson.toJson(event);
-      json = SparkEventJson.withAppId(json, remember(json));
+      json = SparkEventJson.withAppId(redaction.apply(json), remember(json));
       emitter.emit(TOOL, name, json, sparkVersion);
     } catch (Throwable t) {
       // A job must not fail because we could not report on it.
@@ -185,14 +336,5 @@ public class ConvalesceSparkListener extends SparkListener {
       appId = found;
     }
     return appId;
-  }
-
-  private static String readSparkVersion() {
-    try {
-      return org.apache.spark.package$.MODULE$.SPARK_VERSION();
-    } catch (Throwable t) {
-      // A version is a nicety, never a blocker.
-      return null;
-    }
   }
 }

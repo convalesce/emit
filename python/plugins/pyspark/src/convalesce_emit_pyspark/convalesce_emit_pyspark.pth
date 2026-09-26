@@ -1,0 +1,1 @@
+import os; exec("try:\n import convalesce_emit_pyspark\n convalesce_emit_pyspark.install()\nexcept Exception:\n pass") if os.environ.get("CONVALESCE_PYSPARK_DRIVER_HOOK", "").strip().lower() in {"1", "true", "yes", "on"} else None

@@ -30,9 +30,10 @@ HERE = Path(__file__).resolve().parent
 PYTHON_ROOT = HERE.parent
 
 # Tool name, as an envelope carries it, to the plugin's directory under
-# `plugins/` and its package name. Spark has no Python plugin, so it is not
-# here: its contract is a Phase 4 concern, forwarded through OpenLineage
-# rather than through one of these packages.
+# `plugins/` and its package name. Spark is not here: nearly everything under
+# its tool name comes from the Java listener and OpenLineage, and a capture
+# would put all of it in convalesce-emit-pyspark's contract. That package
+# sends one event, `driver_failure`, and its contract.json is kept by hand.
 _PLUGIN_DIRS = {
     "airflow": "airflow",
     "dagster": "dagster",
@@ -89,7 +90,9 @@ def load_captures(
         for row in rows:
             by_event[row["event"]] |= field_paths(row["payload"])
         for event, paths in by_event.items():
-            per_version[tool][event][version] = paths
+            # Several captures of one version (a DAG's own events beside a
+            # probe's OpenLineage ones) add up rather than replace each other.
+            per_version[tool][event].setdefault(version, set()).update(paths)
     return per_version
 
 
