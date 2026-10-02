@@ -497,6 +497,63 @@ class Test_listener_task_group1(unittest.TestCase):
         dag_run = recorder.sent[0]["payload"]["task_instance"]["dag_run"]
         self.assertEqual(dag_run["dag"], {"$ref": task["dag"]["$id"]})
 
+    @staticmethod
+    def _sent_task(group_id: Any) -> Dict[str, Any]:
+        """
+        What a failed task in a group with this id is sent as.
+
+        :param group_id: the group's id; None is the DAG's root group
+        :return: the dumped task
+        """
+
+        class Group:
+            """Stands in for an Airflow task group."""
+
+            def __init__(self) -> None:
+                self.group_id = group_id
+
+            def __str__(self) -> str:
+                return "<TaskGroup>"
+
+        class Task:
+            """Stands in for the operator the hook is about."""
+
+            def __init__(self) -> None:
+                self.task_id = "load_customers"
+                self.task_group = Group()
+
+        class TaskInstance:
+            """Stands in for the task instance Airflow passes."""
+
+            def __init__(self) -> None:
+                self.task_id = "reference.load_customers"
+                self.task = Task()
+                self.dag_run = {"run_id": "manual__1"}
+
+        recorder = _Recorder()
+        cls = cealist.build_listener_class(_FAILED_SPEC)
+        hook = getattr(cls(emitter=recorder), "on_task_instance_failed")
+        hook(None, TaskInstance(), None, None)
+        task: Dict[str, Any] = recorder.sent[0]["payload"]["task_instance"][
+            "task"
+        ]
+        return task
+
+    def test2(self) -> None:
+        """
+        Test that the group's id is sent beside its name.
+        """
+        task = self._sent_task("orders.reference")
+        self.assertEqual(task[cealist.TASK_GROUP_ID], "orders.reference")
+        self.assertEqual(task["task_group"], "<TaskGroup>")
+
+    def test3(self) -> None:
+        """
+        Test that a task in the DAG's root group is sent no group id.
+        """
+        task = self._sent_task(None)
+        self.assertNotIn(cealist.TASK_GROUP_ID, task)
+
 
 # #############################################################################
 # Test_listener_context_kwargs1

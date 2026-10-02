@@ -47,7 +47,9 @@ events; see `redact`.
 
 And one field is named rather than walked. A task belongs to a task group,
 and a task group holds its own copy of the whole DAG, so it was 40% of a
-task event and every byte of it appeared elsewhere already.
+task event and every byte of it appeared elsewhere already. The group's id,
+which the name alone does not reliably carry, is sent beside it as the
+task's `task_group_id`.
 
 `on_asset_event_emitted` does not exist before Airflow 3.2.0 (confirmed
 against the real hookspec source: absent at 3.0.x and 3.1.x, present from
@@ -133,6 +135,8 @@ _SKIP_ARGS = frozenset({"session"})
 # A task group holds the DAG it belongs to, which arrives on the task and on
 # the dag run as well, plus the group bookkeeping Airflow's UI draws with.
 _SUMMARISE = frozenset({"task_group"})
+# Where the summarised group's id goes instead, on the dumped task.
+TASK_GROUP_ID = "task_group_id"
 
 # A `PythonOperator` whose callable takes `**context` keeps what it was
 # called with in `op_kwargs` once it has run: its own kwargs and all of
@@ -309,6 +313,9 @@ def shape(
             connections = {}
         if connections:
             task_dumped["connections"] = connections
+        group_id = task_group_id(task)
+        if group_id is not None:
+            task_dumped[TASK_GROUP_ID] = group_id
     try:
         aliases = asset_aliases(task_instance)
     except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -471,6 +478,21 @@ def connection_coordinates(task: Any) -> Dict[str, Dict[str, Any]]:
             "schema": getattr(connection, "schema", None),
         }
     return out
+
+
+def task_group_id(task: Any) -> Optional[str]:
+    """
+    The id of the task group a task sits in.
+
+    :param task: the operator instance the hook named
+    :return: the group's full dotted id, or None for a task in no group
+        but the DAG's root, which has no id
+    """
+    try:
+        group_id = getattr(getattr(task, "task_group", None), "group_id", None)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    return group_id if isinstance(group_id, str) and group_id else None
 
 
 def _get_connection(conn_id: str) -> Any:
