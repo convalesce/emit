@@ -167,6 +167,7 @@ def _subclasses(cls: type) -> Set[type]:
     :return: its subclasses
     """
     out: Set[type] = set()
+    sub: type
     for sub in cls.__subclasses__():
         out.add(sub)
         out |= _subclasses(sub)
