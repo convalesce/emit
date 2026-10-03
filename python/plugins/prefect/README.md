@@ -62,6 +62,27 @@ way Prefect does.
 A failed task's hook also sends the exception and its traceback, when
 Prefect holds it in memory; a result persisted to storage is not read back.
 
+## Name a run the task started
+
+A task that starts a run in another tool, a Glue job say, can name it, and
+its task-run hook sends it as `launched` so the two runs are linked by id:
+
+```python
+from convalesce_emit_prefect import launched
+
+
+@task(on_completion=[emit_task_run], on_failure=[emit_task_run])
+def aggregate():
+    run_id = glue.start_job_run(JobName="lake_daily_agg")["JobRunId"]
+    launched("glue", run_id, job="lake_daily_agg")
+```
+
+A task that simply returns the id needs none of this: a completed task's
+result is sent as `result_text` when Prefect holds it in memory and it is a
+`str`, `int`, `float` or `bool`, or a list of at most ten of them, cut to
+200 characters. Anything else it returns is never sent. Set
+`CONVALESCE_PREFECT_SEND_RESULT=false` to send no result at all.
+
 ## Supported
 
 Prefect 2.20 and 3.x, on Python 3.9 and later. Verified on real installs:
