@@ -680,10 +680,15 @@ class Test_result_text1(unittest.TestCase):
         """
 
         class Cached:
-            """Stands in for a Prefect 2 result with its value cached."""
+            """Stands in for a Prefect 2 result, a pydantic 1 model: its
+            cached value is a declared private attribute, kept in a slot and
+            not in the instance's `__dict__`."""
+
+            __slots__ = ("_cache",)
+            __private_attributes__ = {"_cache": None}
 
             def __init__(self, value: Any) -> None:
-                self._cache = value
+                object.__setattr__(self, "_cache", value)
 
         for data in (
             _ResultRecord(_GLUE_RUN_ID),
@@ -692,6 +697,22 @@ class Test_result_text1(unittest.TestCase):
         ):
             payload = _completed_task_payload(data)
             self.assertEqual(payload["result_text"], _GLUE_RUN_ID)
+
+    def test1b(self) -> None:
+        """
+        Test that a `_cache` the class does not declare private, such as a
+        property that would load the result, is never read.
+        """
+
+        class Loads:
+            """A result whose `_cache` is a property that reads storage."""
+
+            @property
+            def _cache(self) -> str:
+                raise AssertionError("the result was loaded")
+
+        payload = _completed_task_payload(Loads())
+        self.assertNotIn("result_text", payload)
 
     def test2(self) -> None:
         """

@@ -285,6 +285,15 @@ def _held_result(data: Any) -> Any:
             fields.update(object.__getattribute__(data, store) or {})
         except (AttributeError, TypeError, ValueError):
             continue
+    # Prefect 2's results are pydantic 1 models, which keep a private
+    # attribute in neither: read it only when the class declares it private,
+    # so no property that could load the result is ever run.
+    private = getattr(type(data), "__private_attributes__", None) or {}
+    if "_cache" in private and "_cache" not in fields:
+        try:
+            fields["_cache"] = object.__getattribute__(data, "_cache")
+        except AttributeError:
+            pass
     for name in ("result", "_cache", "value"):
         if name in fields and _is_result_shape(fields[name]):
             return fields[name]
