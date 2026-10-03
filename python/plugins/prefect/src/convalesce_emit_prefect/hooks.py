@@ -18,6 +18,7 @@ Import as:
 import convalesce_emit_prefect.hooks as cephooks
 """
 
+import json
 import logging
 import os
 import re
@@ -58,6 +59,15 @@ _TASK_RUN_PAGE_BACKSTOP = 50
 # data, which never crosses -- or, on a failure, the exception, which crosses
 # as `error_detail` instead. The run objects carry their own copy of it.
 _SKIP = frozenset({"state.data", "flow_run.state.data", "task_run.state.data"})
+
+# What a task returned stays out, with one exception: a short scalar, or a
+# short list of them, is how a task that starts a run elsewhere usually hands
+# back that run's id, and the id is what links the two. It crosses as
+# `result_text`, on by default, never as the value itself.
+_SEND_RESULT_ENV = "CONVALESCE_PREFECT_SEND_RESULT"
+_RESULT_SCALARS = (str, int, float, bool)
+_RESULT_MAX_ITEMS = 10
+_RESULT_MAX_CHARS = 200
 
 # A flow's parameters are whatever launched the run typed -- a customer id, a
 # date range, a bucket -- and nothing a receiver reads. Their names and types
@@ -184,6 +194,127 @@ def _type_marker(value: Any) -> str:
     :return: its type, as `<str>`, `<int>` and so on
     """
     return f"<{type(value).__name__}>"
+
+
+# #############################################################################
+# Result text
+# #############################################################################
+
+
+def send_result() -> bool:
+    """
+    Whether a task's short scalar result crosses as `result_text`, on by
+    default.
+
+    :return: whether `CONVALESCE_PREFECT_SEND_RESULT` is not set falsy
+    """
+    raw = os.environ.get(_SEND_RESULT_ENV, "")
+    return raw.strip().lower() not in _FALSY
+
+
+def result_text(state: Any) -> Optional[str]:
+    """
+    What a completed task returned, as text, when it is short and plain.
+
+    Only a scalar (`str`, `int`, `float`, `bool`) or a list or tuple of at
+    most `_RESULT_MAX_ITEMS` of them, and only when the state already holds
+    it in memory: like `error_detail`, this never calls `state.result()`,
+    which may read the result back from the customer's storage.
+
+    :param state: the state the hook was given
+    :return: the result as text, cut to `_RESULT_MAX_CHARS`; None for
+        anything else, a state that did not complete, or a result not held
+    """
+    try:
+        is_completed = getattr(state, "is_completed", None)
+        if not callable(is_completed) or not is_completed():
+            return None
+        text = _render_result(_held_result(getattr(state, "data", None)))
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: could not read the result: %s", exc)
+        return None
+    return text[:_RESULT_MAX_CHARS] if text else None
+
+
+def _is_result_scalar(value: Any) -> bool:
+    """
+    Whether a value is one of the plain scalars a result may cross as.
+
+    The exact type, not a subclass: a subclass can render itself any way it
+    likes.
+
+    :param value: the value
+    :return: whether it is a plain `str`, `int`, `float` or `bool`
+    """
+    return type(value) in _RESULT_SCALARS
+
+
+def _is_result_shape(value: Any) -> bool:
+    """
+    Whether a value is a scalar or a short list or tuple of scalars.
+
+    :param value: the value
+    :return: whether it may cross as `result_text`
+    """
+    if _is_result_scalar(value):
+        return True
+    if type(value) in (list, tuple):
+        return len(value) <= _RESULT_MAX_ITEMS and all(
+            _is_result_scalar(item) for item in value
+        )
+    return False
+
+
+def _held_result(data: Any) -> Any:
+    """
+    The value a state's data holds in memory, without loading anything.
+
+    The data is the bare value, a Prefect 3 result record with it under
+    `result`, or a Prefect 2 result with it cached under `_cache` or, for a
+    literal result, under `value`.
+
+    :param data: `state.data`
+    :return: the value, when it may cross; None otherwise
+    """
+    if _is_result_shape(data):
+        return data
+    # As in `_held_exception`: the instance's own storage, never attributes.
+    fields: Dict[str, Any] = {}
+    for store in ("__dict__", "__pydantic_private__"):
+        try:
+            fields.update(object.__getattribute__(data, store) or {})
+        except (AttributeError, TypeError, ValueError):
+            continue
+    # Prefect 2's results are pydantic 1 models, which keep a private
+    # attribute in neither: read it only when the class declares it private,
+    # so no property that could load the result is ever run.
+    private = getattr(type(data), "__private_attributes__", None) or {}
+    if "_cache" in private and "_cache" not in fields:
+        try:
+            fields["_cache"] = object.__getattribute__(data, "_cache")
+        except AttributeError:
+            pass
+    for name in ("result", "_cache", "value"):
+        if name in fields and _is_result_shape(fields[name]):
+            return fields[name]
+    return None
+
+
+def _render_result(value: Any) -> Optional[str]:
+    """
+    A result as text.
+
+    :param value: a scalar, a list or tuple of them, or None
+    :return: a string as it is, any other scalar as `str()` gives it, a
+        list as JSON; None for None
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return json.dumps(list(value))
+    return str(value)
 
 
 # #############################################################################
@@ -504,6 +635,13 @@ def emit_task_run(
     declared = celin.take(task_run)
     if declared is not None:
         payload.setdefault("lineage", declared)
+    started = celin.take_launched(task_run)
+    if started is not None:
+        payload.setdefault("launched", started)
+    if send_result():
+        text = result_text(state)
+        if text is not None:
+            payload.setdefault("result_text", text)
     detail = error_detail(state)
     if detail is not None:
         payload.setdefault("error_detail", detail)

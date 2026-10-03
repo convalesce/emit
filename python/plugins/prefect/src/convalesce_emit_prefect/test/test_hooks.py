@@ -520,6 +520,10 @@ class _State:
         """Whether the run crashed."""
         return False
 
+    def is_completed(self) -> bool:
+        """Whether the run completed."""
+        return not self._failed
+
 
 class _ResultRecord:
     """Stands in for Prefect 3's `ResultRecord`, holding its result."""
@@ -605,17 +609,19 @@ class Test_error_detail1(unittest.TestCase):
 
     def test5(self) -> None:
         """
-        Test that what a task returned never crosses: a state's data is the
-        customer's own, on the state and on the run's copy of it alike.
+        Test that what a task returned never crosses as data: a state's data
+        is the customer's own, on the state and on the run's copy of it
+        alike. Only a short scalar crosses, as `result_text`.
         """
         recorder = _Recorder()
+        result = {"email": "customer@example.com"}
         task_run = _TaskRun()
-        task_run.state = _State(False, _ResultRecord("customer@example.com"))
+        task_run.state = _State(False, _ResultRecord(result))
         with mock.patch.dict(sys.modules, {"prefect.context": None}):
             cephooks.emit_task_run(
                 task="T",
                 task_run=task_run,
-                state=_State(False, _ResultRecord("customer@example.com")),
+                state=_State(False, _ResultRecord(result)),
                 emitter=recorder,
             )
         sent = recorder.sent[0]
@@ -624,6 +630,163 @@ class Test_error_detail1(unittest.TestCase):
             {"path": "state.data", "reason": "excluded by name"},
             sent["excluded"],
         )
+
+
+# #############################################################################
+# Test_result_text1
+# #############################################################################
+
+
+# Restated for the same reason as `_API_READS_ENV`.
+_SEND_RESULT_ENV = "CONVALESCE_PREFECT_SEND_RESULT"
+
+_GLUE_RUN_ID = "jr_" + "0123456789abcdef" * 4
+
+
+def _completed_task_payload(data: Any) -> Dict[str, Any]:
+    """
+    Fire the task hook for a task that completed holding `data`.
+
+    :param data: the state's data
+    :return: the payload sent
+    """
+    recorder = _Recorder()
+    with mock.patch.dict(sys.modules, {"prefect.context": None}):
+        cephooks.emit_task_run(
+            task="T",
+            task_run=_TaskRun(),
+            state=_State(False, data),
+            emitter=recorder,
+        )
+    payload: Dict[str, Any] = recorder.sent[0]["payload"]
+    return payload
+
+
+class Test_result_text1(unittest.TestCase):
+    """
+    Test that a task's short scalar result crosses as `result_text`.
+    """
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop(_SEND_RESULT_ENV, None)
+
+    def test1(self) -> None:
+        """
+        Test that a returned run id crosses as is, from a Prefect 3 result
+        record, a Prefect 2 cached result, or bare data.
+        """
+
+        class Cached:
+            """Stands in for a Prefect 2 result, a pydantic 1 model: its
+            cached value is a declared private attribute, kept in a slot and
+            not in the instance's `__dict__`."""
+
+            __slots__ = ("_cache",)
+            __private_attributes__ = {"_cache": None}
+
+            def __init__(self, value: Any) -> None:
+                object.__setattr__(self, "_cache", value)
+
+        for data in (
+            _ResultRecord(_GLUE_RUN_ID),
+            Cached(_GLUE_RUN_ID),
+            _GLUE_RUN_ID,
+        ):
+            payload = _completed_task_payload(data)
+            self.assertEqual(payload["result_text"], _GLUE_RUN_ID)
+
+    def test1b(self) -> None:
+        """
+        Test that a `_cache` the class does not declare private, such as a
+        property that would load the result, is never read.
+        """
+
+        class Loads:
+            """A result whose `_cache` is a property that reads storage."""
+
+            @property
+            def _cache(self) -> str:
+                raise AssertionError("the result was loaded")
+
+        payload = _completed_task_payload(Loads())
+        self.assertNotIn("result_text", payload)
+
+    def test2(self) -> None:
+        """
+        Test that other scalars and short lists are rendered as text, and
+        anything is cut to 200 characters.
+        """
+        cases = [
+            (42, "42"),
+            (True, "True"),
+            ([_GLUE_RUN_ID, 3], json.dumps([_GLUE_RUN_ID, 3])),
+            ("x" * 500, "x" * 200),
+            (["y" * 150, "z" * 150], json.dumps(["y" * 150, "z" * 150])[:200]),
+        ]
+        for value, expected in cases:
+            text = cephooks.result_text(_State(False, _ResultRecord(value)))
+            self.assertEqual(text, expected)
+
+    def test3(self) -> None:
+        """
+        Test that nothing else crosses: a mapping, an object, a long or
+        mixed list, a failed state, or a result not held in memory.
+        """
+
+        class Opaque:
+            """A customer object, whose repr is its own business."""
+
+            def __repr__(self) -> str:
+                return _GLUE_RUN_ID
+
+        class Label(str):
+            """A str subclass, which can render itself any way it likes."""
+
+        for data in (
+            _ResultRecord({"run_id": _GLUE_RUN_ID}),
+            _ResultRecord(Opaque()),
+            _ResultRecord(Label(_GLUE_RUN_ID)),
+            _ResultRecord(list(range(11))),
+            _ResultRecord([_GLUE_RUN_ID, {"a": 1}]),
+            _ResultRecord(None),
+            _PersistedResult(),
+        ):
+            payload = _completed_task_payload(data)
+            self.assertNotIn("result_text", payload)
+            self.assertNotIn(_GLUE_RUN_ID, json.dumps(payload))
+        self.assertIsNone(
+            cephooks.result_text(_State(True, _ResultRecord(_GLUE_RUN_ID)))
+        )
+        self.assertIsNone(cephooks.result_text("S"))
+
+    def test4(self) -> None:
+        """
+        Test that `CONVALESCE_PREFECT_SEND_RESULT` set falsy keeps it back.
+        """
+        for raw in ("0", "false", "FALSE"):
+            os.environ[_SEND_RESULT_ENV] = raw
+            payload = _completed_task_payload(_ResultRecord(_GLUE_RUN_ID))
+            self.assertNotIn("result_text", payload)
+        os.environ[_SEND_RESULT_ENV] = "1"
+        payload = _completed_task_payload(_ResultRecord(_GLUE_RUN_ID))
+        self.assertEqual(payload["result_text"], _GLUE_RUN_ID)
+
+    def test5(self) -> None:
+        """
+        Test that a flow run sends no `result_text`: only a task's result
+        names a run it started.
+        """
+        recorder = _Recorder()
+        cephooks.emit_flow_run(
+            flow=_Flow(),
+            flow_run=_FlowRun(),
+            state=_State(False, _ResultRecord(_GLUE_RUN_ID)),
+            emitter=recorder,
+        )
+        self.assertNotIn("result_text", recorder.sent[0]["payload"])
 
 
 # #############################################################################
