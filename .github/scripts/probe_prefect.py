@@ -6,7 +6,7 @@ whole point.
 """
 
 import prefect
-from prefect import flow
+from prefect import flow, task
 
 import convalesce_emit_prefect as cepref
 
@@ -36,5 +36,50 @@ import json
 
 size = len(json.dumps(payload, default=str))
 assert size < 100_000, f"payload was {size} bytes"
+
+# A task that starts a run elsewhere, as a customer writes it: the hooks are
+# Prefect's to call, keyword on 2.x and positional on 3.x, and the result is
+# read from the state as each version holds it in memory.
+GLUE_RUN = "jr_" + "ab" * 32
+task_sent = []
+
+
+class _TaskRecorder:
+    def emit(self, **kwargs):
+        task_sent.append(kwargs["payload"])
+
+    def flush(self):
+        pass
+
+
+def _on_task_end(task, task_run, state):
+    cepref.emit_task_run(task, task_run, state, emitter=_TaskRecorder())
+
+
+@task(on_completion=[_on_task_end])
+def start_glue_job():
+    cepref.launched("glue", GLUE_RUN, job="probe_daily_agg")
+    return GLUE_RUN
+
+
+@task(on_completion=[_on_task_end])
+def summary():
+    return {"rows": 1}
+
+
+@flow
+def launches():
+    start_glue_job()
+    summary()
+
+
+launches()
+by_task = {p["task"]["name"]: p for p in task_sent}
+started = by_task["start_glue_job"]
+assert started.get("result_text") == GLUE_RUN, sorted(started)
+assert started.get("launched") == [
+    {"platform": "glue", "run_id": GLUE_RUN, "job": "probe_daily_agg"}
+], started.get("launched")
+assert "result_text" not in by_task["summary"], by_task["summary"].get("result_text")
 
 print(f"PROBE_OK prefect {prefect.__version__} ({size} bytes)")
