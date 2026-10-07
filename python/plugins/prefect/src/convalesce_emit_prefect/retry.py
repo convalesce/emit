@@ -64,14 +64,15 @@ skipped, never claimed, fail-closed exactly as the plan's own reasoning
 requires ("a flow run with no deployment/work pool can't be rescheduled
 this way; fail closed").
 
-The credentials used to reach the Prefect API are
-`CONVALESCE_PREFECT_RETRY_API_URL`/`CONVALESCE_PREFECT_RETRY_API_KEY` --
-deliberately distinct from the ambient `PREFECT_API_KEY` the hooks read,
-and never `CONVALESCE_API_KEY`/`CONVALESCE_INGEST_KEY` (those talk to
-collect; this talks to Prefect's own API). Sent as a bearer token, which
-is genuinely how Prefect Cloud's real API authenticates -- unlike the
-Dagster and Airflow executors' own bearer-token choice, this one is not
-an assumption.
+The retry flow is a flow run like any other, so it already holds what
+reaches its own Prefect API: `PREFECT_API_URL`, and `PREFECT_API_KEY` on
+Prefect Cloud or `PREFECT_API_AUTH_STRING` on a secured server. Those are
+what is used. `CONVALESCE_PREFECT_RETRY_API_URL`,
+`CONVALESCE_PREFECT_RETRY_API_KEY` and
+`CONVALESCE_PREFECT_RETRY_AUTH_STRING` replace them one by one, for a
+deployment that wants retries to sign in as somebody else. Never the key
+that talks to collect: this talks to Prefect's own API. A key is sent as
+a bearer token, which is how Prefect Cloud's API authenticates.
 
 Import as:
 
@@ -113,6 +114,14 @@ _API_KEY_ENV = "CONVALESCE_PREFECT_RETRY_API_KEY"
 _AUTH_STRING_ENV = "CONVALESCE_PREFECT_RETRY_AUTH_STRING"
 _CLOUD_HOST_SUFFIX = "prefect.cloud"
 
+# What a flow run already holds to reach its own Prefect API. The retry flow
+# is such a run, so with nothing set for retries these are what it uses.
+_AMBIENT = {
+    _API_URL_ENV: "PREFECT_API_URL",
+    _API_KEY_ENV: "PREFECT_API_KEY",
+    _AUTH_STRING_ENV: "PREFECT_API_AUTH_STRING",
+}
+
 
 # #############################################################################
 # _RetryTarget
@@ -138,31 +147,70 @@ class _RetryTarget:
     auth_string: Optional[str] = None
 
 
+def _prefect_setting(name: str) -> Optional[str]:
+    """
+    One of Prefect's own settings, as this process holds it.
+
+    The environment first, then Prefect's settings, which also cover a
+    value that came from a profile. Imported here so this module still
+    imports where Prefect is absent.
+
+    :param name: the setting, such as `PREFECT_API_URL`
+    :return: its value, or None when it is unset or cannot be read
+    """
+    value: Any = os.environ.get(name)
+    if not value:
+        try:
+            import prefect.settings as settings  # pylint: disable=import-outside-toplevel
+
+            value = getattr(settings, name).value()
+        except Exception:  # pylint: disable=broad-exception-caught
+            return None
+    reveal = getattr(value, "get_secret_value", None)
+    if callable(reveal):
+        value = reveal()
+    text = str(value).strip() if value else ""
+    return text or None
+
+
+def _setting(name: str) -> Optional[str]:
+    """
+    A retry setting: the one set for retries, else what the flow run
+    already uses for the same thing.
+
+    :param name: the retry setting's own variable
+    :return: its value, or None when neither is set
+    """
+    own = os.environ.get(name)
+    if own and own.strip():
+        return own.strip()
+    return _prefect_setting(_AMBIENT[name])
+
+
 def _read_target() -> Optional[_RetryTarget]:
     """
-    Resolve the retry credential, failing closed on anything missing.
+    Resolve where the Prefect API is and how to sign in, failing closed
+    on anything missing.
 
-    :return: the target to call, or None when the url is unset, or it
+    :return: the target to call, or None when no address is known, or it
         is Prefect Cloud's and no key is
     """
-    url = os.environ.get(_API_URL_ENV)
-    api_key = os.environ.get(_API_KEY_ENV)
-    if not url or not url.strip():
+    url = _setting(_API_URL_ENV)
+    api_key = _setting(_API_KEY_ENV)
+    if not url:
         _LOG.warning(
-            "convalesce: %s is not set; not executing prefect retries",
+            "convalesce: neither %s nor PREFECT_API_URL is set; not "
+            "executing prefect retries",
             _API_URL_ENV,
         )
         return None
-    base_url = url.strip().rstrip("/")
-    api_key = api_key.strip() if api_key and api_key.strip() else None
-    auth_string = os.environ.get(_AUTH_STRING_ENV)
-    auth_string = (
-        auth_string.strip() if auth_string and auth_string.strip() else None
-    )
+    base_url = url.rstrip("/")
+    auth_string = _setting(_AUTH_STRING_ENV)
     host = urllib.parse.urlparse(base_url).hostname or ""
     if api_key is None and host.endswith(_CLOUD_HOST_SUFFIX):
         _LOG.warning(
-            "convalesce: %s is not set; not executing prefect retries",
+            "convalesce: neither %s nor PREFECT_API_KEY is set; not "
+            "executing prefect retries",
             _API_KEY_ENV,
         )
         return None

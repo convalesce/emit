@@ -57,6 +57,49 @@ class Test_read_target1(unittest.TestCase):
         self.assertEqual(target.base_url, "http://prefect:4200/api")
         self.assertEqual(target.api_key, "s3cret")
 
+    def test_ambient(self) -> None:
+        """
+        Test that with nothing set for retries the flow run's own Prefect
+        settings are used, and that a retry setting replaces its own one.
+        """
+        with unittest.mock.patch.dict(
+            "os.environ",
+            {
+                "PREFECT_API_URL": "https://api.prefect.cloud/api/accounts/a/workspaces/w",
+                "PREFECT_API_KEY": "ambient",
+            },
+            clear=True,
+        ):
+            target = ceprefretry._read_target()
+            assert target is not None
+            self.assertEqual(
+                (target.base_url, target.api_key),
+                (
+                    "https://api.prefect.cloud/api/accounts/a/workspaces/w",
+                    "ambient",
+                ),
+            )
+            with unittest.mock.patch.dict(
+                "os.environ", {"CONVALESCE_PREFECT_RETRY_API_KEY": "own"}
+            ):
+                target = ceprefretry._read_target()
+                assert target is not None
+                self.assertEqual(target.api_key, "own")
+
+    def test_ambient_auth_string(self) -> None:
+        """Test that a secured server's own sign-in is picked up too."""
+        with unittest.mock.patch.dict(
+            "os.environ",
+            {
+                "PREFECT_API_URL": "http://prefect:4200/api",
+                "PREFECT_API_AUTH_STRING": "admin:pass",
+            },
+            clear=True,
+        ):
+            target = ceprefretry._read_target()
+        assert target is not None
+        self.assertEqual(target.auth_string, "admin:pass")
+
     def test2(self) -> None:
         """Test that a missing url fails closed."""
         with unittest.mock.patch.dict(

@@ -1,29 +1,35 @@
 """
-Airflow retry executor: clears a claimed task instance via Airflow's own
-REST API.
+Airflow retry executor: clears a claimed task instance so the scheduler
+runs it again.
 
 Not wired into `plugin.py` or `listener.py`, and never fired just because
 the listener is registered: this is a separate, opt-in entrypoint --
-`run_pending_retries()` -- the customer schedules themselves, in their own
-cron or a small maintenance DAG, per `plan/04-retry-remedy-kind.md`'s
-Phase 4.
+`run_pending_retries()` -- the customer schedules themselves, in a small
+maintenance DAG.
 
 Fail-closed at every step, the deliberate inverse of the listener's own
 "never let a read stop the pipeline" stance: a `dag_id` this process does
 not recognize -- checked against this Airflow's own `DagBag` -- is
 skipped, never claimed, because claiming burns the tenant's single shot
-even when this process cannot act on it. Any failure calling Airflow's own
-REST API after a claim is reported back as `FAILED_TO_TRIGGER`, never
-silently retried; nothing here loops or re-claims on its own.
+even when this process cannot act on it. Any failure clearing after a
+claim is reported back as `FAILED_TO_TRIGGER`, never silently retried;
+nothing here loops or re-claims on its own.
 
-The credential used to call Airflow's REST API is
-`CONVALESCE_AIRFLOW_RETRY_TOKEN` -- an Airflow connection id, resolved via
-`BaseHook.get_connection` the same way `listener.py`'s own
-`connection_coordinates()` resolves one -- never the listener's ambient
-in-process access, and never `CONVALESCE_API_KEY`/`CONVALESCE_INGEST_KEY`
-(those talk to collect; this talks to Airflow itself).
+How a task is cleared depends on what the running Airflow lets a task do:
 
-That connection carries either an Airflow user or a ready-made token, and
+- Airflow 2 lets a task reach Airflow's own database, which is how every
+  task there already runs. The retry dag is such a task, so it clears the
+  task instance there, the same change the UI's Clear button makes. Nothing
+  has to be created or stored for it.
+- Airflow 3 gives a task no way in but Airflow's REST API, so a sign-in
+  is needed. It is kept in an Airflow connection, `convalesce_retry`
+  unless `CONVALESCE_AIRFLOW_RETRY_CONNECTION` names another, resolved
+  via `BaseHook.get_connection`, so the secret lives in Airflow's own
+  connection store. Where that connection exists on Airflow 2 it is used
+  there too, which is how a managed Airflow 2 with its own API tokens is
+  reached.
+
+The connection carries either an Airflow user or a ready-made token, and
 which one decides how the call signs in:
 
 - a login and a password: the way stock Airflow signs an API client in.
@@ -77,8 +83,11 @@ TOOL = "airflow"
 # Names an Airflow *connection id*, not a literal token -- resolved via
 # BaseHook.get_connection the same way connection_coordinates() resolves
 # one, so the actual secret lives in Airflow's own connection store, never
-# in this process's environment as plaintext.
-_RETRY_CONNECTION_ENV = "CONVALESCE_AIRFLOW_RETRY_TOKEN"
+# in this process's environment as plaintext. The older name is still
+# read: it was never a token, which is why it was renamed.
+_RETRY_CONNECTION_ENV = "CONVALESCE_AIRFLOW_RETRY_CONNECTION"
+_RETRY_CONNECTION_ENV_OLD = "CONVALESCE_AIRFLOW_RETRY_TOKEN"
+DEFAULT_RETRY_CONNECTION = "convalesce_retry"
 
 # Where Airflow 3 exchanges a user's login and password for an API token.
 _TOKEN_PATH = "/auth/token"
@@ -110,28 +119,39 @@ class _RetryTarget:
     login: Optional[str] = None
 
 
+def _named_connection() -> Optional[str]:
+    """
+    The connection id somebody set, when they set one.
+
+    :return: the id, or None when neither variable is set
+    """
+    for name in (_RETRY_CONNECTION_ENV, _RETRY_CONNECTION_ENV_OLD):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
 def _read_target() -> Optional[_RetryTarget]:
     """
-    Resolve the retry credential, failing closed on anything missing.
+    Resolve the retry sign-in, failing closed on anything missing.
 
-    :return: the target to call, or None when the connection id is unset,
-        does not resolve, or is missing a host or a password
+    :return: the target to call, or None when the connection does not
+        resolve, or is missing a host or a password
     """
-    conn_id = os.environ.get(_RETRY_CONNECTION_ENV)
-    if not conn_id or not conn_id.strip():
-        _LOG.warning(
-            "convalesce: %s is not set; not executing airflow retries",
-            _RETRY_CONNECTION_ENV,
-        )
-        return None
+    named = _named_connection()
+    conn_id = named or DEFAULT_RETRY_CONNECTION
     try:
-        connection = _get_connection(conn_id.strip())
+        connection = _get_connection(conn_id)
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        _LOG.warning(
-            "convalesce: could not resolve retry connection %s: %s",
-            conn_id,
-            exc,
-        )
+        # Without a name set, no connection is the ordinary state of an
+        # Airflow that clears in place, so it is not worth a warning.
+        if named:
+            _LOG.warning(
+                "convalesce: could not resolve retry connection %s: %s",
+                conn_id,
+                exc,
+            )
         return None
     base_url = _webserver_base_url(connection)
     token = getattr(connection, "password", None)
@@ -389,6 +409,47 @@ def _clear_task_instance(  # pylint: disable=too-many-arguments,too-many-positio
     return ref if map_index is None else f"{ref}[{map_index}]"
 
 
+def _clear_in_place(
+    *, dag_id: str, task_id: str, run_id: str, map_index: Optional[int]
+) -> str:
+    """
+    Clear one task instance in Airflow's own database, as the UI's Clear
+    button does, so the scheduler queues it again.
+
+    Only for Airflow 2, where a task can reach that database. Imported
+    here so this module still imports where Airflow is absent.
+
+    :param dag_id: the dag the task belongs to
+    :param task_id: the task to clear
+    :param run_id: the dag run the task instance belongs to
+    :param map_index: the mapped task index, when the task is mapped
+    :return: a native run reference identifying what was cleared
+    :raises RuntimeError: when no such task instance exists
+    """
+    # pylint: disable=import-outside-toplevel
+    from airflow.models import DagBag, TaskInstance
+    from airflow.models.taskinstance import clear_task_instances
+    from airflow.utils.session import create_session
+
+    with create_session() as session:
+        query = session.query(TaskInstance).filter(
+            TaskInstance.dag_id == dag_id,
+            TaskInstance.run_id == run_id,
+            TaskInstance.task_id == task_id,
+        )
+        if map_index is not None:
+            query = query.filter(TaskInstance.map_index == map_index)
+        found = query.all()
+        if not found:
+            raise RuntimeError(
+                f"no task instance {dag_id}/{run_id}/{task_id} to clear"
+            )
+        dag = DagBag(read_dags_from_db=True).get_dag(dag_id)
+        clear_task_instances(found, session, dag=dag)
+    ref = f"{dag_id}/{run_id}/{task_id}"
+    return ref if map_index is None else f"{ref}[{map_index}]"
+
+
 # #############################################################################
 # run_pending_retries
 # #############################################################################
@@ -401,7 +462,7 @@ class RetryRunSummary:
 
     :param considered: airflow-tool candidates collect listed
     :param claimed: candidates this process actually claimed
-    :param triggered: claimed candidates Airflow's API cleared
+    :param triggered: claimed candidates that were cleared
     :param failed: claimed candidates whose clear call failed
     :param skipped: candidates left alone -- out of local scope, missing
         or malformed coordinates, no retry credential, or lost the claim
@@ -448,7 +509,8 @@ def run_pending_retries(  # pylint: disable=too-many-locals
         environment when not given
     :param owner: identifies this process's claims to a human debugging a
         stuck remedy later; this host's name when not given
-    :param timeout: seconds to wait on each Airflow REST call
+    :param timeout: seconds to wait on each Airflow REST call, where the
+        REST API is how this Airflow is cleared
     :return: a summary of what happened
     """
     cfg = config or cemit.Config.from_env()
@@ -457,22 +519,36 @@ def run_pending_retries(  # pylint: disable=too-many-locals
     if not candidates:
         return RetryRunSummary(considered=considered)
 
-    target = _read_target()
-    if target is None:
-        return RetryRunSummary(considered=considered, skipped=considered)
-
     major = _airflow_major_version()
-    # Signed in once, and before anything is claimed: a claim is a single
-    # shot, and it is not spent on a sign-in that was never going to work.
-    try:
-        authorization = _authorization(target, major, timeout)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        _LOG.warning(
-            "convalesce: could not sign in to Airflow's API; not executing "
-            "airflow retries: %s",
-            exc,
-        )
-        return RetryRunSummary(considered=considered, skipped=considered)
+    target = _read_target()
+    authorization: Optional[str] = None
+    if target is None:
+        # A connection somebody named and that does not resolve is a
+        # mistake to report, not a reason to clear another way.
+        if (
+            _named_connection()
+            or major is None
+            or major >= _FIRST_MAJOR_WITH_TOKENS
+        ):
+            _LOG.warning(
+                "convalesce: no usable Airflow connection %s; not executing "
+                "airflow retries",
+                _named_connection() or DEFAULT_RETRY_CONNECTION,
+            )
+            return RetryRunSummary(considered=considered, skipped=considered)
+    else:
+        # Signed in once, and before anything is claimed: a claim is a
+        # single shot, and it is not spent on a sign-in that was never
+        # going to work.
+        try:
+            authorization = _authorization(target, major, timeout)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _LOG.warning(
+                "convalesce: could not sign in to Airflow's API; not "
+                "executing airflow retries: %s",
+                exc,
+            )
+            return RetryRunSummary(considered=considered, skipped=considered)
     claim_owner = owner or _default_owner()
     claimed = triggered = failed = skipped = 0
     for candidate in candidates:
@@ -510,16 +586,24 @@ def run_pending_retries(  # pylint: disable=too-many-locals
             continue
         claimed += 1
         try:
-            native_ref = _clear_task_instance(
-                target,
-                major,
-                dag_id=dag_id,
-                task_id=task_id,
-                run_id=run_id,
-                map_index=map_index,
-                timeout=timeout,
-                authorization=authorization,
-            )
+            if target is None:
+                native_ref = _clear_in_place(
+                    dag_id=dag_id,
+                    task_id=task_id,
+                    run_id=run_id,
+                    map_index=map_index,
+                )
+            else:
+                native_ref = _clear_task_instance(
+                    target,
+                    major,
+                    dag_id=dag_id,
+                    task_id=task_id,
+                    run_id=run_id,
+                    map_index=map_index,
+                    timeout=timeout,
+                    authorization=authorization,
+                )
         except Exception as exc:  # pylint: disable=broad-exception-caught
             _LOG.warning(
                 "convalesce: could not clear %s/%s: %s", dag_id, task_id, exc
