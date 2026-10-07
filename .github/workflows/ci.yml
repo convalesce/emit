@@ -34,7 +34,7 @@ jobs:
           max-line-length = 81
           doctests = True
           ignore = W503,W504,E203,E266,E501,E731,E265
-          exclude = .git,.venv,build,dist
+          exclude = .git,.venv,build,dist,_vendored
           EOF
           cat > .isort.cfg <<'EOF'
           [settings]
@@ -42,6 +42,7 @@ jobs:
           treat_all_comments_as_code=True
           line_length=81
           profile=black
+          skip_glob=**/_vendored/**
           EOF
           cat > mypy.ini <<'EOF'
           [mypy]
@@ -57,10 +58,12 @@ jobs:
           allow_redefinition = True
           follow_imports = silent
           ignore_missing_imports = True
+          exclude = /_vendored/
           EOF
           cat > .pylintrc <<'EOF'
           [MAIN]
           jobs = 4
+          ignore = _vendored
           [FORMAT]
           max-line-length = 100
           [BASIC]

@@ -68,6 +68,8 @@ import functools
 import importlib
 import inspect
 import logging
+import os
+import re
 from typing import (
     Any,
     Callable,
@@ -82,6 +84,8 @@ from typing import (
 )
 
 import convalesce_emit as cemit
+import convalesce_emit.source as cesource
+import convalesce_emit.sqlcapture as cesqlcap
 
 _LOG = logging.getLogger(__name__)
 
@@ -236,7 +240,14 @@ class _Base:
         if emitter is None:
             return
         try:
+            if event == _RUNNING:
+                # From here until the task ends, the SQL it runs is noted.
+                watch_sql()
             shaped, excluded = shape(payload)
+            if event in _ENDED:
+                noted = cesqlcap.drain()
+                if noted:
+                    shaped["sql_capture"] = cemit.redact_secrets(noted)[0]
             emitter.emit(
                 tool=TOOL,
                 event=event,
@@ -267,6 +278,85 @@ class _Base:
             self._emitter.flush()
 
 
+_RUNNING = "on_task_instance_running"
+_ENDED = frozenset({"on_task_instance_success", "on_task_instance_failed"})
+_FALSY = frozenset({"0", "false", "no", "off"})
+# What a task was called with. Sent unless `CONVALESCE_SEND_ARGUMENTS` is off.
+_ARGUMENT_PATHS = frozenset(
+    {
+        "task_instance.task.op_args",
+        "task_instance.task.op_kwargs",
+        "task_instance.task.params",
+        "task_instance.task.templates_dict",
+        "task_instance.task.parameters",
+        "task_instance.dag_run.conf",
+        "dag_run.conf",
+    }
+)
+# Tables of Airflow's own database, as its ORM names them in the SQL it
+# writes: a task process reads and writes these for itself on Airflow 2.
+_OWN_TABLES = re.compile(
+    r"\b(task_instance|dag_run|xcom|serialized_dag|dag_code|dag_pickle|"
+    r"rendered_task_instance_fields|task_reschedule|task_fail|slot_pool|"
+    r"log_template|import_error|dataset_event|dataset_dag_run_queue|"
+    r"asset_event|callback_request|ab_user|ab_role)\b",
+    re.IGNORECASE,
+)
+_WATCH: Dict[str, Any] = {}
+
+
+def send_arguments() -> bool:
+    """
+    Whether what a task was called with may be sent.
+
+    :return: False only when `CONVALESCE_SEND_ARGUMENTS` says so
+    """
+    return (
+        os.environ.get("CONVALESCE_SEND_ARGUMENTS", "").strip().lower()
+        not in _FALSY
+    )
+
+
+def _own_statement(row: Mapping[str, Any]) -> bool:
+    """
+    Whether a statement is Airflow talking to its own database.
+
+    :param row: what was noted about the statement
+    :return: True for the metadata database's engine, and for SQL over
+        Airflow's own tables seen at the driver, where there is no engine
+        to tell by
+    """
+    url = row.get("url")
+    if url is not None:
+        return bool(url == _WATCH.get("metadata_url"))
+    return bool(_OWN_TABLES.search(str(row.get("statement") or "")))
+
+
+def watch_sql() -> None:
+    """
+    Start noting the SQL the task runs, leaving out Airflow's own.
+
+    :return: nothing
+    """
+    if not _WATCH:
+        _WATCH["on"] = True
+        try:
+            from airflow import (
+                settings,  # pylint: disable=import-outside-toplevel
+            )
+
+            engine = getattr(settings, "engine", None)
+            if engine is not None:
+                _WATCH["metadata_url"] = engine.url.render_as_string(
+                    hide_password=True
+                )
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        cesqlcap.ignore(_own_statement)
+        cesqlcap.install()
+    cesqlcap.start()
+
+
 def shape(
     payload: Mapping[str, Any],
 ) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
@@ -283,10 +373,10 @@ def shape(
     :param payload: the hook's own arguments
     :return: what to send, and everything left out of it, by path and reason
     """
-    budget = cemit.new_budget(
-        summarise=_SUMMARISE,
-        skip=frozenset(f"{_OP_KWARGS}.{key}" for key in context_keys()),
-    )
+    skip = {f"{_OP_KWARGS}.{key}" for key in context_keys()}
+    if not send_arguments():
+        skip.update(_ARGUMENT_PATHS)
+    budget = cemit.new_budget(summarise=_SUMMARISE, skip=frozenset(skip))
     out = {
         name: cemit.dump(value, budget=budget, path=name)
         for name, value in payload.items()
@@ -326,6 +416,11 @@ def shape(
         group_id = task_group_id(task)
         if group_id is not None:
             task_dumped[TASK_GROUP_ID] = group_id
+        # The callable itself crosses as `<function f at 0x...>`, which says
+        # nothing. Its text is what ran, whatever the repository says.
+        source = cesource.of(getattr(task, "python_callable", None))
+        if source is not None:
+            task_dumped["source"] = source
     try:
         aliases = asset_aliases(task_instance)
     except Exception as exc:  # pylint: disable=broad-exception-caught
