@@ -16,6 +16,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
+import convalesce_emit_dagster.steps as cedsteps
 from convalesce_emit_dagster.retry import RETRY_JOB_NAME
 
 _LOG = logging.getLogger(__name__)
@@ -114,6 +115,9 @@ METADATA_ALLOWED = frozenset(
         "dagster_dbt/failed_row_count",
         "size_in_bytes",
         "dagster/code_version",
+        # Which file and line an asset is defined at, or its link in a
+        # repository: where to look for the code, never the code's data.
+        "dagster/code_references",
         "convalesce_urn",
         "datahub_urn",
         "dagster/column_schema",
@@ -214,6 +218,9 @@ def _sensor(
     target = emitter or cemit.Emitter()
     if run is not None:
         parts.update(reach_instance(context, run))
+        steps = cedsteps.describe(context, run, parts.get("step_stats"))
+        if steps:
+            parts["steps"] = steps
     groups = asset_group_names(context)
     if groups:
         parts["asset_group_names"] = groups
@@ -236,6 +243,8 @@ def _sensor(
             key: _allowed_metadata(entry) if isinstance(entry, dict) else entry
             for key, entry in body["asset_metadata"].items()
         }
+    if not cedsteps.arguments_enabled():
+        excluded = excluded + _without_run_config(body)
     for name in _EVENT_CARRIERS:
         if isinstance(body, dict) and name in body:
             events, withheld = redact_metadata(body[name], name)
@@ -254,6 +263,20 @@ def _sensor(
         excluded=excluded + secrets,
     )
     target.flush()
+
+
+def _without_run_config(body: Any) -> List[Dict[str, str]]:
+    """
+    Take the run's configuration out, where arguments are not to be sent.
+
+    :param body: the dumped payload, changed in place
+    :return: what was left out, by path and reason
+    """
+    run = body.get("dagster_run") if isinstance(body, dict) else None
+    if not isinstance(run, dict) or "run_config" not in run:
+        return []
+    del run["run_config"]
+    return [{"path": "dagster_run.run_config", "reason": "arguments not sent"}]
 
 
 def redact_metadata(value: Any, path: str) -> Tuple[Any, List[Dict[str, str]]]:

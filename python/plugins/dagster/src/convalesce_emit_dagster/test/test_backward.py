@@ -201,7 +201,10 @@ def _metadata_field_names(contract: Set[str]) -> Set[str]:
     The value-class fields a forwarded metadata entry has crossed with.
 
     A metadata value crosses as `...metadata.<key>.<field>`: its class is
-    not sent, only its fields, so a type is judged by those.
+    not sent, only its fields, so a type is judged by those. What an asset
+    was declared with crosses the same way under its asset key, as
+    `asset_metadata.<asset>.<key>.<field>`; an asset key may itself hold
+    dots, so there the entry is told by its key being an allowed one.
 
     :param contract: the contract's paths
     :return: the field names found one level under a metadata key
@@ -212,6 +215,12 @@ def _metadata_field_names(contract: Set[str]) -> Set[str]:
         for i, part in enumerate(parts[:-2]):
             if part == "metadata" and i + 3 == len(parts):
                 out.add(parts[-1])
+        if (
+            len(parts) >= 4
+            and parts[0] == "asset_metadata"
+            and parts[-2] in cedsens.METADATA_ALLOWED
+        ):
+            out.add(parts[-1])
     return out
 
 
