@@ -806,9 +806,9 @@ class _ConnectSession:
     conf = types.SimpleNamespace(get=lambda _key: "Databricks Shell")
 
     @classmethod
-    def getActiveSession(
+    def getActiveSession(  # pylint: disable=invalid-name
         cls,
-    ) -> "_ConnectSession":  # pylint: disable=invalid-name
+    ) -> "_ConnectSession":
         """The session, as PySpark names it."""
         return cls()
 
