@@ -286,6 +286,16 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(type(self).body)
 
+    def do_GET(self) -> None:  # pylint: disable=invalid-name
+        """Record one GET and answer with the configured response."""
+        type(self).requests.append(
+            {"path": self.path, "headers": dict(self.headers), "body": None}
+        )
+        self.send_response(type(self).status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(type(self).body)
+
     def log_message(self, *_args: Any) -> None:
         """Silence the default stderr logging."""
 
@@ -344,7 +354,7 @@ class Test_clear_task_instance1(_ServerCase):
             {
                 "dry_run": False,
                 "only_failed": False,
-                "reset_dag_runs": False,
+                "reset_dag_runs": True,
                 "dag_run_id": "manual__1",
                 "task_ids": ["load"],
             },
@@ -767,6 +777,9 @@ class Test_run_pending_retries_in_place1(unittest.TestCase):
                 cealretry, "_dag_exists_locally", return_value=True
             ),
             unittest.mock.patch.object(
+                cealretry, "_dag_exists_over_api", return_value=True
+            ),
+            unittest.mock.patch.object(
                 cealretry, "_authorization", return_value="Bearer t"
             ),
             unittest.mock.patch.object(
@@ -849,6 +862,9 @@ class Test_run_pending_retries_in_place1(unittest.TestCase):
             unittest.mock.patch.object(
                 cealretry, "_dag_exists_locally", return_value=True
             ),
+            unittest.mock.patch.object(
+                cealretry, "_dag_exists_over_api", return_value=True
+            ),
             unittest.mock.patch.object(ceretry, "claim", return_value=True),
             unittest.mock.patch.object(ceretry, "report_outcome") as report,
             unittest.mock.patch.object(
@@ -860,3 +876,93 @@ class Test_run_pending_retries_in_place1(unittest.TestCase):
         self.assertEqual(
             report.call_args.kwargs["outcome"], ceretry.FAILED_TO_TRIGGER
         )
+
+
+class Test_dag_exists_over_api1(_ServerCase):
+    """
+    Test the question Airflow 3 is asked instead of its database.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a dag the API knows is ours, asked for by its own path
+        with the sign-in already worked out.
+        """
+        _Recorder.status = 200
+        self.assertTrue(
+            cealretry._dag_exists_over_api(
+                self._target, "orders", "Bearer abc", 2.0
+            )
+        )
+        request = _Recorder.requests[0]
+        self.assertEqual(request["path"], "/api/v2/dags/orders")
+        self.assertEqual(request["headers"]["Authorization"], "Bearer abc")
+
+    def test2(self) -> None:
+        """
+        Test that a dag the API does not know, and an API that cannot be
+        asked, are both not ours.
+        """
+        _Recorder.status = 404
+        with self.assertLogs("convalesce_emit_airflow.retry", level="WARNING"):
+            self.assertFalse(
+                cealretry._dag_exists_over_api(
+                    self._target, "nope", "Bearer abc", 2.0
+                )
+            )
+        gone = cealretry._RetryTarget(base_url="http://127.0.0.1:1", token="t")
+        with self.assertLogs("convalesce_emit_airflow.retry", level="WARNING"):
+            self.assertFalse(
+                cealretry._dag_exists_over_api(gone, "orders", "Bearer abc", 1.0)
+            )
+
+
+class Test_run_pending_retries_on_three1(unittest.TestCase):
+    """
+    Test that Airflow 3 is asked through its API whether a dag is ours,
+    and Airflow 2 through its own dag bag.
+    """
+
+    def _run(self, major: int) -> Any:
+        candidate = _candidate(dag_id="orders", task_id="load", run_id="r1")
+        with (
+            unittest.mock.patch.object(
+                ceretry, "list_pending", return_value=[candidate]
+            ),
+            unittest.mock.patch.object(
+                cealretry,
+                "_read_target",
+                return_value=cealretry._RetryTarget(
+                    base_url="http://af", token="t"
+                ),
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_airflow_major_version", return_value=major
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_authorization", return_value="Bearer t"
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_dag_exists_over_api", return_value=True
+            ) as over_api,
+            unittest.mock.patch.object(
+                cealretry, "_dag_exists_locally", return_value=True
+            ) as locally,
+            unittest.mock.patch.object(ceretry, "claim", return_value=True),
+            unittest.mock.patch.object(ceretry, "report_outcome"),
+            unittest.mock.patch.object(
+                cealretry, "_clear_task_instance", return_value="orders/r1/load"
+            ),
+        ):
+            cealretry.run_pending_retries(config=cemit.Config())
+        return over_api, locally
+
+    def test1(self) -> None:
+        over_api, locally = self._run(3)
+        over_api.assert_called_once()
+        locally.assert_not_called()
+
+    def test2(self) -> None:
+        over_api, locally = self._run(2)
+        locally.assert_called_once()
+        over_api.assert_not_called()

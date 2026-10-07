@@ -95,6 +95,7 @@ _FIRST_MAJOR_WITH_TOKENS = 3
 
 _CLEAR_PATH_V1 = "/api/v1/dags/{dag_id}/clearTaskInstances"
 _CLEAR_PATH_V2 = "/api/v2/dags/{dag_id}/clearTaskInstances"
+_DAG_PATH_V2 = "/api/v2/dags/{dag_id}"
 
 
 # #############################################################################
@@ -297,6 +298,46 @@ def _dag_exists_locally(dag_id: str) -> bool:
         return False
 
 
+def _dag_exists_over_api(
+    target: _RetryTarget, dag_id: str, authorization: str, timeout: float
+) -> bool:
+    """
+    Whether this Airflow's REST API knows a dag id.
+
+    What Airflow 3 leaves a task to ask with: it has no way into the
+    database, so `_dag_exists_locally` cannot answer there.
+
+    :param target: where this Airflow's REST API is
+    :param dag_id: the dag id a candidate names
+    :param authorization: the Authorization header already worked out
+    :param timeout: seconds to wait on the request
+    :return: True only on a 200; False on a 404 and on anything that
+        means it could not be asked, for the same reason
+        `_dag_exists_locally` answers False when it cannot tell
+    """
+    url = target.base_url + _DAG_PATH_V2.format(
+        dag_id=urllib.parse.quote(dag_id, safe="")
+    )
+    request = urllib.request.Request(  # nosec B310
+        url,
+        headers={
+            "Authorization": authorization,
+            "User-Agent": f"convalesce-emit-airflow/{ceairflowver.__version__}",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(  # nosec B310
+            request, timeout=timeout
+        ) as response:
+            return bool(response.status == 200)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.warning(
+            "convalesce: could not ask Airflow about dag %s: %s", dag_id, exc
+        )
+        return False
+
+
 def _parse_map_index(raw: Optional[str]) -> Tuple[bool, Optional[int]]:
     """
     Read a coordinate's `map_index`, when there is one.
@@ -377,7 +418,10 @@ def _clear_task_instance(  # pylint: disable=too-many-arguments,too-many-positio
     body = {
         "dry_run": False,
         "only_failed": False,
-        "reset_dag_runs": False,
+        # A failed task leaves its run failed, and the scheduler queues
+        # nothing in a run that has ended: the run has to be set going again
+        # for the cleared task to be picked up, as the UI's Clear does.
+        "reset_dag_runs": True,
         "dag_run_id": run_id,
         "task_ids": task_ids,
     }
@@ -572,7 +616,17 @@ def run_pending_retries(  # pylint: disable=too-many-locals
             )
             skipped += 1
             continue
-        if not _dag_exists_locally(dag_id):
+        # Airflow 3 gives a task no database to look in, so there the same
+        # question goes to the API it is already signed in to.
+        ours = (
+            _dag_exists_over_api(target, dag_id, authorization, timeout)
+            if target is not None
+            and authorization is not None
+            and major is not None
+            and major >= _FIRST_MAJOR_WITH_TOKENS
+            else _dag_exists_locally(dag_id)
+        )
+        if not ours:
             _LOG.info(
                 "convalesce: dag %s is not local to this process; leaving "
                 "retry %s to whoever owns it",

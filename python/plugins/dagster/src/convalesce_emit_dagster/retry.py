@@ -124,15 +124,16 @@ mutation($reexecutionParams: ReexecutionParams) {
         status
       }
     }
-    ... on RunNotFoundError {
-      message
-    }
     ... on PythonError {
       message
     }
   }
 }
 """
+# Only types this mutation can answer with may be named in it: Dagster
+# refuses the whole request, with a 400, for a fragment on any other type.
+# `RunNotFoundError` is one it cannot answer with, and naming it here once
+# made every re-execution fail. Any other answer is told by its type name.
 
 
 # #############################################################################
