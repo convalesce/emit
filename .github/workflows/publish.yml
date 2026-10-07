@@ -1,4 +1,4 @@
-# The release. A tag `vX.Y.Z` on main publishes the five Python packages to
+# The release. A tag `vX.Y.Z` on main publishes the six Python packages to
 # PyPI and the two jars to Maven Central, after the tag is checked against
 # every version the tree declares: a tag that disagrees with a package
 # publishes nothing.
@@ -20,6 +20,10 @@ on:
         description: "Upload to TestPyPI instead of PyPI"
         type: boolean
         default: true
+      python_only:
+        description: "Leave Maven Central out (a package that missed a release)"
+        type: boolean
+        default: false
 
 jobs:
   check-version:
@@ -76,15 +80,13 @@ jobs:
         include:
           # One GitHub environment per package, because PyPI allows one
           # pending publisher per owner, repository, workflow and
-          # environment: five packages cannot share `pypi` until they exist.
+          # environment: six packages cannot share `pypi` until they exist.
           - { package: convalesce-emit, dir: ".", env: "" }
           - { package: convalesce-emit-airflow, dir: plugins/airflow, env: "-airflow" }
           - { package: convalesce-emit-dagster, dir: plugins/dagster, env: "-dagster" }
           - { package: convalesce-emit-prefect, dir: plugins/prefect, env: "-prefect" }
           - { package: convalesce-emit-gx, dir: plugins/gx, env: "-gx" }
-          # convalesce-emit-pyspark ships from the next release: uncomment once
-          # its pending publisher and `pypi-pyspark` environment exist.
-          # - { package: convalesce-emit-pyspark, dir: plugins/pyspark, env: "-pyspark" }
+          - { package: convalesce-emit-pyspark, dir: plugins/pyspark, env: "-pyspark" }
     name: ${{ matrix.package }}
     environment: ${{ inputs.rehearse && 'testpypi' || 'pypi' }}${{ matrix.env }}
     permissions:
@@ -115,7 +117,7 @@ jobs:
     needs: check-version
     # On a tag, and on a manual run that is not a rehearsal: Central has no
     # test index, so a rehearsal never touches it.
-    if: github.event_name == 'push' || !inputs.rehearse
+    if: github.event_name == 'push' || (!inputs.rehearse && !inputs.python_only)
     runs-on: ubuntu-latest
     environment: maven-central
     steps:
