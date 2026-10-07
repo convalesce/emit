@@ -303,6 +303,9 @@ _OWN_TABLES = re.compile(
     re.IGNORECASE,
 )
 _WATCH: Dict[str, Any] = {}
+# Set on the function this module puts in a hook's place, so it is put there
+# once.
+_NOTING = "convalesce_noting"
 
 
 def send_arguments() -> bool:
@@ -354,7 +357,54 @@ def watch_sql() -> None:
             pass
         cesqlcap.ignore(_own_statement)
         cesqlcap.install()
+        watch_hooks()
     cesqlcap.start()
+
+
+def watch_hooks() -> None:
+    """
+    Note what Airflow's own database hooks run.
+
+    Every hook built on `DbApiHook` runs a statement through its
+    `_run_command`, whatever driver is underneath. That is a surer place to
+    stand than the driver: a driver written in C cannot be wrapped at all,
+    and one imported before this plugin has already handed out the
+    function this would have replaced. A statement seen here and again at
+    the driver is kept once.
+
+    :return: nothing
+    """
+    try:
+        from airflow.providers.common.sql.hooks.sql import (  # pylint: disable=import-outside-toplevel
+            DbApiHook,
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        return
+    original = getattr(DbApiHook, "_run_command", None)
+    if original is None or getattr(original, _NOTING, False):
+        return
+
+    def noted(
+        self: Any, cur: Any, sql_statement: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        cesqlcap.record(
+            sql_statement,
+            # The hook's class says which database: `PostgresHook`,
+            # `SnowflakeHook`. Its connection type says the same where set.
+            dialect=str(getattr(self, "conn_type", None) or type(self).__name__),
+            database=_text(getattr(self, "database", None)),
+            schema=_text(getattr(self, "schema", None)),
+            via="airflow_hook",
+        )
+        return original(self, cur, sql_statement, *args, **kwargs)
+
+    setattr(noted, _NOTING, True)
+    DbApiHook._run_command = noted  # type: ignore[method-assign]  # pylint: disable=protected-access
+
+
+def _text(value: Any) -> Optional[str]:
+    """A value that is text, else nothing."""
+    return value if isinstance(value, str) and value else None
 
 
 def shape(
