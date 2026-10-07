@@ -10,7 +10,7 @@ subprojects {
   apply plugin: 'com.diffplug.spotless'
 
   group = 'io.convalesce'
-  version = '0.1.8'
+  version = '0.2.0'
   // Artifact ids carry the product name; the Gradle project names do not have to.
   base.archivesName = "convalesce-${project.name}"
 
@@ -64,24 +64,28 @@ subprojects {
         // published is io.convalesce:emit-spark while every doc says
         // io.convalesce:convalesce-emit-spark.
         artifactId = "convalesce-${project.name}"
-        pom {
+      }
+    }
+    // Every publication, including the ones a project adds beside `maven`: Central refuses a pom
+    // without these.
+    publications.withType(MavenPublication).configureEach {
+      pom {
+        url = 'https://github.com/convalesce/emit'
+        licenses {
+          license {
+            name = 'Apache License, Version 2.0'
+            url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+          }
+        }
+        developers {
+          developer {
+            name = 'Convalesce'
+          }
+        }
+        scm {
           url = 'https://github.com/convalesce/emit'
-          licenses {
-            license {
-              name = 'Apache License, Version 2.0'
-              url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
-            }
-          }
-          developers {
-            developer {
-              name = 'Convalesce'
-            }
-          }
-          scm {
-            url = 'https://github.com/convalesce/emit'
-            connection = 'scm:git:https://github.com/convalesce/emit.git'
-            developerConnection = 'scm:git:ssh://git@github.com/convalesce/emit.git'
-          }
+          connection = 'scm:git:https://github.com/convalesce/emit.git'
+          developerConnection = 'scm:git:ssh://git@github.com/convalesce/emit.git'
         }
       }
     }
@@ -112,6 +116,12 @@ subprojects {
     if (signingKey) {
       useInMemoryPgpKeys(signingKey, signingPassword)
     }
-    sign publishing.publications.maven
+    sign publishing.publications
+  }
+
+  // Publications that share a jar share its signature file too, and Gradle refuses to run one
+  // publication's upload beside another's signing unless told the order.
+  tasks.withType(AbstractPublishToMaven).configureEach {
+    mustRunAfter tasks.withType(Sign)
   }
 }

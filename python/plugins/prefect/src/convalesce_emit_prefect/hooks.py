@@ -13,6 +13,9 @@ to. Prefect puts both on the run context while a task hook runs, so they are
 read from there and sent alongside. The import of that context is late and
 guarded, so this module still imports where Prefect is absent.
 
+A run also says what it ran: the source of the flow's or task's function,
+what it was called with, and the SQL it sent, read by `_capture`.
+
 Import as:
 
 import convalesce_emit_prefect.hooks as cephooks
@@ -25,6 +28,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
+import convalesce_emit_prefect._capture as cecap
 import convalesce_emit_prefect._lineage as celin
 
 _LOG = logging.getLogger(__name__)
@@ -69,9 +73,23 @@ _RESULT_SCALARS = (str, int, float, bool)
 _RESULT_MAX_ITEMS = 10
 _RESULT_MAX_CHARS = 200
 
+# Prefect 3.8 keeps a task's source on the task itself, where it crosses
+# with everything else the task carries. With source switched off it must
+# not: the switch means the text stays behind, wherever it was found.
+_SOURCE_PATHS = frozenset({"task.source_code"})
+SOURCE = "source"
+SQL = "sql_capture"
+DEPLOYMENT = "api_deployment"
+# All of a deployment that is read. The record also holds default
+# parameters, job variables and pull steps: configuration, some of it
+# credentials, and none of it says what ran.
+_DEPLOYMENT_FIELDS = ("id", "name", "entrypoint", "path")
+
 # A flow's parameters are whatever launched the run typed -- a customer id, a
-# date range, a bucket -- and nothing a receiver reads. Their names and types
-# cross; their values only when a customer opts in.
+# date range, a bucket -- and often the reason a run failed. They cross with
+# their values, as a task's arguments do, unless `CONVALESCE_SEND_ARGUMENTS`
+# is off; then only their names and types cross. This older setting, where
+# it is set at all, decides for the flow's parameters alone, either way.
 _SEND_PARAMETERS_ENV = "CONVALESCE_PREFECT_SEND_PARAMETERS"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _PARAMETER_VALUES = (("flow_run", "parameters"), ("api_flow_run", "parameters"))
@@ -89,10 +107,13 @@ _CLOUD_URL_RE = re.compile(
 )
 
 
-def _emit(
+def _emit(  # pylint: disable=too-many-arguments
     event: str,
     payload: Dict[str, Any],
     emitter: Optional[cemit.EmitterLike] = None,
+    *,
+    subject: str = "",
+    cut: Optional[List[Dict[str, str]]] = None,
 ) -> None:
     """
     Send one Prefect event.
@@ -100,17 +121,28 @@ def _emit(
     :param event: which hook fired
     :param payload: Prefect's own objects
     :param emitter: emitter to send through
+    :param subject: which of the payload's objects the event is about,
+        `flow` or `task`; its function's source is sent with it
+    :param cut: what the caller already left out of the payload, by path
+        and reason
     :return: nothing
     """
     try:
         payload = {**payload, **api_state(payload)}
-        budget = cemit.new_budget(skip=_SKIP)
+        skip = _SKIP if cecap.send_source() else _SKIP | _SOURCE_PATHS
+        budget = cemit.new_budget(skip=skip)
         dumped = cemit.dump(payload, budget=budget)
-        withheld: List[Dict[str, str]] = []
-        if not send_parameters():
+        source = cecap.source_of(payload.get(subject))
+        if source is not None and isinstance(dumped.get(subject), dict):
+            dumped[subject][SOURCE] = source
+        if send_parameters():
+            dumped, withheld = bound_parameters(dumped)
+        else:
             dumped, withheld = withhold_parameters(dumped)
-        # A run's job variables and, when sent, its parameters are whatever
-        # launched it typed, and either can hold a literal credential.
+        withheld = list(cut or []) + withheld
+        # A run's job variables, its parameters and a task's arguments are
+        # whatever launched it typed, and any can hold a literal credential;
+        # so can a statement that creates a user or a connection.
         dumped, secrets = cemit.redact_secrets(dumped)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         # A Prefect hook that raises is logged by Prefect as the flow's own
@@ -134,12 +166,37 @@ def _emit(
 
 def send_parameters() -> bool:
     """
-    Whether flow parameter values cross, off by default.
+    Whether flow parameter values cross, on by default.
 
-    :return: whether `CONVALESCE_PREFECT_SEND_PARAMETERS` is set truthy
+    :return: what `CONVALESCE_PREFECT_SEND_PARAMETERS` says where it is set
+        to a yes or a no; otherwise whether arguments are sent at all
     """
-    raw = os.environ.get(_SEND_PARAMETERS_ENV, "")
-    return raw.strip().lower() in _TRUTHY
+    raw = os.environ.get(_SEND_PARAMETERS_ENV, "").strip().lower()
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
+    return cecap.send_arguments()
+
+
+def bound_parameters(body: Any) -> Tuple[Any, List[Dict[str, str]]]:
+    """
+    Cut each flow parameter's value down to what a task's arguments are
+    cut to: a parameter can be a document as easily as a date.
+
+    :param body: the dumped payload
+    :return: the same payload, large values cut, and every cut made, by
+        path and reason
+    """
+    excluded: List[Dict[str, str]] = []
+    if not isinstance(body, dict):
+        return body, excluded
+    for carrier, name in _PARAMETER_VALUES:
+        holder = body.get(carrier)
+        if isinstance(holder, dict) and isinstance(holder.get(name), dict):
+            holder[name], cut = cecap.shape(holder[name], f"{carrier}.{name}")
+            excluded.extend(cut)
+    return body, excluded
 
 
 def withhold_parameters(
@@ -324,7 +381,7 @@ def _render_result(value: Any) -> Optional[str]:
 
 def api_reads_enabled() -> bool:
     """
-    Whether the four API reads below run at all.
+    Whether the API reads below run at all.
 
     On by default; a customer with a locked-down Prefect API sets
     `CONVALESCE_PREFECT_API_READS=false` and still gets everything the
@@ -338,7 +395,7 @@ def api_reads_enabled() -> bool:
 
 def api_state(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Everything the four API reads add, named so nothing collides with what
+    Everything the API reads add, named so nothing collides with what
     the hook's own arguments already carry (`api_flow`, not `flow`).
 
     Each read is independently guarded: a Prefect that moved a method, an
@@ -385,6 +442,11 @@ def api_state(payload: Dict[str, Any]) -> Dict[str, Any]:
                 task_runs = _read_task_runs(client, flow_run_id)
                 if task_runs:
                     out["api_task_runs"] = task_runs
+            deployment_id = _text_id(getattr(flow_run, "deployment_id", None))
+            if deployment_id:
+                deployment = _read_deployment(client, deployment_id)
+                if deployment:
+                    out[DEPLOYMENT] = deployment
     except Exception as exc:  # pylint: disable=broad-exception-caught
         # An API that is down or refuses the request is the customer's
         # infrastructure, not a reason to lose the event itself.
@@ -438,6 +500,34 @@ def _read_flow(client: Any, flow_id: str) -> Any:
     if record is not None:
         return record
     return _get(client, f"/flows/{flow_id}")
+
+
+def _read_deployment(client: Any, deployment_id: str) -> Dict[str, Any]:
+    """
+    Where a deployed run's code is: the deployment's entrypoint, the file
+    and function Prefect loaded the flow from, and the path it is under.
+
+    Only those and the deployment's name are kept. The rest of the record
+    is the customer's configuration and stays where it is.
+
+    :param client: the sync API client
+    :param deployment_id: the deployment the flow run names
+    :return: `id`, `name`, `entrypoint` and `path`, those that are set;
+        empty when the deployment could not be read
+    """
+    record = _call(client, "read_deployment", deployment_id)
+    if record is None:
+        record = _get(client, f"/deployments/{deployment_id}")
+    out: Dict[str, Any] = {}
+    for name in _DEPLOYMENT_FIELDS:
+        value = (
+            record.get(name)
+            if isinstance(record, dict)
+            else getattr(record, name, None)
+        )
+        if value is not None:
+            out[name] = str(value)
+    return out
 
 
 def _read_graph(client: Any, flow_run_id: str) -> Any:
@@ -582,7 +672,11 @@ def emit_flow_run(
     detail = error_detail(state)
     if detail is not None:
         payload.setdefault("error_detail", detail)
-    _emit("flow_run", payload, emitter)
+    # What the flow itself sent to a database, outside any task.
+    noted = cecap.take_sql(flow_run, state)
+    if noted is not None:
+        payload.setdefault(SQL, noted)
+    _emit("flow_run", payload, emitter, subject="flow")
 
 
 def running_flow() -> Dict[str, Any]:
@@ -651,7 +745,18 @@ def emit_task_run(
         payload.setdefault(name, None)
         if payload[name] is None:
             payload[name] = value
-    _emit("task_run", payload, emitter)
+    noted = cecap.take_sql(task_run, state)
+    if noted is not None:
+        payload.setdefault(SQL, noted)
+    cut: List[Dict[str, str]] = []
+    called_with = cecap.arguments_of(task_run)
+    if called_with is not None:
+        try:
+            shaped, cut = cecap.shape(called_with)
+            payload.setdefault(cecap.ARGUMENTS, shaped)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _LOG.debug("convalesce: could not shape the arguments: %s", exc)
+    _emit("task_run", payload, emitter, subject="task", cut=cut)
 
 
 # #############################################################################

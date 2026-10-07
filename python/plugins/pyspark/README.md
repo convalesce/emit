@@ -1,12 +1,17 @@
 # convalesce-emit-pyspark
 
-Report a PySpark driver that fails in Python to Convalesce.
+Report a PySpark driver to Convalesce: the script it ran, what it was called
+with, and whether it failed in Python.
 
 A driver can fail before Spark runs anything, say by reading a table that is
 not there. Spark still ends the application normally, so the listener that
 `convalesce-emit-spark` installs reports a success. This package hooks the
 driver's own Python and sends one `driver_failure` observation, which marks
 the application's run failed, with the Python exception and its traceback.
+
+Whether it failed or not, it also sends one `driver_script` observation as
+the driver exits: the script's text and the arguments it was given. What ran
+is the file on the machine that ran it, which a repository can only suggest.
 
 ## Install
 
@@ -41,30 +46,59 @@ Run it beside `convalesce-emit-spark`, which reports the application itself.
 
 ## What is reported
 
-At most one observation per driver, for whichever comes first:
+### `driver_script`, once per driver
+
+Sent as the interpreter exits, after a run that succeeded and after one that
+failed, for a driver that started a Spark application:
+
+- the application's id and name
+- `argv`: the script and its arguments, with credentials masked
+  (`--password hunter2` and `--url=postgresql://etl:hunter2@db/shop` both
+  lose the password)
+- `source`: the script's path, its text with credentials masked the same
+  way, and the sha256 of the file as it is on the driver's machine. Text
+  over 60,000 characters is cut from the end and marked `truncated`; the
+  hash is always of the whole file
+- the Python and PySpark versions
+
+Two settings, both on unless set to `false`, `0`, `no` or `off`:
+
+| Variable | Off means |
+| --- | --- |
+| `CONVALESCE_SEND_SOURCE` | no `source` |
+| `CONVALESCE_SEND_ARGUMENTS` | `argv` holds the script's path only, here and in `driver_failure` |
+
+### `driver_failure`, at most once per driver
+
+For whichever comes first:
 
 - an exception nobody caught, in the main thread or another thread
 - `sys.exit(n)` with `n` not zero, sent as a `SystemExit`
 
-Each carries the application's id and name, the exception (type, message,
-traceback, and its cause), the script and its arguments with credentials
-masked, and the Python and PySpark versions. It is sent before the driver
-exits, which delays that exit by at most `CONVALESCE_TIMEOUT` per attempt.
-The hook never raises and never changes the exit code; the exception still
-prints as it would have.
+It carries the application's id and name, the exception (type, message,
+traceback, and its cause), `argv` as above, and the Python and PySpark
+versions.
+
+Both are sent before the driver exits, which delays that exit by at most
+`CONVALESCE_TIMEOUT` per attempt. The hook never raises and never changes
+the exit code; the exception still prints as it would have.
+
+A driver usually stops its `SparkSession` before it exits, and a stopped
+session no longer names its application. The hook wraps `SparkContext.stop`
+to read the application's id and name first, and changes nothing else about
+it.
 
 Limits:
 
 - `raise SystemExit(n)` is not seen, only `sys.exit(n)`
 - a `sys.exit(n)` whose `SystemExit` the driver catches and swallows is
   still reported
-- a driver that stops its `SparkSession` before the exception escapes (in a
-  `finally`, say) is reported without the application's id and name, and
-  cannot be matched to its run
+- `source` is the script the driver was started with (`spark-submit job.py`),
+  not the modules it imports
 
 ## Supported
 
-PySpark 3.x, on Python 3.9 and later.
+PySpark 3.3 to 4.0, on Python 3.9 and later.
 
 ## Configure
 

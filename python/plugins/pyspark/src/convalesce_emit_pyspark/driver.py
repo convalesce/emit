@@ -1,5 +1,5 @@
 """
-Report a PySpark driver that fails in Python.
+Report a PySpark driver: what it ran, and whether it failed in Python.
 
 A driver can fail before Spark runs anything: it reads a table that is not
 there, and the exception ends the Python process. The JVM still ends the
@@ -15,13 +15,28 @@ interpreter exit). At most one observation is sent per process, whichever
 comes first, and it is flushed synchronously before the process goes on to
 exit. Nothing here raises into the driver or changes its exit code.
 
+Whether it failed or not, a driver is also described once, as it exits, by
+one `driver_script` observation: the arguments it was called with and the
+text of the script it ran. A repository says what the script was meant to
+be; what ran is the file on the machine that ran it. Arguments are sent
+unless `CONVALESCE_SEND_ARGUMENTS` is false, and the text unless
+`CONVALESCE_SEND_SOURCE` is.
+
+A driver usually stops its session before it exits, and a stopped session
+no longer says which application it was. So `SparkContext.stop` is wrapped
+to read the application's id and name first, and nothing else about it
+changes.
+
 Import as:
 
 import convalesce_emit_pyspark.driver as cepysdri
 """
 
 import atexit
+import functools
+import hashlib
 import logging
+import os
 import platform
 import sys
 import threading
@@ -29,13 +44,17 @@ import types
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
+import convalesce_emit.source as cesource
 
 _LOG = logging.getLogger(__name__)
 
 TOOL = "spark"
 EVENT = "driver_failure"
+SCRIPT_EVENT = "driver_script"
 
 _PYSPARK = "pyspark"
+_ARGUMENTS_ENV = "CONVALESCE_SEND_ARGUMENTS"
+_FALSY = frozenset({"0", "false", "no", "off"})
 
 _Context = Tuple[Optional[str], Optional[str]]
 
@@ -129,6 +148,12 @@ class _Hook:
         self._config = config
         self._lock = threading.Lock()
         self._sent = False
+        self._script_sent = False
+        # The application a stopped context was, read as it stopped.
+        self._stopped: _Context = (None, None)
+        self._context_class: Any = None
+        self._original_stop: Any = None
+        self._finder: Optional["_Finder"] = None
         self._exit_code: Any = None
         self._exit_context: _Context = (None, None)
         self._previous_excepthook: Callable[..., Any] = sys.excepthook
@@ -148,6 +173,10 @@ class _Hook:
         threading.excepthook = self.threading_excepthook
         sys.exit = self.exit  # type: ignore[assignment]
         atexit.register(self.at_exit)
+        if not self.wrap_stop():
+            # Hooked before the driver imported PySpark, as the `.pth` does.
+            self._finder = _Finder(self)
+            sys.meta_path.insert(0, self._finder)
 
     def detach(self) -> None:
         """
@@ -163,6 +192,65 @@ class _Hook:
         if sys.exit == self.exit:
             sys.exit = self._original_exit
         atexit.unregister(self.at_exit)
+        if self._finder in sys.meta_path:
+            sys.meta_path.remove(self._finder)
+        self._finder = None
+        if (
+            self._context_class is not None
+            and getattr(self._context_class.stop, "_convalesce", None) is self
+        ):
+            self._context_class.stop = self._original_stop
+        self._context_class = None
+        self._original_stop = None
+
+    # -- the application ----------------------------------------------------
+
+    def wrap_stop(self) -> bool:
+        """
+        Wrap `SparkContext.stop`, once PySpark has a context class to wrap.
+
+        :return: whether it is wrapped
+        """
+        if self._context_class is not None:
+            return True
+        context_class = getattr(sys.modules.get(_PYSPARK), "SparkContext", None)
+        original = getattr(context_class, "stop", None)
+        if context_class is None or not callable(original):
+            return False
+
+        @functools.wraps(original)
+        def stop(context: Any, *args: Any, **kwargs: Any) -> Any:
+            self.remember(context)
+            return original(context, *args, **kwargs)
+
+        setattr(stop, "_convalesce", self)
+        self._context_class = context_class
+        self._original_stop = original
+        context_class.stop = stop
+        return True
+
+    def remember(self, context: Any) -> None:
+        """
+        Keep the application a context is, while it can still say.
+
+        :param context: the SparkContext about to stop
+        :return: nothing
+        """
+        try:
+            app_id = _read(lambda: context.applicationId)
+            if app_id is not None:
+                self._stopped = (app_id, _read(lambda: context.appName))
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOG.debug("convalesce: could not read the application: %s", err)
+
+    def context(self) -> _Context:
+        """
+        The driver's application: the running one, else the last stopped.
+
+        :return: its id and name, or None for either
+        """
+        live = _spark_context()
+        return live if live[0] is not None else self._stopped
 
     # -- the hooks --------------------------------------------------------
 
@@ -183,7 +271,7 @@ class _Hook:
         try:
             if exc is not None and exc.__traceback__ is None and tb is not None:
                 exc = exc.with_traceback(tb)
-            self.report(exc, _spark_context())
+            self.report(exc, self.context())
         except Exception as err:  # pylint: disable=broad-exception-caught
             _LOG.debug("convalesce: could not report the driver: %s", err)
         _chain(self._previous_excepthook, exc_type, exc, tb)
@@ -198,7 +286,7 @@ class _Hook:
         try:
             exc = getattr(args, "exc_value", None)
             if exc is not None and not isinstance(exc, SystemExit):
-                self.report(exc, _spark_context())
+                self.report(exc, self.context())
         except Exception as err:  # pylint: disable=broad-exception-caught
             _LOG.debug("convalesce: could not report the driver: %s", err)
         _chain(self._previous_threading, args)
@@ -219,14 +307,14 @@ class _Hook:
                 and threading.current_thread() is threading.main_thread()
             ):
                 self._exit_code = code
-                self._exit_context = _spark_context()
+                self._exit_context = self.context()
         except Exception as err:  # pylint: disable=broad-exception-caught
             _LOG.debug("convalesce: could not read the exit: %s", err)
         self._original_exit(code)
 
     def at_exit(self) -> None:
         """
-        Report a non-zero `sys.exit()`, once the interpreter is exiting.
+        Report a non-zero `sys.exit()`, then what the driver ran.
 
         :return: nothing
         """
@@ -235,6 +323,10 @@ class _Hook:
                 self.report(SystemExit(self._exit_code), self._exit_context)
         except Exception as err:  # pylint: disable=broad-exception-caught
             _LOG.debug("convalesce: could not report the driver: %s", err)
+        try:
+            self.report_script(self.context())
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOG.debug("convalesce: could not report the script: %s", err)
 
     # -- sending ------------------------------------------------------------
 
@@ -266,17 +358,99 @@ class _Hook:
             "python_version": platform.python_version(),
             "pyspark_version": _pyspark_version(),
         }
+        self._send(EVENT, payload, excluded)
+
+    def report_script(self, context: _Context) -> None:
+        """
+        Send the one `driver_script` observation this process sends.
+
+        Only for a driver whose application is known: the script and its
+        arguments describe a run, and without the application there is no
+        run to describe.
+
+        :param context: the application's id and name, where known
+        :return: nothing
+        """
+        app_id, app_name = context
+        if app_id is None or not _is_driver():
+            return
+        with self._lock:
+            if self._script_sent:
+                return
+            self._script_sent = True
+        argv, excluded = _argv()
+        payload: Dict[str, Any] = {
+            "application_id": app_id,
+            "application_name": app_name,
+            "argv": argv,
+            "python_version": platform.python_version(),
+            "pyspark_version": _pyspark_version(),
+        }
+        source, masked = _script_source()
+        if source is not None:
+            payload["source"] = source
+            excluded.extend(masked)
+        self._send(SCRIPT_EVENT, payload, excluded)
+
+    def _send(
+        self, event: str, payload: Dict[str, Any], excluded: List[Dict[str, str]]
+    ) -> None:
+        """
+        Send one observation and flush it before the driver goes on.
+
+        :param event: which observation
+        :param payload: what it carries
+        :param excluded: what was masked in it, by path and reason
+        :return: nothing
+        """
         emitter = self._emitter
         if emitter is None and self._config is not None:
             emitter = cemit.Emitter(self._config)
         cemit.send_one(
             tool=TOOL,
-            event=EVENT,
+            event=event,
             payload=payload,
             emitter=emitter,
             tool_version=payload["pyspark_version"],
             excluded=excluded,
         )
+
+
+# #############################################################################
+# _Finder
+# #############################################################################
+
+
+class _Finder:
+    """
+    Watches the driver's imports until PySpark's context can be wrapped.
+
+    The `.pth` hooks the interpreter before the driver's script has
+    imported anything. This sits on `sys.meta_path`, finds nothing, and at
+    each PySpark import asks the hook to wrap `SparkContext.stop`; once that
+    succeeds it takes itself off the path.
+
+    :param hook: the installed hooks
+    """
+
+    def __init__(self, hook: _Hook) -> None:
+        self._hook = hook
+
+    def find_spec(self, name: str, path: Any = None, target: Any = None) -> None:
+        """
+        Find nothing; only notice that PySpark is being imported.
+
+        :param name: the module being imported
+        :param path: where its package looks, unused
+        :param target: the module being reloaded, unused
+        :return: None, always, so the real finders import it
+        """
+        del path, target
+        try:
+            if name.startswith(f"{_PYSPARK}.") and self._hook.wrap_stop():
+                sys.meta_path.remove(self)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
 
 
 # #############################################################################
@@ -374,9 +548,12 @@ def _argv() -> Tuple[List[str], List[Dict[str, str]]]:
     secret-named flag followed by its value (`--password hunter2`) has the
     value masked here, since only the flag says what it is.
 
-    :return: the arguments, and what was masked, by path and reason
+    :return: the arguments, and what was masked, by path and reason; the
+        script alone when `CONVALESCE_SEND_ARGUMENTS` is false
     """
     args = [str(arg) for arg in sys.argv]
+    if not _arguments_enabled():
+        args = args[:1]
     redacted, excluded = cemit.redact_secrets(args, path="argv")
     out: List[str] = list(redacted)
     for i in range(1, len(out)):
@@ -388,3 +565,65 @@ def _argv() -> Tuple[List[str], List[Dict[str, str]]]:
             out[i] = "***"
             excluded.append({"path": f"argv[{i}]", "reason": "secret redacted"})
     return out, excluded
+
+
+def _arguments_enabled() -> bool:
+    """
+    Whether what the driver was called with may be sent.
+
+    :return: False only when `CONVALESCE_SEND_ARGUMENTS` says so
+    """
+    return os.environ.get(_ARGUMENTS_ENV, "").strip().lower() not in _FALSY
+
+
+def _script_path() -> Optional[str]:
+    """
+    The file this driver is running.
+
+    A driver started as `python -m package` is a launcher, such as a
+    notebook kernel, and its file is not the job.
+
+    :return: the script's path, or None when there is no such file
+    """
+    main = sys.modules.get("__main__")
+    if getattr(main, "__spec__", None) is not None:
+        return None
+    path = getattr(main, "__file__", None) or (sys.argv[0] if sys.argv else None)
+    if not path or not os.path.isfile(str(path)):
+        return None
+    return os.path.abspath(str(path))
+
+
+def _script_source() -> Tuple[Optional[Dict[str, Any]], List[Dict[str, str]]]:
+    """
+    The text of the script this driver is running, with credentials masked.
+
+    The hash is of the file as it is on this machine, whole and unmasked,
+    so it can be compared with the same file anywhere else.
+
+    :return: `{"file", "text", "language", "sha256", "truncated"}` and what
+        was masked in the text, by path and reason; None and nothing when
+        `CONVALESCE_SEND_SOURCE` is false or the script cannot be read
+    """
+    if not cesource.enabled():
+        return None, []
+    path = _script_path()
+    if path is None:
+        return None, []
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return None, []
+    text = raw.decode("utf-8", errors="replace")
+    masked, excluded = cemit.redact_secrets(
+        text[: cesource.MAX_CHARS], path="source.text"
+    )
+    source = {
+        "file": path,
+        "text": masked,
+        "language": "python",
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "truncated": len(text) > cesource.MAX_CHARS,
+    }
+    return source, excluded

@@ -940,3 +940,118 @@ class Test_gx_secrets1(unittest.TestCase):
         wire = json.dumps(recorder.sent, default=str)
         self.assertNotIn("s3cret", wire)
         self.assertIn("postgresql://user:***@db:5432/shop", wire)
+
+
+# #############################################################################
+# Test_gx_query1
+# #############################################################################
+
+
+def _query_suite(query: str) -> Any:
+    """
+    The action's arguments for one result validated over a query asset.
+
+    :param query: the asset's query
+    :return: what `forward` is handed
+    """
+    suite = {
+        "meta": {
+            "batch_spec": {"data_asset_name": "paid_orders", "query": query},
+            "active_batch_definition": {"datasource_name": "shop"},
+        },
+        "results": [],
+    }
+    return {"args": [], "kwargs": {"validation_result_suite": suite}}
+
+
+def _sent_spec(recorder: _Recorder) -> Any:
+    """
+    The batch spec of the one result a recorder was sent.
+
+    :param recorder: what `forward` sent through
+    :return: its `meta.batch_spec`
+    """
+    payload = recorder.sent[0]["payload"]
+    return payload["kwargs"]["validation_result_suite"]["meta"]["batch_spec"]
+
+
+class Test_gx_query1(unittest.TestCase):
+    """
+    Test what crosses of the query a query asset's batch was read with.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the query crosses whole, a password in it masked.
+        """
+        query = (
+            "select id, amount from orders where paid "
+            "and source = 'postgresql://etl:s3cret@db:5432/shop'"
+        )
+        recorder = _Recorder()
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            cegxcom.forward(_query_suite(query), recorder)
+        spec = _sent_spec(recorder)
+        self.assertEqual(spec["query"], query.replace("s3cret", "***"))
+        self.assertNotIn("query_truncated", spec)
+        self.assertEqual(
+            [entry["reason"] for entry in recorder.sent[0]["excluded"]],
+            ["credential masked"],
+        )
+
+    def test2(self) -> None:
+        """
+        Test that the query stays behind when source is not to be sent,
+        and that the observation says so.
+        """
+        for value in ("false", "0", "no", "OFF"):
+            recorder = _Recorder()
+            env = {"CONVALESCE_SEND_SOURCE": value}
+            with unittest.mock.patch.dict(os.environ, env, clear=True):
+                cegxcom.forward(_query_suite("select 1 from orders"), recorder)
+            spec = _sent_spec(recorder)
+            self.assertEqual(spec, {"data_asset_name": "paid_orders"})
+            self.assertEqual(
+                recorder.sent[0]["excluded"],
+                [
+                    {
+                        "path": "kwargs.validation_result_suite.meta."
+                        "batch_spec.query",
+                        "reason": "query not sent",
+                    }
+                ],
+            )
+
+    def test3(self) -> None:
+        """
+        Test that a query past the bound is cut and marked as cut, in every
+        result a checkpoint carries.
+        """
+        long = "select id from orders where id in (" + "1, " * 9000 + "1)"
+        self.assertGreater(len(long), cegxcom.MAX_QUERY_CHARS)
+        suite = _query_suite(long)["kwargs"]["validation_result_suite"]
+        payload = {
+            "args": [],
+            "kwargs": {"checkpoint_result": {"run_results": {"a": suite}}},
+        }
+        recorder = _Recorder()
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            cegxcom.forward(payload, recorder)
+        sent = recorder.sent[0]
+        results = sent["payload"]["kwargs"]["checkpoint_result"]["run_results"]
+        spec = results["a"]["meta"]["batch_spec"]
+        self.assertEqual(spec["query"], long[: cegxcom.MAX_QUERY_CHARS])
+        self.assertTrue(spec["query_truncated"])
+        self.assertEqual(
+            [entry["reason"] for entry in sent["excluded"]], ["query cut"]
+        )
+
+    def test4(self) -> None:
+        """
+        Test that a batch spec with no query, and a payload that is no
+        result at all, cross untouched.
+        """
+        payload = {"batch_spec": {"table_name": "orders"}, "other": [1, "x"]}
+        bounded, excluded = cegxcom.bound_queries(payload)
+        self.assertEqual(bounded, payload)
+        self.assertEqual(excluded, [])

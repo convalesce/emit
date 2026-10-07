@@ -9,8 +9,9 @@ ext {
   // TransportConfig, OpenLineageClientUtils.toJson) has not changed shape since 1.13.
   openLineageVersion = '1.53.0'
   // Only read, never loaded: its facet classes are listed by OpenLineageFacetInventoryTest. It
-  // bundles its own openlineage-java, so on a classpath it would shadow the one above.
-  openLineageSparkVersion = '1.50.0'
+  // bundles its own openlineage-java, so on a classpath it would shadow the one above. This is
+  // also the version the `_2.12` and `_2.13` poms ask for.
+  openLineageSparkVersion = openLineageVersion
 }
 
 // Spark 3.3 is the last release whose JsonProtocol returns a json4s JValue rather than a String.
@@ -92,4 +93,36 @@ tasks.named('test') { dependsOn 'openLineageTest' }
 publishing.publications.maven.pom {
   name = 'convalesce-emit-spark'
   description = project.description
+}
+
+// The same jar under a coordinate per Scala build, whose pom also asks for the OpenLineage-Spark
+// of that build. The jar itself has no Scala in its signatures; OpenLineage-Spark does, and a
+// package manager can only be told which one through the coordinate. `--packages` with one of
+// these brings the listener, the transport and OpenLineage together; the unsuffixed coordinate
+// stays what it was, this jar and emit-core and nothing else, for a job that adds jars by hand
+// or runs its own OpenLineage.
+['2.12', '2.13'].each { scala ->
+  publishing.publications.create("scala${scala.replace('.', '')}", MavenPublication) {
+    artifactId = "convalesce-emit-spark_${scala}"
+    artifact tasks.named('jar')
+    artifact tasks.named('sourcesJar')
+    artifact tasks.named('javadocJar')
+    pom {
+      name = "convalesce-emit-spark_${scala}"
+      description = "${project.description} With OpenLineage-Spark for Scala ${scala}, for table and column lineage."
+      withXml {
+        def dependencies = asNode().appendNode('dependencies')
+        [
+          [project.group, 'convalesce-emit-core', project.version, 'compile'],
+          ['io.openlineage', "openlineage-spark_${scala}", openLineageVersion, 'runtime'],
+        ].each { g, a, v, scope ->
+          def dependency = dependencies.appendNode('dependency')
+          dependency.appendNode('groupId', g)
+          dependency.appendNode('artifactId', a)
+          dependency.appendNode('version', v)
+          dependency.appendNode('scope', scope)
+        }
+      }
+    }
+  }
 }

@@ -25,6 +25,7 @@ import importlib.util
 import inspect
 import json
 import logging
+import os
 import pathlib
 import re
 import unittest
@@ -90,7 +91,7 @@ _MODELS: Dict[str, Tuple[str, Tuple[str, ...]]] = {
         ("task_run.empirical_policy", "api_task_runs[].empirical_policy"),
     ),
     "Flow": ("prefect.client.schemas.objects", ("api_flow",)),
-    "Deployment": ("prefect.client.schemas.objects", ()),
+    "Deployment": ("prefect.client.schemas.objects", ("api_deployment",)),
     "WorkPool": ("prefect.client.schemas.objects", ()),
     "Asset": ("prefect.assets", ("task.assets[]", "task.asset_deps[]")),
     "AssetProperties": (
@@ -361,11 +362,13 @@ class Test_live_run1(unittest.TestCase):
 
     def test1(self) -> None:
         """
-        Test that a real run fires every wired hook, withholds parameter
-        values, forwards the assets a task materializes, and emits no event
-        family that is neither carried nor excluded.
+        Test that a real run fires every wired hook, says what each flow
+        and task ran -- source, the values it was called with, the SQL it
+        sent and none of Prefect's own -- forwards the assets a task
+        materializes, and emits no event family that is neither carried nor
+        excluded.
         """
-        sent, events = _live_run()
+        sent, events = _live_run({})
         by_event: Dict[str, List[Dict[str, Any]]] = {}
         for observation in sent:
             by_event.setdefault(observation["event"], []).append(observation)
@@ -375,10 +378,25 @@ class Test_live_run1(unittest.TestCase):
         }
         self.assertIn(("flow_run", "Completed"), states)
         self.assertIn(("task_run", "Failed"), states)
-        text = json.dumps([item["payload"] for item in sent])
-        self.assertNotIn("customer-value", text)
-        flow_run = by_event["flow_run"][-1]["payload"]["flow_run"]
-        self.assertEqual(flow_run["parameters"], {"customer": "<str>"})
+        ended = by_event["flow_run"][-1]["payload"]
+        self.assertEqual(
+            ended["flow_run"]["parameters"], {"customer": "customer-value"}
+        )
+        self.assertIn("def nightly(", ended["flow"]["source"]["text"])
+        by_task = {
+            item["payload"]["task"]["name"]: item["payload"]
+            for item in by_event["task_run"]
+        }
+        self.assertEqual(by_task["audit"]["arguments"], {"rows": [1, 2]})
+        self.assertIn("def audit(", by_task["audit"]["task"]["source"]["text"])
+        self.assertEqual(
+            [
+                row["statement"]
+                for row in by_task["extract"]["sql_capture"]["statements"]
+            ],
+            ["create table staged as select 1 as id"],
+        )
+        self.assertNotIn("sql_capture", by_task["audit"])
         if importlib.util.find_spec("prefect.assets") is not None:
             keys = {
                 asset["key"]
@@ -392,8 +410,32 @@ class Test_live_run1(unittest.TestCase):
         )
         self.assertEqual(missing, [], sorted(events))
 
+    def test2(self) -> None:
+        """
+        Test that with each switch off a real run sends no source, no
+        argument or parameter value and no SQL.
+        """
+        sent, _ = _live_run(
+            {
+                "CONVALESCE_SEND_SOURCE": "false",
+                "CONVALESCE_SEND_ARGUMENTS": "false",
+                "CONVALESCE_SQL_CAPTURE": "false",
+            }
+        )
+        text = json.dumps([item["payload"] for item in sent])
+        self.assertNotIn("customer-value", text)
+        self.assertNotIn("def audit(", text)
+        self.assertNotIn("create table staged", text)
+        for item in sent:
+            payload = item["payload"]
+            self.assertNotIn("arguments", payload)
+            self.assertNotIn("sql_capture", payload)
+            self.assertEqual(
+                payload["flow_run"]["parameters"], {"customer": "<str>"}
+            )
 
-def _live_run() -> Tuple[List[Dict[str, Any]], Set[str]]:
+
+def _live_run(env: Dict[str, str]) -> Tuple[List[Dict[str, Any]], Set[str]]:
     """
     Run a flow with the plugin wired in, against a throwaway server.
 
@@ -401,6 +443,7 @@ def _live_run() -> Tuple[List[Dict[str, Any]], Set[str]]:
     Prefect. What the hooks send is caught at `cemit.send_one`, which is the
     one place every event leaves through.
 
+    :param env: settings to run it under
     :return: the observations the hooks sent, and the names of the events
         Prefect emitted from this process
     """
@@ -413,8 +456,17 @@ def _live_run() -> Tuple[List[Dict[str, Any]], Set[str]]:
     def _record(**kwargs: Any) -> None:
         sent.append(kwargs)
 
+    sqlalchemy = importlib.import_module("sqlalchemy")
+
     @prefect.task(on_completion=[cephooks.emit_task_run])
     def extract() -> List[int]:
+        # Prefect brings SQLAlchemy with it, and on 2.x runs its own server
+        # on it in this very process: only this statement is the task's.
+        engine = sqlalchemy.create_engine("sqlite://")
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.text("create table staged as select 1 as id")
+            )
         return [1, 2]
 
     @prefect.task(on_failure=[cephooks.emit_task_run])
@@ -455,6 +507,7 @@ def _live_run() -> Tuple[List[Dict[str, Any]], Set[str]]:
         return 1
 
     with (
+        mock.patch.dict(os.environ, env),
         utilities.prefect_test_harness(),
         _events_recorded(events),
         mock.patch("convalesce_emit.send_one", side_effect=_record),

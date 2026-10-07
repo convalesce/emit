@@ -11,7 +11,7 @@
     "ASSET_STORE_OPERATION": "The IO manager's own bookkeeping; HANDLED_OUTPUT and LOADED_INPUT carry the same path metadata.",
     "ASSET_WIPED": "A user wiping an asset's history in the UI, outside any run.",
     "CODE_LOCATION_UPDATED": "A code location reloading, outside any run.",
-    "ENGINE_EVENT": "Executor chatter (process started, steps finished); the step stats carry each step's start and end.",
+    "ENGINE_EVENT": "Executor chatter (process started, steps finished); the step stats carry each step's start and end. Read only for the notes this package writes itself under convalesce/step, which cross as steps[].",
     "FRESHNESS_STATE_CHANGE": "Written by the freshness daemon outside any run; a run-status sensor never sees it.",
     "FRESHNESS_STATE_EVALUATION": "Written by the freshness daemon outside any run; a run-status sensor never sees it.",
     "HOOK_COMPLETED": "A success or failure hook ran; says nothing about the data.",
@@ -40,7 +40,6 @@
   "fields": {},
   "metadata_types": {
     "CodeLocationReconstructionMetadataValue": "Dagster's own code-location state, not an asset's.",
-    "CodeReferencesMetadataValue": "Links to the asset's source files; the run's origin already names the code location, file and module.",
     "DagsterAssetMetadataValue": "A link to another asset in the UI; carries no lineage Dagster itself acts on. Redacted as author metadata.",
     "DagsterJobMetadataValue": "A link to a job in the UI. Redacted as author metadata.",
     "DagsterRunMetadataValue": "A link to a run in the UI. Redacted as author metadata.",
@@ -51,7 +50,5 @@
     "PythonArtifactMetadataValue": "A Python import path an author chose to show; not the asset's code, which the origin names. Redacted.",
     "TableMetadataValue": "Rows of a table: a data sample. Redacted; its schema crosses as dagster/column_schema."
   },
-  "metadata_keys": {
-    "dagster/code_references": "Links to the asset's source files; the run's origin already names the code location, file and module."
-  }
+  "metadata_keys": {}
 }

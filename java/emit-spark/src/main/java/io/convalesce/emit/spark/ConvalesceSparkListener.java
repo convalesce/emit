@@ -17,6 +17,7 @@ import org.apache.spark.scheduler.SparkListenerExecutorExcludedForStage;
 import org.apache.spark.scheduler.SparkListenerExecutorMetricsUpdate;
 import org.apache.spark.scheduler.SparkListenerExecutorRemoved;
 import org.apache.spark.scheduler.SparkListenerExecutorUnexcluded;
+import org.apache.spark.scheduler.SparkListenerInterface;
 import org.apache.spark.scheduler.SparkListenerJobEnd;
 import org.apache.spark.scheduler.SparkListenerJobStart;
 import org.apache.spark.scheduler.SparkListenerNodeExcluded;
@@ -40,7 +41,7 @@ import org.apache.spark.scheduler.SparkListenerUnschedulableTaskSetRemoved;
  * <p>Wire it up with two lines of Spark config:
  *
  * <pre>
- * spark.jars.packages   io.convalesce:convalesce-emit-spark:0.1.0
+ * spark.jars.packages   io.convalesce:convalesce-emit-spark_2.12:0.1.8
  * spark.extraListeners  io.convalesce.emit.spark.ConvalesceSparkListener
  * </pre>
  *
@@ -66,6 +67,11 @@ import org.apache.spark.scheduler.SparkListenerUnschedulableTaskSetRemoved;
  * included, and Spark redacts them only on the way into its own event log. They are redacted here
  * by the same rule before anything leaves the driver.
  *
+ * <p><b>Lineage.</b> None of Spark's events carries the logical plan, so exact tables and columns
+ * come from OpenLineage-Spark, which the {@code _2.12} and {@code _2.13} packages bring with them.
+ * Where the job has not set OpenLineage up itself, this starts it and passes it every event; see
+ * {@link CarriedOpenLineage}.
+ *
  * <p>Nothing may escape into the customer's job. Every override wraps its body, and a failure to
  * emit is logged and dropped.
  */
@@ -78,6 +84,10 @@ public class ConvalesceSparkListener extends SparkListener {
   private final String sparkVersion;
   private final SparkEvents events = SparkEvents.fromEnvironment();
   private final Redaction redaction;
+  // OpenLineage's own listener, when this started it; null when the job runs its own or none.
+  private final SparkListenerInterface lineage;
+  // Cleared when OpenLineage turns out to be built for another Scala or Spark than this driver's.
+  private volatile boolean carrying = true;
   // Written by the listener bus thread and read by it; volatile so a later event on another
   // thread, which Spark does not promise against, still sees it.
   private volatile String appId;
@@ -91,13 +101,15 @@ public class ConvalesceSparkListener extends SparkListener {
    * Built by Spark when {@code spark.extraListeners} names a class taking a conf, which Spark
    * prefers.
    *
-   * @param conf the running job's configuration, read for its {@code spark.redaction.regex}
+   * @param conf the running job's configuration, read for its {@code spark.redaction.regex} and for
+   *     whether the job set OpenLineage up itself
    */
   public ConvalesceSparkListener(SparkConf conf) {
     this(
         SharedEmitter.emitter(),
         SharedEmitter.sparkVersion(),
-        Redaction.of(conf == null ? null : conf.get(Redaction.REGEX_KEY, null)));
+        Redaction.of(conf == null ? null : conf.get(Redaction.REGEX_KEY, null)),
+        CarriedOpenLineage.start(conf));
   }
 
   /**
@@ -107,13 +119,15 @@ public class ConvalesceSparkListener extends SparkListener {
    * @param sparkVersion the version to record on each observation
    */
   public ConvalesceSparkListener(Emitter emitter, String sparkVersion) {
-    this(emitter, sparkVersion, Redaction.of(null));
+    this(emitter, sparkVersion, Redaction.of(null), null);
   }
 
-  private ConvalesceSparkListener(Emitter emitter, String sparkVersion, Redaction redaction) {
+  ConvalesceSparkListener(
+      Emitter emitter, String sparkVersion, Redaction redaction, SparkListenerInterface lineage) {
     this.emitter = emitter;
     this.sparkVersion = sparkVersion;
     this.redaction = redaction;
+    this.lineage = lineage;
     if (!SparkEventJson.available()) {
       LOG.warning(
           "convalesce: this Spark has no serialiser we recognise; events will carry only their type");
@@ -123,11 +137,17 @@ public class ConvalesceSparkListener extends SparkListener {
   @Override
   public void onApplicationStart(SparkListenerApplicationStart event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onApplicationStart(event));
+    }
   }
 
   @Override
   public void onApplicationEnd(SparkListenerApplicationEnd event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onApplicationEnd(event));
+    }
     // The driver is going away; anything still queued goes now or never.
     try {
       emitter.close();
@@ -139,11 +159,17 @@ public class ConvalesceSparkListener extends SparkListener {
   @Override
   public void onJobStart(SparkListenerJobStart event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onJobStart(event));
+    }
   }
 
   @Override
   public void onJobEnd(SparkListenerJobEnd event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onJobEnd(event));
+    }
   }
 
   @Override
@@ -151,11 +177,17 @@ public class ConvalesceSparkListener extends SparkListener {
     // Stages are off by default, but a failed one carries the reason the job died; that is never
     // left behind.
     forward(event, failed(event));
+    if (lineage != null) {
+      carry(() -> lineage.onStageCompleted(event));
+    }
   }
 
   @Override
   public void onTaskEnd(SparkListenerTaskEnd event) {
     forward(event, failed(event));
+    if (lineage != null) {
+      carry(() -> lineage.onTaskEnd(event));
+    }
   }
 
   static boolean failed(SparkListenerStageCompleted event) {
@@ -182,111 +214,177 @@ public class ConvalesceSparkListener extends SparkListener {
   @Override
   public void onStageSubmitted(SparkListenerStageSubmitted event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onStageSubmitted(event));
+    }
   }
 
   @Override
   public void onTaskStart(SparkListenerTaskStart event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onTaskStart(event));
+    }
   }
 
   @Override
   public void onTaskGettingResult(SparkListenerTaskGettingResult event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onTaskGettingResult(event));
+    }
   }
 
   @Override
   public void onEnvironmentUpdate(SparkListenerEnvironmentUpdate event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onEnvironmentUpdate(event));
+    }
   }
 
   @Override
   public void onBlockManagerAdded(SparkListenerBlockManagerAdded event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onBlockManagerAdded(event));
+    }
   }
 
   @Override
   public void onBlockManagerRemoved(SparkListenerBlockManagerRemoved event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onBlockManagerRemoved(event));
+    }
   }
 
   @Override
   public void onUnpersistRDD(SparkListenerUnpersistRDD event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onUnpersistRDD(event));
+    }
   }
 
   @Override
   public void onExecutorMetricsUpdate(SparkListenerExecutorMetricsUpdate event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onExecutorMetricsUpdate(event));
+    }
   }
 
   @Override
   public void onStageExecutorMetrics(SparkListenerStageExecutorMetrics event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onStageExecutorMetrics(event));
+    }
   }
 
   @Override
   public void onExecutorAdded(SparkListenerExecutorAdded event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onExecutorAdded(event));
+    }
   }
 
   @Override
   public void onExecutorRemoved(SparkListenerExecutorRemoved event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onExecutorRemoved(event));
+    }
   }
 
   @Override
   public void onExecutorExcluded(SparkListenerExecutorExcluded event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onExecutorExcluded(event));
+    }
   }
 
   @Override
   public void onExecutorExcludedForStage(SparkListenerExecutorExcludedForStage event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onExecutorExcludedForStage(event));
+    }
   }
 
   @Override
   public void onNodeExcludedForStage(SparkListenerNodeExcludedForStage event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onNodeExcludedForStage(event));
+    }
   }
 
   @Override
   public void onExecutorUnexcluded(SparkListenerExecutorUnexcluded event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onExecutorUnexcluded(event));
+    }
   }
 
   @Override
   public void onNodeExcluded(SparkListenerNodeExcluded event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onNodeExcluded(event));
+    }
   }
 
   @Override
   public void onNodeUnexcluded(SparkListenerNodeUnexcluded event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onNodeUnexcluded(event));
+    }
   }
 
   @Override
   public void onBlockUpdated(SparkListenerBlockUpdated event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onBlockUpdated(event));
+    }
   }
 
   @Override
   public void onSpeculativeTaskSubmitted(SparkListenerSpeculativeTaskSubmitted event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onSpeculativeTaskSubmitted(event));
+    }
   }
 
   @Override
   public void onUnschedulableTaskSetAdded(SparkListenerUnschedulableTaskSetAdded event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onUnschedulableTaskSetAdded(event));
+    }
   }
 
   @Override
   public void onUnschedulableTaskSetRemoved(SparkListenerUnschedulableTaskSetRemoved event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onUnschedulableTaskSetRemoved(event));
+    }
   }
 
   @Override
   public void onResourceProfileAdded(SparkListenerResourceProfileAdded event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onResourceProfileAdded(event));
+    }
   }
 
   /** The application this listener is reporting on, once anything has named it. */
@@ -303,6 +401,9 @@ public class ConvalesceSparkListener extends SparkListener {
   @Override
   public void onOtherEvent(SparkListenerEvent event) {
     forward(event);
+    if (lineage != null) {
+      carry(() -> lineage.onOtherEvent(event));
+    }
   }
 
   private void forward(SparkListenerEvent event) {
@@ -321,6 +422,31 @@ public class ConvalesceSparkListener extends SparkListener {
     } catch (Throwable t) {
       // A job must not fail because we could not report on it.
       LOG.warning("convalesce: could not emit an event: " + t.getMessage());
+    }
+  }
+
+  /**
+   * Passes one event on to OpenLineage, whatever {@code CONVALESCE_SPARK_EVENTS} says of it.
+   *
+   * @param call the callback Spark would have made, had it been registered
+   */
+  private void carry(Runnable call) {
+    if (!carrying) {
+      return;
+    }
+    try {
+      call.run();
+    } catch (LinkageError e) {
+      // A method or class that is not there will not be there for the next event either, and a
+      // warning per event would bury the job's own log.
+      carrying = false;
+      LOG.warning(
+          "convalesce: the OpenLineage-Spark on the classpath was built for another Scala or "
+              + "Spark than this driver runs, so table and column lineage is off for this job. "
+              + "Use the convalesce-emit-spark package whose suffix is this Spark's Scala build. "
+              + e);
+    } catch (Throwable t) {
+      LOG.warning("convalesce: OpenLineage could not read an event: " + t);
     }
   }
 

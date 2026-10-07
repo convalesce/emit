@@ -69,8 +69,10 @@ exclude = ["**/test/**"]
 [tool.black]
 line-length = 81
 target-version = ["py39"]
+# Copies of somebody else's code, carried unchanged.
+extend-exclude = "/_vendored/"
 
 [tool.pytest.ini_options]
 testpaths = ["src", "plugins"]
-norecursedirs = [".git", ".venv", "build", "dist"]
+norecursedirs = [".git", ".venv", "build", "dist", "_vendored"]
 addopts = "-p no:warnings --tb=native -rpa --durations=3 --timeout=60"

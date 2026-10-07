@@ -40,10 +40,31 @@ final class Redaction {
               "\"System Properties\"",
               "\"Metrics Properties\""));
 
+  // The same, in an OpenLineage run event: the Spark settings a job asked to have captured (the
+  // `spark_properties` facet) and what OpenLineage read of the platform (`environment-properties`).
+  private static final List<String> RUN_EVENT_MAPS =
+      Collections.unmodifiableList(Arrays.asList("\"properties\"", "\"environment-properties\""));
+
   private final Pattern pattern;
 
   private Redaction(Pattern pattern) {
     this.pattern = pattern;
+  }
+
+  /**
+   * The rule of the Spark this driver is running, for a caller Spark did not hand a configuration.
+   *
+   * @return the job's rule, or Spark's default when there is no running Spark to ask
+   */
+  static Redaction ofRunningSpark() {
+    String regex = null;
+    try {
+      org.apache.spark.SparkEnv env = org.apache.spark.SparkEnv.get();
+      regex = env == null ? null : env.conf().get(REGEX_KEY, null);
+    } catch (Throwable t) {
+      // No Spark on the classpath, or none started: the default rule still applies.
+    }
+    return of(regex);
   }
 
   /**
@@ -76,12 +97,33 @@ final class Redaction {
     }
     String out = json;
     for (String field : CONFIG_MAPS) {
-      out = redactMaps(out, field);
+      out = redactMaps(out, field, false);
     }
     return out;
   }
 
-  private String redactMaps(String json, String field) {
+  /**
+   * Redacts the configuration an OpenLineage run event carries.
+   *
+   * <p>OpenLineage does not redact what it captures. Unlike a Spark event's maps, these can hold
+   * values that are not strings (a platform's mount points, say). A map inside one is redacted by
+   * the same rule; anything else is kept as it is unless its key names a credential.
+   *
+   * @param json the run event as OpenLineage rendered it
+   * @return the event, with sensitive values replaced
+   */
+  String applyToRunEvent(String json) {
+    if (json == null) {
+      return null;
+    }
+    String out = json;
+    for (String field : RUN_EVENT_MAPS) {
+      out = redactMaps(out, field, true);
+    }
+    return out;
+  }
+
+  private String redactMaps(String json, String field, boolean anyValue) {
     StringBuilder out = null;
     int copied = 0;
     int from = 0;
@@ -102,7 +144,7 @@ final class Redaction {
       }
       StringBuilder map = new StringBuilder();
       boolean[] changed = new boolean[1];
-      int end = redactMap(json, open, map, changed);
+      int end = redactMap(json, open, map, changed, anyValue);
       if (end < 0 || !changed[0]) {
         // Nothing to hide, or not a flat map of strings, which is left as it is rather than
         // guessed at.
@@ -126,9 +168,11 @@ final class Redaction {
    * Copies one flat {@code {"key":"value",...}} object into {@code out}, redacted.
    *
    * @param changed set when a value was replaced
-   * @return the index just past the object, or -1 when it is not a flat map of strings
+   * @param anyValue whether a value may be something other than a string
+   * @return the index just past the object, or -1 when it is not a map this can read
    */
-  private int redactMap(String json, int open, StringBuilder out, boolean[] changed) {
+  private int redactMap(
+      String json, int open, StringBuilder out, boolean[] changed, boolean anyValue) {
     out.append('{');
     int i = skipSpace(json, open + 1);
     if (i < json.length() && json.charAt(i) == '}') {
@@ -147,14 +191,24 @@ final class Redaction {
       }
       int valueStart = skipSpace(json, colon + 1);
       int valueEnd = stringEnd(json, valueStart);
+      boolean text = valueEnd >= 0;
+      if (!text && anyValue) {
+        valueEnd = valueEnd(json, valueStart);
+      }
       if (valueEnd < 0) {
         return -1;
       }
       String value = json.substring(valueStart, valueEnd);
       out.append(key).append(':');
-      if (pattern.matcher(unquote(key)).find() || pattern.matcher(unquote(value)).find()) {
+      if (pattern.matcher(unquote(key)).find()
+          || (text && pattern.matcher(unquote(value)).find())) {
         out.append('"').append(REPLACEMENT).append('"');
         changed[0] = true;
+      } else if (!text && value.charAt(0) == '{') {
+        // A map inside the map is configuration too, and is held to the same rule.
+        if (redactMap(json, valueStart, out, changed, true) < 0) {
+          return -1;
+        }
       } else {
         out.append(value);
       }
@@ -187,6 +241,36 @@ final class Redaction {
         i++;
       } else if (c == '"') {
         return i + 1;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * The index just past the JSON value starting at {@code start} that is not a string: a nested
+   * object or array, a number or a literal. -1 when it never ends.
+   */
+  private static int valueEnd(String json, int start) {
+    int depth = 0;
+    for (int i = start; i < json.length(); i++) {
+      char c = json.charAt(i);
+      if (c == '"') {
+        i = stringEnd(json, i) - 1;
+        if (i < 0) {
+          return -1;
+        }
+      } else if (c == '{' || c == '[') {
+        depth++;
+      } else if (c == '}' || c == ']') {
+        if (depth == 0) {
+          return i > start ? i : -1;
+        }
+        depth--;
+        if (depth == 0) {
+          return i + 1;
+        }
+      } else if (depth == 0 && (c == ',' || Character.isWhitespace(c))) {
+        return i > start ? i : -1;
       }
     }
     return -1;

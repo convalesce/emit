@@ -13,6 +13,8 @@ import unittest
 from typing import Any, Dict, List, Optional
 from unittest import mock
 
+import convalesce_emit.sqlcapture as cesqlcap
+import convalesce_emit_prefect._capture as cecap
 import convalesce_emit_prefect.hooks as cephooks
 
 _LOG = logging.getLogger(__name__)
@@ -796,6 +798,8 @@ class Test_result_text1(unittest.TestCase):
 
 # Restated for the same reason as `_API_READS_ENV`.
 _SEND_PARAMETERS_ENV = "CONVALESCE_PREFECT_SEND_PARAMETERS"
+_SEND_ARGUMENTS_ENV = "CONVALESCE_SEND_ARGUMENTS"
+_SEND_SOURCE_ENV = "CONVALESCE_SEND_SOURCE"
 
 
 class _ParameterisedFlow(_Flow):
@@ -823,7 +827,7 @@ class _ParameterisedRun(_FlowRun):
 
 class Test_withhold_parameters1(unittest.TestCase):
     """
-    Test that a flow's parameter values stay behind unless opted in.
+    Test that a flow's parameter values cross unless switched off.
     """
 
     def _send(self, env: Dict[str, str]) -> Dict[str, Any]:
@@ -845,9 +849,10 @@ class Test_withhold_parameters1(unittest.TestCase):
 
     def test1(self) -> None:
         """
-        Test that by default the names and types cross, never the values.
+        Test that with arguments switched off the names and types cross,
+        never the values.
         """
-        sent = self._send({})
+        sent = self._send({_SEND_ARGUMENTS_ENV: "false"})
         payload = sent["payload"]
         self.assertEqual(
             payload["flow_run"]["parameters"],
@@ -871,21 +876,67 @@ class Test_withhold_parameters1(unittest.TestCase):
 
     def test2(self) -> None:
         """
-        Test that opting in sends the values as they are.
+        Test that by default the values cross as they are, and that the
+        older setting, set to a yes, sends them even with arguments off.
         """
-        sent = self._send({_SEND_PARAMETERS_ENV: "true"})
-        payload = sent["payload"]
-        self.assertEqual(
-            payload["flow_run"]["parameters"],
-            {"customer": "acme-corp", "limit": 10},
-        )
-        self.assertEqual(
-            payload["flow"]["parameters"]["properties"]["customer"]["default"],
-            "acme-corp",
-        )
-        self.assertNotIn(
-            "parameter values withheld",
-            [entry["reason"] for entry in sent["excluded"]],
+        for env in (
+            {},
+            {_SEND_PARAMETERS_ENV: "true"},
+            {_SEND_PARAMETERS_ENV: "true", _SEND_ARGUMENTS_ENV: "false"},
+        ):
+            sent = self._send(env)
+            payload = sent["payload"]
+            self.assertEqual(
+                payload["flow_run"]["parameters"],
+                {"customer": "acme-corp", "limit": 10},
+            )
+            schema = payload["flow"]["parameters"]["properties"]
+            self.assertEqual(schema["customer"]["default"], "acme-corp")
+            self.assertNotIn(
+                "parameter values withheld",
+                [entry["reason"] for entry in sent["excluded"]],
+            )
+
+    def test2b(self) -> None:
+        """
+        Test that the older setting, set to a no, still withholds the
+        values, whatever the newer one says.
+        """
+        for env in (
+            {_SEND_PARAMETERS_ENV: "false"},
+            {_SEND_PARAMETERS_ENV: "0", _SEND_ARGUMENTS_ENV: "true"},
+        ):
+            sent = self._send(env)
+            self.assertEqual(
+                sent["payload"]["flow_run"]["parameters"],
+                {"customer": "<str>", "limit": "<int>"},
+            )
+
+    def test2c(self) -> None:
+        """
+        Test that a parameter holding a document is cut like any argument,
+        and the cut is declared.
+        """
+        recorder = _Recorder()
+        run = _ParameterisedRun()
+        run.parameters = {"ids": list(range(400)), "limit": 10}
+        with mock.patch.dict(os.environ, {}, clear=True):
+            cephooks.emit_flow_run(
+                flow=_ParameterisedFlow(),
+                flow_run=run,
+                state="S",
+                emitter=recorder,
+            )
+        sent = recorder.sent[0]
+        parameters = sent["payload"]["flow_run"]["parameters"]
+        self.assertEqual(parameters["ids"], list(range(50)))
+        self.assertEqual(parameters["limit"], 10)
+        self.assertIn(
+            {
+                "path": "flow_run.parameters.ids",
+                "reason": "argument cut: first 50 of 400",
+            },
+            sent["excluded"],
         )
 
     def test3(self) -> None:
@@ -893,7 +944,7 @@ class Test_withhold_parameters1(unittest.TestCase):
         Test that a credential in a run's job variables never crosses, in
         either mode.
         """
-        for env in ({}, {_SEND_PARAMETERS_ENV: "true"}):
+        for env in ({}, {_SEND_PARAMETERS_ENV: "false"}):
             sent = self._send(env)
             self.assertNotIn("hunter2", json.dumps(sent["payload"]))
             self.assertIn(
@@ -922,3 +973,282 @@ class Test_withhold_parameters1(unittest.TestCase):
             ],
         )
         self.assertEqual(cephooks.withhold_parameters({"a": 1}), ({"a": 1}, []))
+
+
+# #############################################################################
+# Test_what_ran1
+# #############################################################################
+
+
+def _load(table: str, minimum: int) -> str:
+    """A task body whose text is looked for below."""
+    return f"{table}:{minimum}"
+
+
+class _RunningTask:
+    """Stands in for a Prefect task: the function, and on 3.8 its text."""
+
+    def __init__(self) -> None:
+        self.name = "load"
+        self.fn = _load
+        self.source_code = "def _load(table, minimum): ..."
+
+
+class _RunContexts:
+    """A stand-in `prefect.context` with a task run in progress."""
+
+    def __init__(self, task_run: Any, parameters: Dict[str, Any]) -> None:
+        context = types.SimpleNamespace(task_run=task_run, parameters=parameters)
+        flow_context = types.SimpleNamespace(flow=_Flow(), flow_run=_FlowRun())
+        # Named as Prefect names them, which is what the hook looks up.
+        setattr(
+            self, "TaskRunContext", types.SimpleNamespace(get=lambda: context)
+        )
+        setattr(
+            self,
+            "FlowRunContext",
+            types.SimpleNamespace(get=lambda: flow_context),
+        )
+
+
+class Test_what_ran1(unittest.TestCase):
+    """
+    Test that a run says what it ran: source, arguments and SQL.
+    """
+
+    def setUp(self) -> None:
+        self.task_run = _TaskRun()
+        self.task_run.id = "t-1"  # type: ignore[attr-defined]
+        arguments = {
+            "table": "orders",
+            "minimum": 1000000000,
+            "options": {"api_key": "abc123", "dsn": "postgres://u:pw@h/db"},
+        }
+        modules = {"prefect.context": _RunContexts(self.task_run, arguments)}
+        patch = mock.patch.dict(sys.modules, modules)
+        patch.start()
+        self.addCleanup(patch.stop)
+        cesqlcap.scope_by(cecap.running_scope)
+        self.addCleanup(cesqlcap.scope_by, None)
+
+    def _send(self, env: Dict[str, str], state: Any = "Failed") -> Any:
+        """
+        Run one statement as the task, then fire its hook.
+
+        :param env: the environment to do both under
+        :param state: the state the hook is given
+        :return: the observation sent
+        """
+        recorder = _Recorder()
+        with mock.patch.dict(os.environ, env, clear=True):
+            cesqlcap.record(
+                "insert into shop.big select * from shop.orders where n > %s",
+                dialect="postgres",
+                database="shop",
+                via="test",
+            )
+            cephooks.emit_task_run(
+                task=_RunningTask(),
+                task_run=self.task_run,
+                state=state,
+                emitter=recorder,
+            )
+        return recorder.sent[0]
+
+    def test1(self) -> None:
+        """
+        Test that a task event carries the task's source, the values it
+        was called with and the statements it sent, credentials masked.
+        """
+        sent = self._send({})
+        payload = sent["payload"]
+        self.assertIn("def _load(table: str", payload["task"]["source"]["text"])
+        self.assertEqual(
+            payload["arguments"],
+            {
+                "table": "orders",
+                "minimum": 1000000000,
+                "options": {
+                    "api_key": {"redacted": True},
+                    "dsn": "postgres://u:***@h/db",
+                },
+            },
+        )
+        (noted,) = payload["sql_capture"]["statements"]
+        self.assertEqual(
+            (noted["statement"], noted["dialect"], noted["database"]),
+            (
+                "insert into shop.big select * from shop.orders where n > %s",
+                "postgres",
+                "shop",
+            ),
+        )
+        self.assertIn(
+            {"path": "arguments.options.api_key", "reason": "secret redacted"},
+            sent["excluded"],
+        )
+
+    def test2(self) -> None:
+        """
+        Test that each switch keeps its own part behind, including the
+        source text Prefect 3.8 keeps on the task itself.
+        """
+        sent = self._send(
+            {
+                _SEND_SOURCE_ENV: "false",
+                _SEND_ARGUMENTS_ENV: "false",
+                "CONVALESCE_SQL_CAPTURE": "false",
+            }
+        )
+        payload = sent["payload"]
+        self.assertNotIn("source", payload["task"])
+        self.assertNotIn("source_code", payload["task"])
+        self.assertNotIn("arguments", payload)
+        self.assertNotIn("sql_capture", payload)
+        self.assertIn(
+            {"path": "task.source_code", "reason": "excluded by name"},
+            sent["excluded"],
+        )
+
+    def test3(self) -> None:
+        """
+        Test that a task still running sends its arguments and keeps its
+        statements for the event that ends it.
+        """
+
+        class _Running:
+            """Stands in for a state that is not over."""
+
+            def is_running(self) -> bool:
+                """Whether the run is still going."""
+                return True
+
+        payload = self._send({}, state=_Running())["payload"]
+        self.assertEqual(payload["arguments"]["table"], "orders")
+        self.assertNotIn("sql_capture", payload)
+        ended = self._send({})["payload"]
+        self.assertEqual(ended["sql_capture"]["statements"][0]["count"], 2)
+
+    def test4(self) -> None:
+        """
+        Test that a flow event carries the flow's source, and what the
+        flow itself sent outside any task.
+        """
+        flow = _Flow()
+        flow.fn = _load  # type: ignore[attr-defined]
+        flow_run = _FlowRun()
+        modules = {
+            "prefect.context": types.SimpleNamespace(
+                TaskRunContext=types.SimpleNamespace(get=lambda: None),
+                FlowRunContext=types.SimpleNamespace(
+                    get=lambda: types.SimpleNamespace(flow_run=flow_run)
+                ),
+            )
+        }
+        recorder = _Recorder()
+        with mock.patch.dict(sys.modules, modules):
+            cesqlcap.record("truncate shop.staging", via="test")
+            cephooks.emit_flow_run(
+                flow=flow, flow_run=flow_run, state="S", emitter=recorder
+            )
+        payload = recorder.sent[0]["payload"]
+        self.assertIn("def _load(", payload["flow"]["source"]["text"])
+        self.assertEqual(
+            [row["statement"] for row in payload["sql_capture"]["statements"]],
+            ["truncate shop.staging"],
+        )
+        self.assertNotIn("arguments", payload)
+
+
+# #############################################################################
+# Test_deployment1
+# #############################################################################
+
+
+class _Deployment:
+    """Stands in for the `Deployment` the API's `read_deployment` returns."""
+
+    def __init__(self) -> None:
+        self.id = "d-1"
+        self.name = "nightly"
+        self.entrypoint = "flows/orders.py:nightly"
+        self.path = "."
+        self.job_variables = {"env": {"DB_PASSWORD": "hunter2"}}
+        self.pull_steps = [{"git_clone": {"access_token": "tok"}}]
+
+
+class _DeployedRun(_FlowRun):
+    """Stands in for a flow run a deployment started."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.deployment_id = "d-1"
+
+
+class Test_deployment1(unittest.TestCase):
+    """
+    Test reading where a deployed run's code is.
+    """
+
+    def _send(self, client: Any, flow_run: Any) -> Dict[str, Any]:
+        """
+        Fire the flow hook against a faked API.
+
+        :param client: the client the API reads go through
+        :param flow_run: the flow run the hook is given
+        :return: the payload sent
+        """
+        recorder = _Recorder()
+        with mock.patch.dict(sys.modules, _prefect_modules(client)):
+            cephooks.emit_flow_run(
+                flow=_Flow(), flow_run=flow_run, state="S", emitter=recorder
+            )
+        payload: Dict[str, Any] = recorder.sent[0]["payload"]
+        return payload
+
+    def test1(self) -> None:
+        """
+        Test that the entrypoint, path and name cross, and nothing else of
+        the deployment does.
+        """
+        client = _SyncClient()
+        client.read_deployment = lambda _id: _Deployment()  # type: ignore[attr-defined]
+        payload = self._send(client, _DeployedRun())
+        self.assertEqual(
+            payload["api_deployment"],
+            {
+                "id": "d-1",
+                "name": "nightly",
+                "entrypoint": "flows/orders.py:nightly",
+                "path": ".",
+            },
+        )
+        self.assertNotIn("hunter2", json.dumps(payload))
+
+    def test2(self) -> None:
+        """
+        Test that a client with no typed method is asked by path, and that
+        a run no deployment started asks nothing.
+        """
+
+        class _Raw(_SyncClient):
+            """A client that answers the deployment only by its path."""
+
+            def _request(self, method: str, path: str) -> _APIResponse:
+                self.calls.append(("request", method, path))
+                if path.startswith("/deployments/"):
+                    return _APIResponse(
+                        {"name": "nightly", "entrypoint": "a.py:f", "tags": []}
+                    )
+                return _APIResponse({})
+
+        client = _Raw()
+        payload = self._send(client, _DeployedRun())
+        self.assertEqual(
+            payload["api_deployment"],
+            {"name": "nightly", "entrypoint": "a.py:f"},
+        )
+        self.assertIn(("request", "GET", "/deployments/d-1"), client.calls)
+        plain = _Raw()
+        self.assertNotIn("api_deployment", self._send(plain, _FlowRun()))
+        self.assertNotIn(("request", "GET", "/deployments/d-1"), plain.calls)

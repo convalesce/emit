@@ -18,6 +18,7 @@ import unittest
 import unittest.mock
 from typing import Any, Dict, List
 
+import convalesce_emit.sqlcapture as cesqlcap
 import convalesce_emit_airflow.listener as cealist
 
 _LOG = logging.getLogger(__name__)
@@ -1142,3 +1143,72 @@ class Test_listener_error_detail1(unittest.TestCase):
         getattr(listener, _FAILED)("running", "TI", None, None)
         for sent in recorder.sent:
             self.assertNotIn("error_detail", sent["payload"])
+
+
+class Test_watch_hooks1(unittest.TestCase):
+    """
+    Test noting what Airflow's database hooks run.
+    """
+
+    def _hooked(self) -> Any:
+        """A stand-in `DbApiHook`, wrapped as the listener wraps the real one."""
+        calls: List[Any] = []
+
+        class DbApiHook:
+            """Runs a statement the way the real hook's `run` does."""
+
+            conn_type = "postgres"
+            database = "shop"
+            schema = None
+
+            def _run_command(
+                self, cur: Any, sql_statement: Any, parameters: Any
+            ) -> str:
+                calls.append((cur, sql_statement, parameters))
+                return "ran"
+
+        where = "airflow.providers.common.sql.hooks.sql"
+        module = types.ModuleType(where)
+        module.DbApiHook = DbApiHook  # type: ignore[attr-defined]
+        names = (
+            "airflow",
+            "airflow.providers",
+            "airflow.providers.common",
+            "airflow.providers.common.sql",
+            "airflow.providers.common.sql.hooks",
+        )
+        modules = {name: types.ModuleType(name) for name in names}
+        modules[where] = module
+        with unittest.mock.patch.dict(sys.modules, modules):
+            cealist.watch_hooks()
+            cealist.watch_hooks()
+        return DbApiHook, calls
+
+    def test1(self) -> None:
+        """
+        Test that a statement a hook runs is noted with the hook's database
+        and still run, with the values bound to it left out.
+        """
+        hook_class, calls = self._hooked()
+        cesqlcap.start()
+        self.addCleanup(cesqlcap.drain)
+        result = hook_class()._run_command(  # pylint: disable=protected-access
+            "cur", "insert into a.t select * from b.s where x > %s", (7,)
+        )
+        self.assertEqual(result, "ran")
+        self.assertEqual(calls[0][2], (7,))
+        noted = cesqlcap.drain()
+        assert noted is not None
+        (row,) = noted["statements"]
+        self.assertEqual(
+            (row["dialect"], row["database"], row["via"]),
+            ("postgres", "shop", "airflow_hook"),
+        )
+        self.assertNotIn("7", row["statement"])
+
+    def test2(self) -> None:
+        """Test that an Airflow with no such hook is not an error."""
+        with unittest.mock.patch.dict(
+            sys.modules, {"airflow.providers.common.sql.hooks.sql": None}
+        ):
+            cealist.watch_hooks()

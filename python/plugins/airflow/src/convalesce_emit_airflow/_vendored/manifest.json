@@ -1,0 +1,154 @@
+{
+  "2.7": {
+    "airflow": "2.7.3",
+    "provider": "1.2.0",
+    "client": "1.4.1",
+    "wheels": [
+      {
+        "wheel": "apache_airflow_providers_openlineage-1.2.0-py3-none-any.whl",
+        "sha256": "76f246cf8b065816ec199797bd168b918d2fb66eb87d8a1ad61ac980a42b3b01"
+      },
+      {
+        "wheel": "openlineage_python-1.4.1-py3-none-any.whl",
+        "sha256": "323c076965ed3018d09ab3894e99b67b5f1787bcb60ca1563f133c4ad6eff4bf"
+      },
+      {
+        "wheel": "openlineage_integration_common-1.4.1-py3-none-any.whl",
+        "sha256": "e1268e10a0626275019f8d426dc01ec5d30262710e4a05041fa4d49330c4c857"
+      }
+    ]
+  },
+  "2.8": {
+    "airflow": "2.8.4",
+    "provider": "1.6.0",
+    "client": "1.10.2",
+    "wheels": [
+      {
+        "wheel": "apache_airflow_providers_openlineage-1.6.0-py3-none-any.whl",
+        "sha256": "fd1742d77d508f8204615577002628bb459814ae0883af088edff845f9910160"
+      },
+      {
+        "wheel": "openlineage_python-1.10.2-py3-none-any.whl",
+        "sha256": "d34fa111edf4d6eac38973be5e1f713e48e5f8a57e7f6e191e6a3056cb2053bd"
+      },
+      {
+        "wheel": "openlineage_integration_common-1.10.2-py3-none-any.whl",
+        "sha256": "0b3e06c026847214dc6a1f1a74879d8ce4e85c324f7620fd8be965cf39df4bfa"
+      }
+    ]
+  },
+  "2.9": {
+    "airflow": "2.9.3",
+    "provider": "1.9.1",
+    "client": "1.18.0",
+    "wheels": [
+      {
+        "wheel": "apache_airflow_providers_openlineage-1.9.1-py3-none-any.whl",
+        "sha256": "d3a0a6f714287db75db7cb011d27edbe10ace21473f6a930d396e25b7234eb87"
+      },
+      {
+        "wheel": "openlineage_python-1.18.0-py3-none-any.whl",
+        "sha256": "8e0b5f6db53cd0d7850028929d540c9890eb7bb169aadc8a0e099a053967d696"
+      },
+      {
+        "wheel": "openlineage_integration_common-1.18.0-py3-none-any.whl",
+        "sha256": "5def2cb6f5401c37cde245d5d07c77ec3924adad869e3fda5ae9c3869dd9207b"
+      }
+    ]
+  },
+  "2.10": {
+    "airflow": "2.10.5",
+    "provider": "2.0.0",
+    "client": "1.27.0",
+    "wheels": [
+      {
+        "wheel": "apache_airflow_providers_openlineage-2.0.0-py3-none-any.whl",
+        "sha256": "8f766ebbf9699600c302b9d66b4b62fb8a0c58ed0cdade48c2b13b59bcc5f5cd"
+      },
+      {
+        "wheel": "openlineage_python-1.27.0-py3-none-any.whl",
+        "sha256": "19bc008ba541ae6709761e57896ca09b13d7283a350f111f70d52cb397d4262e"
+      },
+      {
+        "wheel": "openlineage_integration_common-1.27.0-py3-none-any.whl",
+        "sha256": "7e3e53baf2dbbf9f0d296ec3acd98dcf8a1b484d54089d8e64a7590bdab2abcd"
+      }
+    ]
+  },
+  "2.11": {
+    "airflow": "2.11.0",
+    "provider": "2.3.0",
+    "client": "1.33.0",
+    "wheels": [
+      {
+        "wheel": "apache_airflow_providers_openlineage-2.3.0-py3-none-any.whl",
+        "sha256": "4e5ea6e45464f8ec6886d02a7698957a9c026eb2ec3ed477e710a51e48d2e1de"
+      },
+      {
+        "wheel": "openlineage_python-1.33.0-py3-none-any.whl",
+        "sha256": "f70f893e17883880dee0997954f74a1d7eda060ef74bc7fcb24f631931b17d8e"
+      },
+      {
+        "wheel": "openlineage_integration_common-1.33.0-py3-none-any.whl",
+        "sha256": "dcd1dc152b7af56a4ad741ba96c01d10dce8e9defce725138378d72e671da204"
+      }
+    ]
+  },
+  "3.0": {
+    "airflow": "3.0.3",
+    "provider": "2.5.0",
+    "client": "1.35.0",
+    "wheels": [
+      {
+        "wheel": "apache_airflow_providers_openlineage-2.5.0-py3-none-any.whl",
+        "sha256": "abbb3d89f0ceb91c93a8c452e9dea9588f6961c5b322c14b8695538fb9f614ee"
+      },
+      {
+        "wheel": "openlineage_python-1.35.0-py3-none-any.whl",
+        "sha256": "e36b724e69907a1c1a209714207105ea1203ab5c8ee8b41ff62b7d83040109bf"
+      },
+      {
+        "wheel": "openlineage_integration_common-1.35.0-py3-none-any.whl",
+        "sha256": "f20c054b0655eb59232c60e5d13bd134d4b0304a35d1031ad79e303458f6e087"
+      }
+    ]
+  },
+  "3.1": {
+    "airflow": "3.1.0",
+    "provider": "2.7.1",
+    "client": "1.37.0",
+    "wheels": [
+      {
+        "wheel": "apache_airflow_providers_openlineage-2.7.1-py3-none-any.whl",
+        "sha256": "b52f98561e7a19f1c927d75a869786a5cd85132a334c992f9f63267f23aa359f"
+      },
+      {
+        "wheel": "openlineage_python-1.37.0-py3-none-any.whl",
+        "sha256": "ec6837a741c5d534332d431af428dc67a8d34ea2f09ef33d74b56200a28ed28d"
+      },
+      {
+        "wheel": "openlineage_integration_common-1.37.0-py3-none-any.whl",
+        "sha256": "f9f9041a3ca88622a6a62b5987808f94ca5f4afbe7fbdc5d00862b972b0df74b"
+      }
+    ]
+  },
+  "3.2": {
+    "airflow": "3.2.2",
+    "provider": "2.17.0",
+    "client": "1.47.1",
+    "wheels": [
+      {
+        "wheel": "apache_airflow_providers_openlineage-2.17.0-py3-none-any.whl",
+        "sha256": "2fb6ad9c0db950820fba9759a48620b9b5fc71091e9e01c19cbba5638e5e39e0"
+      },
+      {
+        "wheel": "openlineage_python-1.47.1-py3-none-any.whl",
+        "sha256": "44ca34b0b38c9a49f6b7200ace37612334a34a455361af29adcfb80e27d258dd"
+      },
+      {
+        "wheel": "openlineage_integration_common-1.47.1-py3-none-any.whl",
+        "sha256": "2fad64ec0dd5f1e179112a8fd0a7f8eca5731a40e3d7307a8ec165ba4d6e089d"
+      }
+    ]
+  }
+}

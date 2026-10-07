@@ -65,6 +65,9 @@ validator=validator)`, so the platform is named from its engine.
   expectation result, under every result format.
 - Each datasource's platform, database and default schema. Never its
   connection string; a password inside a batch spec is masked.
+- The query a query asset's batch is read with, up to 20,000 characters,
+  so the tables and columns behind the batch can be read from it. Set
+  `CONVALESCE_SEND_SOURCE=false` to keep it where it is.
 - Each result's GX Cloud page, when GX Cloud stored it.
 - Not the rows: sampled failing values, and the values a distinct-values or
   most-common-value expectation observed, cross as counts. Set

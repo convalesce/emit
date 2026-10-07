@@ -52,6 +52,7 @@ import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import convalesce_emit as cemit
+import convalesce_emit_airflow.carried as cealcar
 import convalesce_emit_airflow.listener as cealist
 
 _LOG = logging.getLogger(__name__)
@@ -69,6 +70,11 @@ _SECTION = "openlineage"
 _HOOK_LINEAGE_READER_MODULES = ("airflow.sdk.lineage", "airflow.lineage.hook")
 _FALSY = frozenset({"0", "false", "no", "off"})
 _TRUTHY = frozenset({"1", "true", "t", "yes", "on"})
+
+# Before the import below: where the provider is not installed, the copy
+# this plugin carries has to be on the path for the transport's base
+# classes to be the client's own.
+CARRIED = cealcar.prepare(cemit.version_of("airflow"))
 
 try:
     from openlineage.client.transport import Config, Transport
