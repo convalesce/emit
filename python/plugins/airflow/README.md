@@ -53,6 +53,36 @@ own and forward to Convalesce too, name this one in it:
 
 Set `CONVALESCE_OPENLINEAGE=false` to switch this off.
 
+## Choose which DAGs are reported
+
+Every DAG is reported unless you say otherwise. Two settings choose by DAG
+id, each a comma-separated list of shell-style patterns (`*` for any run of
+characters, `?` for one, `[abc]` for one of a set), matched against the
+whole id with its case kept:
+
+- `CONVALESCE_AIRFLOW_DAG_DENY`: a DAG whose id matches is left out.
+- `CONVALESCE_AIRFLOW_DAG_ALLOW`: when set, only a DAG whose id matches is
+  reported.
+
+A DAG that matches both is left out.
+
+```sh
+CONVALESCE_AIRFLOW_DAG_ALLOW="orders_*,billing"
+CONVALESCE_AIRFLOW_DAG_DENY="orders_scratch"
+```
+
+Nothing is sent for a DAG that is left out: its task and dag run events, the
+asset events its tasks raise, and the OpenLineage events the provider builds
+for it. Set them on the scheduler and on every worker.
+
+## Connections
+
+For each connection a task names, the plugin sends its type, host, port and
+schema, and these names from its `extra` when they are set: `database`,
+`schema`, `warehouse`, `role`, `catalog`, `project` and `dataset`. They say
+which database a table named without one belongs to. Each value passes
+through the same redaction as the rest of the event.
+
 ## Configure
 
 `CONVALESCE_INGEST_KEY`, `CONVALESCE_ENDPOINT`, `CONVALESCE_DRY_RUN` and the

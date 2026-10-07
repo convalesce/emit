@@ -45,6 +45,10 @@ failures carry `error` alone.
 Credentials are withheld after the dump, the same as for the OpenLineage
 events; see `redact`.
 
+A DAG can be left unreported by name: `CONVALESCE_AIRFLOW_DAG_ALLOW` and
+`CONVALESCE_AIRFLOW_DAG_DENY`, see `dag_reported`. Nothing about such a DAG
+is sent, by this listener or by the OpenLineage transport.
+
 And one field is named rather than walked. A task belongs to a task group,
 and a task group holds its own copy of the whole DAG, so it was 40% of a
 task event and every byte of it appeared elsewhere already. The group's id,
@@ -64,6 +68,7 @@ Import as:
 import convalesce_emit_airflow.listener as cealist
 """
 
+import fnmatch
 import functools
 import importlib
 import inspect
@@ -93,6 +98,14 @@ TOOL = "airflow"
 
 # The dag the customer schedules to call `run_pending_retries`; see `send`.
 RETRY_DAG_ID = "convalesce_retries"
+
+# Which DAGs are reported, by id: comma-separated shell-style patterns
+# (`*`, `?`, `[abc]`), matched against the whole id with its case kept.
+DAG_ALLOW_ENV = "CONVALESCE_AIRFLOW_DAG_ALLOW"
+DAG_DENY_ENV = "CONVALESCE_AIRFLOW_DAG_DENY"
+# Where a hook's argument names the DAG it is about: on a task instance and
+# a dag run, and on the asset event a task's outlet raised.
+_DAG_ID_FIELDS = ("dag_id", "source_dag_id")
 
 # Where Airflow declares what it will pass. Read as plain modules: asking the
 # listener manager instead builds it, which loads plugins, which imports this
@@ -229,11 +242,10 @@ class _Base:
         :param payload: whatever Airflow handed the hook
         :return: nothing
         """
-        # The dag that asks which retries are approved runs every minute and
-        # is ours, not the customer's: its runs say nothing about theirs.
-        if any(
-            getattr(part, "dag_id", None) == RETRY_DAG_ID
+        if not all(
+            dag_reported(getattr(part, name, None))
             for part in payload.values()
+            for name in _DAG_ID_FIELDS
         ):
             return
         emitter = self.emitter
@@ -306,6 +318,42 @@ _WATCH: Dict[str, Any] = {}
 # Set on the function this module puts in a hook's place, so it is put there
 # once.
 _NOTING = "convalesce_noting"
+
+
+def _patterns(name: str) -> List[str]:
+    """
+    The patterns one of the DAG settings lists.
+
+    :param name: the setting
+    :return: its patterns, none when it is unset or empty
+    """
+    listed = (cealenv.read(name) or "").split(",")
+    return [pattern.strip() for pattern in listed if pattern.strip()]
+
+
+def dag_reported(dag_id: Any) -> bool:
+    """
+    Whether anything about this DAG may be sent.
+
+    The dag that asks which retries are approved runs every minute and is
+    ours, not the customer's: its runs say nothing about theirs. Any other
+    is reported unless `CONVALESCE_AIRFLOW_DAG_DENY` matches its id, or
+    `CONVALESCE_AIRFLOW_DAG_ALLOW` is set and does not. Deny wins over
+    allow. Read on every call, so a setting the scheduler or a worker was
+    given after the plugin loaded still holds.
+
+    :param dag_id: the DAG's id; anything that is not one (an event about
+        no DAG) is reported
+    :return: False for a DAG that is ours or that the settings leave out
+    """
+    if not isinstance(dag_id, str) or not dag_id:
+        return True
+    if dag_id == RETRY_DAG_ID:
+        return False
+    if any(fnmatch.fnmatchcase(dag_id, p) for p in _patterns(DAG_DENY_ENV)):
+        return False
+    allowed = _patterns(DAG_ALLOW_ENV)
+    return not allowed or any(fnmatch.fnmatchcase(dag_id, p) for p in allowed)
 
 
 def send_arguments() -> bool:
@@ -450,6 +498,14 @@ def shape(
             dumped["dag_run"] = cemit.dump(
                 dag_run, budget=budget, path="task_instance.dag_run"
             )
+    if dumped.get("next_method") is None:
+        try:
+            method = find_next_method(task_instance)
+        except Exception:  # pylint: disable=broad-exception-caught
+            # The same lazy values as the dag run above; not worth the event.
+            method = None
+        if method is not None:
+            dumped["next_method"] = method
     task_dumped = dumped.get("task")
     task = getattr(task_instance, "task", None)
     if task is not None and isinstance(task_dumped, dict):
@@ -497,8 +553,9 @@ def redact(
     `conf`, a pod's `env_vars`, templated SQL. Any of them can hold a
     literal credential. Values under credential-named keys are replaced and
     passwords inside URIs and connection strings masked, the SQL around them
-    kept. A connection's `extra` is never read in the first place (see
-    `connection_coordinates`).
+    kept. Of a connection's `extra` only a fixed list of names is read in
+    the first place (see `connection_coordinates`), and their values pass
+    through here like everything else.
 
     :param out: the payload as shaped
     :param excluded: what the dump already left out
@@ -591,14 +648,33 @@ def context_keys() -> FrozenSet[str]:
 # model, never read for meaning.
 _CONN_ID_SUFFIX = "conn_id"
 
+# What of a connection's `extra` is sent, and nothing else of it ever is:
+# where its tables live and what it runs as. Snowflake keeps its database
+# there, Trino and Databricks their catalog, BigQuery its project, and
+# without them a receiver cannot tell which `orders` a task's SQL means. A
+# fixed list rather than a filter on names, because `extra` is also where
+# the connection types with no password field keep their keys and tokens.
+# The account or host a connection reaches is not on it: it names whose
+# database this is, not which table, and nothing downstream reads it.
+EXTRA_ALLOWED = (
+    "database",
+    "schema",
+    "warehouse",
+    "role",
+    "catalog",
+    "project",
+    "dataset",
+)
+
 
 def connection_coordinates(task: Any) -> Dict[str, Dict[str, Any]]:
     """
     Non-secret coordinates for every connection id the task names.
 
-    `conn_type`, `host`, `port` and `schema` only. Never `password`, never
-    `extra` -- `extra` commonly holds a second copy of the same secrets for
-    the connection types that keep them there instead.
+    `conn_type`, `host`, `port` and `schema`, and of `extra` only the keys
+    in `EXTRA_ALLOWED`. Never `password`, never the rest of `extra` --
+    `extra` commonly holds a second copy of the same secrets for the
+    connection types that keep them there instead.
 
     :param task: the operator instance the hook named
     :return: each resolved connection id to its coordinates
@@ -631,6 +707,38 @@ def connection_coordinates(task: Any) -> Dict[str, Dict[str, Any]]:
             "port": getattr(connection, "port", None),
             "schema": getattr(connection, "schema", None),
         }
+        try:
+            extra = allowed_extra(connection)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            # `extra` is parsed as it is read, and one that is not JSON
+            # raises on some Airflow releases.
+            _LOG.debug("convalesce: could not read extra of %s: %s", value, exc)
+            extra = {}
+        if extra:
+            out[value]["extra"] = extra
+    return out
+
+
+def allowed_extra(connection: Any) -> Dict[str, str]:
+    """
+    The allowed keys of a connection's `extra`, and no other.
+
+    A key is read under its own name and under the prefixed name older
+    providers stored it by, `extra__<conn_type>__<key>`. Only text is kept:
+    anything else there is not a name.
+
+    :param connection: Airflow's own Connection object
+    :return: each allowed key that is set, to its value
+    """
+    extra = getattr(connection, "extra_dejson", None)
+    if not isinstance(extra, dict):
+        return {}
+    prefix = f"extra__{getattr(connection, 'conn_type', None)}__"
+    out: Dict[str, str] = {}
+    for key in EXTRA_ALLOWED:
+        found = extra.get(key) or extra.get(prefix + key)
+        if isinstance(found, str) and found:
+            out[key] = found
     return out
 
 
@@ -817,6 +925,26 @@ def find_dag_run(task_instance: Any) -> Any:
         dag_run = getattr(value, "dag_run", None)
         if dag_run is not None:
             return dag_run
+    return None
+
+
+def find_next_method(task_instance: Any) -> Optional[str]:
+    """
+    The method a deferred task resumes at, when it is coming back from one.
+
+    Airflow 2 keeps it on the task instance, where the dump finds it.
+    Airflow 3's task instance has no such field: the API server says it on
+    the same private context the dag run is read from in `find_dag_run`.
+    A receiver reads it to tell a task resuming from a task starting, which
+    Airflow reports through the same hook.
+
+    :param task_instance: whatever the hook was handed
+    :return: the method's name, or None for a task that is not resuming
+    """
+    for value in _private_values(task_instance):
+        method = getattr(value, "next_method", None)
+        if isinstance(method, str) and method:
+            return method
     return None
 
 
