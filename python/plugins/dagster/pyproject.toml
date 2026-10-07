@@ -9,7 +9,7 @@ authors = [{ name = "Convalesce" }]
 # The host tool is deliberately not a dependency: this installs into an
 # existing one, and pinning it would fight that environment's resolution.
 requires-python = ">=3.9"
-dependencies = ["convalesce-emit>=0.1.8,<1"]
+dependencies = ["convalesce-emit>=0.2.0,<1"]
 
 [build-system]
 requires = ["hatchling"]

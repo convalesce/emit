@@ -8,7 +8,7 @@ columns each job read and wrote.
 Two lines of Spark config:
 
 ```
-spark.jars.packages   io.convalesce:convalesce-emit-spark_2.12:0.1.8
+spark.jars.packages   io.convalesce:convalesce-emit-spark_2.12:0.2.0
 spark.extraListeners  io.convalesce.emit.spark.ConvalesceSparkListener
 ```
 
@@ -16,7 +16,7 @@ Or on the command line:
 
 ```sh
 spark-submit \
-  --packages io.convalesce:convalesce-emit-spark_2.12:0.1.8 \
+  --packages io.convalesce:convalesce-emit-spark_2.12:0.2.0 \
   --conf spark.extraListeners=io.convalesce.emit.spark.ConvalesceSparkListener \
   your_job.py
 ```
