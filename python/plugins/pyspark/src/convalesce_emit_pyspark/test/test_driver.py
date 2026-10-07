@@ -1,13 +1,16 @@
 """
-Tests for the driver failure hooks.
+Tests for the driver hooks.
 
 Run with `make test`.
 """
 
+import hashlib
 import logging
 import os
 import pathlib
+import shutil
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -268,7 +271,8 @@ class Test_exit1(_HookTestCase):
         hook = cepysdri._INSTALLED  # pylint: disable=protected-access
         assert hook is not None
         hook.at_exit()
-        self.assertEqual(self.recorder.sent, [])
+        events = [sent["event"] for sent in self.recorder.sent]
+        self.assertNotIn("driver_failure", events)
 
 
 # #############################################################################
@@ -348,6 +352,265 @@ class Test_context1(_HookTestCase):
         self.assertEqual(
             sorted(e["path"] for e in sent["excluded"]), ["argv[2]", "argv[3]"]
         )
+
+
+# #############################################################################
+# Test_script
+# #############################################################################
+
+_SCRIPT = """import sys
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+spark.read.jdbc("jdbc:postgresql://etl:s3cret@db/shop", sys.argv[1])
+"""
+
+
+class _Stoppable:
+    """Stands in for a SparkContext the driver can stop."""
+
+    appName = "daily_revenue"
+    _active_spark_context: Optional["_Stoppable"] = None
+    stopped = 0
+
+    @property
+    def applicationId(self) -> str:  # pylint: disable=invalid-name
+        """What PySpark reads off the JVM, until the context stops."""
+        if type(self)._active_spark_context is None:
+            raise RuntimeError("stopped")
+        return "local-1790387079999"
+
+    def stop(self) -> None:
+        """Stop, after which the context names no application."""
+        type(self).stopped += 1
+        type(self)._active_spark_context = None
+
+
+class Test_script1(_HookTestCase):
+    """What the driver ran, sent as it exits whether or not it failed."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        self.script = os.path.join(folder, "revenue.py")
+        pathlib.Path(self.script).write_text(_SCRIPT, encoding="utf-8")
+        main = types.ModuleType("__main__")
+        setattr(main, "__file__", self.script)
+        patches: List[Any] = [
+            mock.patch.dict(sys.modules, {"__main__": main}),
+            mock.patch.object(sys, "argv", [self.script, "shop.orders"]),
+            mock.patch.dict(os.environ, {}, clear=False),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        os.environ.pop("CONVALESCE_SEND_SOURCE", None)
+        os.environ.pop("CONVALESCE_SEND_ARGUMENTS", None)
+
+    def at_exit(self) -> None:
+        """Run what the interpreter runs as it exits."""
+        hook = cepysdri._INSTALLED  # pylint: disable=protected-access
+        assert hook is not None
+        hook.at_exit()
+
+    def test_a_driver_that_succeeds_sends_its_script(self) -> None:
+        """A driver that succeeds sends its script."""
+        self.install()
+        self.at_exit()
+        self.assertEqual(len(self.recorder.sent), 1)
+        sent = self.recorder.sent[0]
+        self.assertEqual(sent["tool"], "spark")
+        self.assertEqual(sent["event"], "driver_script")
+        self.assertEqual(sent["tool_version"], "3.5.3")
+        payload = sent["payload"]
+        self.assertEqual(payload["application_id"], "local-1790387078840")
+        self.assertEqual(payload["application_name"], "customer_features_broken")
+        self.assertEqual(payload["argv"], [self.script, "shop.orders"])
+        source = payload["source"]
+        self.assertEqual(source["file"], self.script)
+        self.assertEqual(source["language"], "python")
+        self.assertFalse(source["truncated"])
+        self.assertIn("spark.read.jdbc", source["text"])
+        self.assertEqual(self.recorder.flushes, 1)
+
+    def test_the_hash_is_of_the_file_and_the_text_is_masked(self) -> None:
+        """The hash is of the file and the text is masked."""
+        self.install()
+        self.at_exit()
+        sent = self.recorder.sent[0]
+        source = sent["payload"]["source"]
+        self.assertNotIn("s3cret", source["text"])
+        self.assertIn("postgresql://etl:***@db/shop", source["text"])
+        self.assertEqual(
+            source["sha256"], hashlib.sha256(_SCRIPT.encode("utf-8")).hexdigest()
+        )
+        self.assertIn("source.text", [e["path"] for e in sent["excluded"]])
+
+    def test_sends_once(self) -> None:
+        """Sends once."""
+        self.install()
+        self.at_exit()
+        self.at_exit()
+        self.assertEqual(len(self.recorder.sent), 1)
+
+    def test_a_failing_driver_sends_both(self) -> None:
+        """A failing driver sends both."""
+        self.install()
+        self.fail_main(ValueError("x"))
+        self.at_exit()
+        self.assertEqual(
+            [sent["event"] for sent in self.recorder.sent],
+            ["driver_failure", "driver_script"],
+        )
+
+    def test_a_long_script_is_cut_from_the_end(self) -> None:
+        """A long script is cut from the end."""
+        text = "# head\n" + "x = 1\n" * 20_000
+        pathlib.Path(self.script).write_text(text, encoding="utf-8")
+        self.install()
+        self.at_exit()
+        source = self.recorder.sent[0]["payload"]["source"]
+        self.assertTrue(source["truncated"])
+        self.assertEqual(len(source["text"]), cepysdri.cesource.MAX_CHARS)
+        self.assertTrue(source["text"].startswith("# head"))
+        self.assertEqual(
+            source["sha256"], hashlib.sha256(text.encode("utf-8")).hexdigest()
+        )
+
+    def test_source_can_be_switched_off(self) -> None:
+        """Source can be switched off."""
+        for value in ("false", "0", "no", "off"):
+            with self.subTest(value=value):
+                self.recorder.sent.clear()
+                cepysdri.uninstall()
+                os.environ["CONVALESCE_SEND_SOURCE"] = value
+                self.install()
+                self.at_exit()
+                payload = self.recorder.sent[0]["payload"]
+                self.assertNotIn("source", payload)
+                self.assertEqual(payload["argv"], [self.script, "shop.orders"])
+
+    def test_arguments_can_be_switched_off(self) -> None:
+        """Arguments can be switched off."""
+        os.environ["CONVALESCE_SEND_ARGUMENTS"] = "false"
+        self.install()
+        self.fail_main(ValueError("x"))
+        self.at_exit()
+        failure, script = (sent["payload"] for sent in self.recorder.sent)
+        self.assertEqual(failure["argv"], [self.script])
+        self.assertEqual(script["argv"], [self.script])
+        self.assertIn("source", script)
+
+    def test_a_launcher_module_has_no_source(self) -> None:
+        """A launcher module has no source."""
+        main = sys.modules["__main__"]
+        setattr(main, "__spec__", types.SimpleNamespace(name="kernel_launcher"))
+        self.install()
+        self.at_exit()
+        self.assertNotIn("source", self.recorder.sent[0]["payload"])
+
+    def test_a_script_that_cannot_be_read_has_no_source(self) -> None:
+        """A script that cannot be read has no source."""
+        os.remove(self.script)
+        self.install()
+        self.at_exit()
+        self.assertNotIn("source", self.recorder.sent[0]["payload"])
+
+    def test_no_application_sends_nothing(self) -> None:
+        """No application sends nothing."""
+        with mock.patch.dict(sys.modules, {"pyspark": _pyspark(None)}):
+            self.install()
+            self.at_exit()
+        self.assertEqual(self.recorder.sent, [])
+
+    def test_a_failing_emitter_is_swallowed(self) -> None:
+        """A failing emitter is swallowed."""
+        self.install(_Broken())
+        self.at_exit()
+
+
+# #############################################################################
+# Test_stop
+# #############################################################################
+
+
+class Test_stop1(_HookTestCase):
+    """A driver that stops its session before it exits."""
+
+    # The stand-in keeps PySpark's own names, and the finder is the hook's.
+    # pylint: disable=protected-access
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.context = _Stoppable()
+        _Stoppable._active_spark_context = self.context
+        _Stoppable.stopped = 0
+        self.original_stop = _Stoppable.stop
+        self.module = types.ModuleType("pyspark")
+        setattr(self.module, "__version__", "3.5.3")
+        patch = mock.patch.dict(sys.modules, {"pyspark": self.module})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(setattr, _Stoppable, "stop", self.original_stop)
+
+    def test_the_application_is_read_as_the_context_stops(self) -> None:
+        """The application is read as the context stops."""
+        setattr(self.module, "SparkContext", _Stoppable)
+        self.install()
+        self.context.stop()
+        self.assertEqual(_Stoppable.stopped, 1)
+        hook = cepysdri._INSTALLED  # pylint: disable=protected-access
+        assert hook is not None
+        hook.at_exit()
+        payload = self.recorder.sent[0]["payload"]
+        self.assertEqual(payload["application_id"], "local-1790387079999")
+        self.assertEqual(payload["application_name"], "daily_revenue")
+
+    def test_a_failure_after_the_stop_names_the_application(self) -> None:
+        """A failure after the stop names the application."""
+        setattr(self.module, "SparkContext", _Stoppable)
+        self.install()
+        self.context.stop()
+        self.fail_main(ValueError("after the stop"))
+        payload = self.recorder.sent[0]["payload"]
+        self.assertEqual(payload["application_id"], "local-1790387079999")
+
+    def test_hooked_before_pyspark_is_imported(self) -> None:
+        """Hooked before pyspark is imported."""
+        self.install()
+        finder = sys.meta_path[0]
+        self.assertIsInstance(finder, cepysdri._Finder)
+        # Something else being imported changes nothing.
+        self.assertIsNone(finder.find_spec("json.decoder", None))
+        self.assertIn(finder, sys.meta_path)
+        # PySpark's own imports, once its context class exists, wrap it.
+        setattr(self.module, "SparkContext", _Stoppable)
+        self.assertIsNone(finder.find_spec("pyspark.sql", None))
+        self.assertNotIn(finder, sys.meta_path)
+        self.context.stop()
+        hook = cepysdri._INSTALLED  # pylint: disable=protected-access
+        assert hook is not None
+        self.assertEqual(hook.context()[0], "local-1790387079999")
+
+    def test_uninstall_puts_stop_back(self) -> None:
+        """Uninstall puts stop back."""
+        setattr(self.module, "SparkContext", _Stoppable)
+        self.install()
+        self.assertIsNot(_Stoppable.stop, self.original_stop)
+        cepysdri.uninstall()
+        self.assertIs(_Stoppable.stop, self.original_stop)
+        self.assertFalse(
+            [f for f in sys.meta_path if isinstance(f, cepysdri._Finder)]
+        )
+
+    def test_a_context_that_cannot_be_read_still_stops(self) -> None:
+        """A context that cannot be read still stops."""
+        setattr(self.module, "SparkContext", _Stoppable)
+        self.install()
+        _Stoppable._active_spark_context = None
+        self.context.stop()
+        self.assertEqual(_Stoppable.stopped, 1)
 
 
 # #############################################################################

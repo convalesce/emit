@@ -1,0 +1,13 @@
+convalesce-emit-airflow
+Copyright Convalesce
+
+This distribution carries, unchanged, under
+src/convalesce_emit_airflow/_vendored/, copies of:
+
+- apache-airflow-providers-openlineage (Apache Airflow), Apache License 2.0
+  Copyright The Apache Software Foundation
+- openlineage-python and openlineage-integration-common (OpenLineage),
+  Apache License 2.0, Copyright the OpenLineage contributors
+
+The exact releases and the checksum of each wheel they were taken from are
+recorded in src/convalesce_emit_airflow/_vendored/manifest.json.

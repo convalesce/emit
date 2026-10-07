@@ -16,6 +16,10 @@ import java.util.logging.Logger;
  * RunEvent>}}, rendered by OpenLineage's own serialiser, and nothing here reads a field of it
  * except to decide when to flush and what to drop when it is too large.
  *
+ * <p>One thing is changed. OpenLineage copies the Spark settings a job asked it to capture, and
+ * what it reads of the platform, without redacting them, so they are redacted here by the rule the
+ * listener applies to Spark's own events.
+ *
  * <p>Nothing may escape into the customer's job, the same rule the listener keeps.
  */
 public final class ConvalesceTransport extends Transport {
@@ -30,6 +34,9 @@ public final class ConvalesceTransport extends Transport {
 
   private final Emitter emitter;
   private final String sparkVersion;
+  // Read from the running Spark at the first event: the transport is built with no configuration
+  // of Spark's, and may be built before there is one to ask.
+  private volatile Redaction redaction;
 
   /** Built by {@link ConvalesceTransportBuilder}, sharing the listener's emitter. */
   public ConvalesceTransport() {
@@ -85,8 +92,13 @@ public final class ConvalesceTransport extends Transport {
     }
   }
 
-  private static String payload(OpenLineage.RunEvent event) {
-    return "{\"run_event\":" + OpenLineageClientUtils.toJson(event) + "}";
+  private String payload(OpenLineage.RunEvent event) {
+    Redaction rule = redaction;
+    if (rule == null) {
+      rule = Redaction.ofRunningSpark();
+      redaction = rule;
+    }
+    return "{\"run_event\":" + rule.applyToRunEvent(OpenLineageClientUtils.toJson(event)) + "}";
   }
 
   /**

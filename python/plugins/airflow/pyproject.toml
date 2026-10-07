@@ -4,12 +4,15 @@ dynamic = ["version"]
 description = "Forward Airflow run and lineage events to Convalesce."
 readme = "README.md"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Convalesce" }]
 # The host tool is deliberately not a dependency: this installs into an
 # existing one, and pinning it would fight that environment's resolution.
+# Its OpenLineage provider is not one either, for the same reason, and is
+# carried instead (see `carried.py`). What that copy needs and cannot carry
+# is the SQL parser: compiled, and with no requirements of its own.
 requires-python = ">=3.9"
-dependencies = ["convalesce-emit>=0.1,<1"]
+dependencies = ["convalesce-emit>=0.2.0,<1", "openlineage-sql>=1.4"]
 
 [project.entry-points."airflow.plugins"]
 convalesce_emit = "convalesce_emit_airflow.plugin:ConvalescePlugin"

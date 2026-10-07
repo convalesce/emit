@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/OpenLineage/OpenLineage/main/integration/common/openlineage/common/schema/dbt-version-run-facet.json",
+  "$defs": {
+    "DbtVersionRunFacet": {
+      "allOf": [
+        {
+          "$ref": "https://openlineage.io/spec/1-0-2/OpenLineage.json#/$defs/BaseFacet"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "version": {
+              "type": "string",
+              "example": "0.20.1"
+            }
+          }
+        }
+      ],
+      "type": "object"
+    }
+  },
+  "type": "object",
+  "properties": {
+    "dbt_version": {
+      "$ref": "#/$defs/DbtVersionRunFacet"
+    }
+  }
+}

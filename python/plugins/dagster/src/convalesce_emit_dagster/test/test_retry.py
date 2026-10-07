@@ -527,3 +527,17 @@ class Test_run_pending_retries1(unittest.TestCase):
             summary = cedagretry.run_pending_retries(config=cemit.Config())
         claim.assert_not_called()
         self.assertEqual(summary.considered, 0)
+
+
+class Test_reexecute_mutation1(unittest.TestCase):
+    """
+    Test the text of the re-execution request itself.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that it names only types the mutation can answer with:
+        Dagster refuses the whole request for a fragment on any other.
+        """
+        self.assertNotIn("RunNotFoundError", cedagretry._REEXECUTE_MUTATION)
+        self.assertIn("LaunchRunSuccess", cedagretry._REEXECUTE_MUTATION)

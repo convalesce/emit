@@ -122,14 +122,48 @@ class Test_read_target1(unittest.TestCase):
 
     def test2(self) -> None:
         """
-        Test that no env var set fails closed without resolving anything.
+        Test that with no name set the connection looked for is
+        `convalesce_retry`, and that its absence is not a sign-in.
         """
         with unittest.mock.patch.dict("os.environ", {}, clear=False) as environ:
             environ.pop("CONVALESCE_AIRFLOW_RETRY_TOKEN", None)
-            with unittest.mock.patch.object(cealretry, "_get_connection") as get:
+            environ.pop("CONVALESCE_AIRFLOW_RETRY_CONNECTION", None)
+            with unittest.mock.patch.object(
+                cealretry, "_get_connection", side_effect=RuntimeError("none")
+            ) as get:
                 target = cealretry._read_target()
-        get.assert_not_called()
+        get.assert_called_once_with("convalesce_retry")
         self.assertIsNone(target)
+
+    def test5(self) -> None:
+        """
+        Test that the connection can be named, by the current variable
+        first and still by the one it replaced.
+        """
+        for env, expected in (
+            ({"CONVALESCE_AIRFLOW_RETRY_CONNECTION": "mine"}, "mine"),
+            ({"CONVALESCE_AIRFLOW_RETRY_TOKEN": "older"}, "older"),
+            (
+                {
+                    "CONVALESCE_AIRFLOW_RETRY_CONNECTION": "mine",
+                    "CONVALESCE_AIRFLOW_RETRY_TOKEN": "older",
+                },
+                "mine",
+            ),
+        ):
+            with unittest.mock.patch.dict(
+                "os.environ", {}, clear=False
+            ) as environ:
+                environ.pop("CONVALESCE_AIRFLOW_RETRY_TOKEN", None)
+                environ.pop("CONVALESCE_AIRFLOW_RETRY_CONNECTION", None)
+                environ.update(env)
+                with unittest.mock.patch.object(
+                    cealretry,
+                    "_get_connection",
+                    side_effect=RuntimeError("none"),
+                ) as get:
+                    cealretry._read_target()
+            get.assert_called_once_with(expected)
 
     def test3(self) -> None:
         """
@@ -252,6 +286,16 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(type(self).body)
 
+    def do_GET(self) -> None:  # pylint: disable=invalid-name
+        """Record one GET and answer with the configured response."""
+        type(self).requests.append(
+            {"path": self.path, "headers": dict(self.headers), "body": None}
+        )
+        self.send_response(type(self).status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(type(self).body)
+
     def log_message(self, *_args: Any) -> None:
         """Silence the default stderr logging."""
 
@@ -310,7 +354,7 @@ class Test_clear_task_instance1(_ServerCase):
             {
                 "dry_run": False,
                 "only_failed": False,
-                "reset_dag_runs": False,
+                "reset_dag_runs": True,
                 "dag_run_id": "manual__1",
                 "task_ids": ["load"],
             },
@@ -705,3 +749,222 @@ class Test_run_pending_retries1(unittest.TestCase):
         claim.assert_not_called()
         self.assertEqual(summary.skipped, 1)
         self.assertEqual(summary.claimed, 0)
+
+
+class Test_run_pending_retries_in_place1(unittest.TestCase):
+    """
+    Test which way a task is cleared: in place on an Airflow 2 with no
+    sign-in set up, through the API wherever a sign-in exists, and not at
+    all where neither is possible.
+    """
+
+    def _run(self, major: Any, target: Any, named: Any = None) -> Any:
+        candidate = _candidate(dag_id="orders", task_id="load", run_id="r1")
+        with (
+            unittest.mock.patch.object(
+                ceretry, "list_pending", return_value=[candidate]
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_read_target", return_value=target
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_named_connection", return_value=named
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_airflow_major_version", return_value=major
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_dag_exists_locally", return_value=True
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_dag_exists_over_api", return_value=True
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_authorization", return_value="Bearer t"
+            ),
+            unittest.mock.patch.object(
+                ceretry, "claim", return_value=True
+            ) as claim,
+            unittest.mock.patch.object(ceretry, "report_outcome") as report,
+            unittest.mock.patch.object(
+                cealretry, "_clear_in_place", return_value="orders/r1/load"
+            ) as in_place,
+            unittest.mock.patch.object(
+                cealretry, "_clear_task_instance", return_value="orders/r1/load"
+            ) as through_api,
+        ):
+            summary = cealretry.run_pending_retries(config=cemit.Config())
+        return summary, claim, report, in_place, through_api
+
+    def test1(self) -> None:
+        """
+        Test that Airflow 2 with no connection clears in place and
+        reports the retry as triggered.
+        """
+        summary, _, report, in_place, through_api = self._run(2, None)
+        in_place.assert_called_once_with(
+            dag_id="orders", task_id="load", run_id="r1", map_index=None
+        )
+        through_api.assert_not_called()
+        self.assertEqual((summary.claimed, summary.triggered), (1, 1))
+        self.assertEqual(report.call_args.kwargs["outcome"], ceretry.TRIGGERED)
+
+    def test2(self) -> None:
+        """
+        Test that a connection, where there is one, is what is used, on
+        either major version.
+        """
+        target = cealretry._RetryTarget(base_url="http://af", token="t")
+        for major in (2, 3):
+            _, _, _, in_place, through_api = self._run(major, target)
+            in_place.assert_not_called()
+            through_api.assert_called_once()
+
+    def test3(self) -> None:
+        """
+        Test that Airflow 3 with no connection, and an Airflow whose
+        version cannot be read, claim nothing.
+        """
+        for major in (3, None):
+            summary, claim, _, in_place, _ = self._run(major, None)
+            claim.assert_not_called()
+            in_place.assert_not_called()
+            self.assertEqual((summary.considered, summary.skipped), (1, 1))
+
+    def test4(self) -> None:
+        """
+        Test that a connection somebody named and that does not resolve is
+        not quietly replaced by clearing in place.
+        """
+        summary, claim, _, in_place, _ = self._run(2, None, named="mine")
+        claim.assert_not_called()
+        in_place.assert_not_called()
+        self.assertEqual(summary.skipped, 1)
+
+    def test5(self) -> None:
+        """
+        Test that a failure clearing in place is reported, not retried.
+        """
+        candidate = _candidate(dag_id="orders", task_id="load", run_id="r1")
+        with (
+            unittest.mock.patch.object(
+                ceretry, "list_pending", return_value=[candidate]
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_read_target", return_value=None
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_named_connection", return_value=None
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_airflow_major_version", return_value=2
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_dag_exists_locally", return_value=True
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_dag_exists_over_api", return_value=True
+            ),
+            unittest.mock.patch.object(ceretry, "claim", return_value=True),
+            unittest.mock.patch.object(ceretry, "report_outcome") as report,
+            unittest.mock.patch.object(
+                cealretry, "_clear_in_place", side_effect=RuntimeError("gone")
+            ),
+        ):
+            summary = cealretry.run_pending_retries(config=cemit.Config())
+        self.assertEqual((summary.claimed, summary.failed), (1, 1))
+        self.assertEqual(
+            report.call_args.kwargs["outcome"], ceretry.FAILED_TO_TRIGGER
+        )
+
+
+class Test_dag_exists_over_api1(_ServerCase):
+    """
+    Test the question Airflow 3 is asked instead of its database.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a dag the API knows is ours, asked for by its own path
+        with the sign-in already worked out.
+        """
+        _Recorder.status = 200
+        self.assertTrue(
+            cealretry._dag_exists_over_api(
+                self._target, "orders", "Bearer abc", 2.0
+            )
+        )
+        request = _Recorder.requests[0]
+        self.assertEqual(request["path"], "/api/v2/dags/orders")
+        self.assertEqual(request["headers"]["Authorization"], "Bearer abc")
+
+    def test2(self) -> None:
+        """
+        Test that a dag the API does not know, and an API that cannot be
+        asked, are both not ours.
+        """
+        _Recorder.status = 404
+        with self.assertLogs("convalesce_emit_airflow.retry", level="WARNING"):
+            self.assertFalse(
+                cealretry._dag_exists_over_api(
+                    self._target, "nope", "Bearer abc", 2.0
+                )
+            )
+        gone = cealretry._RetryTarget(base_url="http://127.0.0.1:1", token="t")
+        with self.assertLogs("convalesce_emit_airflow.retry", level="WARNING"):
+            self.assertFalse(
+                cealretry._dag_exists_over_api(gone, "orders", "Bearer abc", 1.0)
+            )
+
+
+class Test_run_pending_retries_on_three1(unittest.TestCase):
+    """
+    Test that Airflow 3 is asked through its API whether a dag is ours,
+    and Airflow 2 through its own dag bag.
+    """
+
+    def _run(self, major: int) -> Any:
+        candidate = _candidate(dag_id="orders", task_id="load", run_id="r1")
+        with (
+            unittest.mock.patch.object(
+                ceretry, "list_pending", return_value=[candidate]
+            ),
+            unittest.mock.patch.object(
+                cealretry,
+                "_read_target",
+                return_value=cealretry._RetryTarget(
+                    base_url="http://af", token="t"
+                ),
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_airflow_major_version", return_value=major
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_authorization", return_value="Bearer t"
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_dag_exists_over_api", return_value=True
+            ) as over_api,
+            unittest.mock.patch.object(
+                cealretry, "_dag_exists_locally", return_value=True
+            ) as locally,
+            unittest.mock.patch.object(ceretry, "claim", return_value=True),
+            unittest.mock.patch.object(ceretry, "report_outcome"),
+            unittest.mock.patch.object(
+                cealretry, "_clear_task_instance", return_value="orders/r1/load"
+            ),
+        ):
+            cealretry.run_pending_retries(config=cemit.Config())
+        return over_api, locally
+
+    def test1(self) -> None:
+        """Test that Airflow 3 is asked through its API."""
+        over_api, locally = self._run(3)
+        over_api.assert_called_once()
+        locally.assert_not_called()
+
+    def test2(self) -> None:
+        """Test that Airflow 2 is asked through its dag bag."""
+        over_api, locally = self._run(2)
+        locally.assert_called_once()
+        over_api.assert_not_called()
