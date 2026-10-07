@@ -7,7 +7,7 @@
   },
   "fields": {
     "Deployment": {
-      "*": "Never read: the flow run already names its deployment (deployment_id, deployment_version) and where it ran (work_pool_name, work_queue_name). The deployment record holds default parameters, job variables and pull steps, customer configuration that can carry credentials, and its schedules decode to nothing yet."
+      "*": "Only id, name, entrypoint and path are read, as api_deployment: where a deployed run's code is. The rest of the record is default parameters, job variables and pull steps, customer configuration that can carry credentials, and its schedules decode to nothing yet. The flow run already names its deployment (deployment_id, deployment_version) and where it ran (work_pool_name, work_queue_name)."
     },
     "WorkPool": {
       "*": "Never read: the flow run names its pool (work_pool_id, work_pool_name). The pool's base job template is infrastructure configuration and can carry credentials."
