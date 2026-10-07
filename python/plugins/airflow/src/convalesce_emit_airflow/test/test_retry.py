@@ -47,6 +47,7 @@ class _Connection:
     host: Any = None
     schema: Any = None
     port: Any = None
+    login: Any = None
     password: Any = None
 
 
@@ -360,6 +361,80 @@ class Test_clear_task_instance1(_ServerCase):
 # #############################################################################
 
 
+# #############################################################################
+# Test_authorization1
+# #############################################################################
+
+
+class Test_authorization1(_ServerCase):
+    """
+    Test how a call signs in, which follows what the connection carries
+    and which Airflow it is.
+    """
+
+    def _user(self) -> Any:
+        return cealretry._RetryTarget(
+            base_url=self._target.base_url, token="pw", login="convalesce"
+        )
+
+    def test1(self) -> None:
+        """
+        Test that a password with no login is a ready-made token, sent as
+        a bearer token whatever the Airflow version, with nothing fetched.
+        """
+        for major in (2, 3, None):
+            self.assertEqual(
+                cealretry._authorization(self._target, major, 5.0),
+                "Bearer af-token",
+            )
+        self.assertEqual(_Recorder.requests, [])
+
+    def test2(self) -> None:
+        """
+        Test that a user is signed in to Airflow 2 with basic auth, which
+        is what its API accepts, with nothing fetched.
+        """
+        header = cealretry._authorization(self._user(), 2, 5.0)
+        self.assertEqual(header, "Basic Y29udmFsZXNjZTpwdw==")
+        self.assertEqual(_Recorder.requests, [])
+
+    def test3(self) -> None:
+        """
+        Test that a user is signed in to Airflow 3 by exchanging the login
+        and password for a token, so nothing stored can expire.
+        """
+        _Recorder.status = 201
+        _Recorder.body = b'{"access_token": "fresh-jwt"}'
+        header = cealretry._authorization(self._user(), 3, 5.0)
+        self.assertEqual(header, "Bearer fresh-jwt")
+        request = _Recorder.requests[0]
+        self.assertEqual(request["path"], "/auth/token")
+        self.assertEqual(
+            request["body"], {"username": "convalesce", "password": "pw"}
+        )
+
+    def test4(self) -> None:
+        """
+        Test that a refused sign-in, or a reply with no token in it, is an
+        error and never a header.
+        """
+        _Recorder.status = 401
+        with self.assertRaises(RuntimeError):
+            cealretry._authorization(self._user(), 3, 5.0)
+        _Recorder.status = 201
+        _Recorder.body = b"{}"
+        with self.assertRaises(RuntimeError):
+            cealretry._authorization(self._user(), 3, 5.0)
+
+    def test5(self) -> None:
+        """
+        Test that a user on an Airflow whose version cannot be read is not
+        signed in by guessing which of the two ways applies.
+        """
+        with self.assertRaises(RuntimeError):
+            cealretry._authorization(self._user(), None, 5.0)
+
+
 class _FakeDagBag:
     """Stands in for Airflow's own DagBag, resolving one fixed dag id."""
 
@@ -600,3 +675,33 @@ class Test_run_pending_retries1(unittest.TestCase):
             summary = cealretry.run_pending_retries(config=cemit.Config())
         claim.assert_not_called()
         self.assertEqual(summary.considered, 0)
+
+    def test7(self) -> None:
+        """
+        Test that a sign-in Airflow refuses stops the run before anything
+        is claimed: a claim is a single shot, and none is spent on it.
+        """
+        candidate = _candidate(dag_id="orders", task_id="load", run_id="r1")
+        with (
+            unittest.mock.patch.object(
+                ceretry, "list_pending", return_value=[candidate]
+            ),
+            unittest.mock.patch.object(
+                cealretry,
+                "_read_target",
+                return_value=cealretry._RetryTarget(
+                    base_url="http://af", token="pw", login="convalesce"
+                ),
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_airflow_major_version", return_value=3
+            ),
+            unittest.mock.patch.object(
+                cealretry, "_token_for", side_effect=RuntimeError("401")
+            ),
+            unittest.mock.patch.object(ceretry, "claim") as claim,
+        ):
+            summary = cealretry.run_pending_retries(config=cemit.Config())
+        claim.assert_not_called()
+        self.assertEqual(summary.skipped, 1)
+        self.assertEqual(summary.claimed, 0)

@@ -16,6 +16,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
+from convalesce_emit_dagster.retry import RETRY_JOB_NAME
 
 _LOG = logging.getLogger(__name__)
 
@@ -198,10 +199,19 @@ def convalesce_sensor(
 def _sensor(
     context: Any, emitter: Optional[cemit.EmitterLike], **kwargs: Any
 ) -> None:
-    target = emitter or cemit.Emitter()
     parts = unwrap_context(context)
     had_parts = bool(parts)
     run = parts.get("dagster_run")
+    # The job that asks which retries are approved runs every minute and is
+    # ours, not the customer's: its runs are not news about their pipelines.
+    job_name = (
+        run.get("job_name")
+        if isinstance(run, dict)
+        else getattr(run, "job_name", None)
+    )
+    if job_name == RETRY_JOB_NAME:
+        return
+    target = emitter or cemit.Emitter()
     if run is not None:
         parts.update(reach_instance(context, run))
     groups = asset_group_names(context)

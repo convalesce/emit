@@ -67,13 +67,57 @@ class Test_read_target1(unittest.TestCase):
             self.assertIsNone(ceprefretry._read_target())
 
     def test3(self) -> None:
-        """Test that a missing key fails closed."""
+        """
+        Test that an open server somebody runs themselves needs no key, and
+        is sent nothing to sign in with.
+        """
         with unittest.mock.patch.dict(
             "os.environ",
             {"CONVALESCE_PREFECT_RETRY_API_URL": "http://prefect:4200/api"},
             clear=True,
         ):
+            target = ceprefretry._read_target()
+        assert target is not None
+        self.assertEqual(ceprefretry._sign_in(target), {})
+
+    def test4(self) -> None:
+        """Test that Prefect Cloud with no key fails closed: it always takes one."""
+        url = "https://api.prefect.cloud/api/accounts/a/workspaces/w"
+        with unittest.mock.patch.dict(
+            "os.environ", {"CONVALESCE_PREFECT_RETRY_API_URL": url}, clear=True
+        ):
             self.assertIsNone(ceprefretry._read_target())
+
+    def test5(self) -> None:
+        """
+        Test that a secured server somebody runs themselves is signed in
+        to with its user and password, as basic auth.
+        """
+        with unittest.mock.patch.dict(
+            "os.environ",
+            {
+                "CONVALESCE_PREFECT_RETRY_API_URL": "https://prefect.example.com/api",
+                "CONVALESCE_PREFECT_RETRY_AUTH_STRING": "admin:pass",
+            },
+            clear=True,
+        ):
+            target = ceprefretry._read_target()
+        assert target is not None
+        self.assertEqual(
+            ceprefretry._sign_in(target),
+            {"Authorization": "Basic YWRtaW46cGFzcw=="},
+        )
+
+    def test6(self) -> None:
+        """Test that a key, when there is one, is what signs in."""
+        target = ceprefretry._RetryTarget(
+            base_url="https://api.prefect.cloud/api",
+            api_key="k",
+            auth_string="a:b",
+        )
+        self.assertEqual(
+            ceprefretry._sign_in(target), {"Authorization": "Bearer k"}
+        )
 
 
 # #############################################################################

@@ -87,6 +87,9 @@ _LOG = logging.getLogger(__name__)
 
 TOOL = "airflow"
 
+# The dag the customer schedules to call `run_pending_retries`; see `send`.
+RETRY_DAG_ID = "convalesce_retries"
+
 # Where Airflow declares what it will pass. Read as plain modules: asking the
 # listener manager instead builds it, which loads plugins, which imports this
 # module again.
@@ -222,6 +225,13 @@ class _Base:
         :param payload: whatever Airflow handed the hook
         :return: nothing
         """
+        # The dag that asks which retries are approved runs every minute and
+        # is ours, not the customer's: its runs say nothing about theirs.
+        if any(
+            getattr(part, "dag_id", None) == RETRY_DAG_ID
+            for part in payload.values()
+        ):
+            return
         emitter = self.emitter
         if emitter is None:
             return
