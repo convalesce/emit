@@ -13,11 +13,13 @@ swallowed is a caller passing an `outcome` this module does not recognize --
 that is a bug in the caller's own code, not a transport failure, the same
 distinction `record.py` already draws for its `event` argument.
 
-This reads an `api`-scoped key (`CONVALESCE_API_KEY`) -- the same key and
-the same server-side actor `gate.py` already uses -- never the `ingest`
-key. The credential that actually performs a tool's own native retry call
-is a separate one again, resolved and used entirely inside each plugin's
-own sibling `retry.py`, never here and never this key.
+This presents the deployment's own key: the `ingest` key it already
+sends with (`CONVALESCE_INGEST_KEY`), or an `api` key
+(`CONVALESCE_API_KEY`) where one is set, which is tried first. Collect
+shows an ingest key the approved retries of its own deployment only. The
+credential that actually performs a tool's own native retry call is a
+separate one again, resolved and used entirely inside each plugin's own
+sibling `retry.py`, never here and never this key.
 
 This module never claims a coordinate on its own initiative: the caller
 (a plugin's own `retry.py`) must confirm a listed coordinate is one it is
@@ -89,7 +91,7 @@ def list_pending(  # pylint: disable=too-many-return-statements
     :param config: where to send and how hard to try; read from the
         environment when not given
     :return: pending retries, or `[]` on any failure -- disabled, dry-run,
-        no api key, unreachable, timed out, a non-2xx status, or a body
+        no key, unreachable, timed out, a non-2xx status, or a body
         that does not parse as the expected shape. A single malformed row
         inside an otherwise well-formed response is skipped and logged on
         its own, rather than discarding every other row alongside it.
@@ -97,8 +99,8 @@ def list_pending(  # pylint: disable=too-many-return-statements
     cfg = config or ceconfig.Config.from_env()
     if not cfg.enabled or cfg.dry_run:
         return []
-    if not cfg.api_key:
-        _LOG.warning("convalesce: no api key configured; not listing retries")
+    if not _key(cfg):
+        _LOG.warning("convalesce: no key configured; not listing retries")
         return []
 
     url = cfg.endpoint.rstrip("/") + _RETRIES_PATH
@@ -198,10 +200,8 @@ def claim(  # pylint: disable=too-many-return-statements
     cfg = config or ceconfig.Config.from_env()
     if not cfg.enabled or cfg.dry_run:
         return False
-    if not cfg.api_key:
-        _LOG.warning(
-            "convalesce: no api key configured; not claiming %s", remedy_id
-        )
+    if not _key(cfg):
+        _LOG.warning("convalesce: no key configured; not claiming %s", remedy_id)
         return False
 
     url = _remedy_url(cfg, remedy_id) + "/claim"
@@ -289,9 +289,9 @@ def report_outcome(
     cfg = config or ceconfig.Config.from_env()
     if not cfg.enabled or cfg.dry_run:
         return False
-    if not cfg.api_key:
+    if not _key(cfg):
         _LOG.warning(
-            "convalesce: no api key configured; not reporting outcome for %s",
+            "convalesce: no key configured; not reporting outcome for %s",
             remedy_id,
         )
         return False
@@ -352,6 +352,21 @@ def _remedy_url(cfg: ceconfig.Config, remedy_id: str) -> str:
     )
 
 
+def _key(cfg: ceconfig.Config) -> Optional[str]:
+    """
+    The key retries are asked for and reported with.
+
+    The ingest key a deployment already holds is enough: collect lets it
+    see and act on the approved retries of its own deployment and nothing
+    else. An `api` key, where one is set, is used first, as it was before
+    the ingest key could do this.
+
+    :param cfg: the configuration read from the environment
+    :return: the key to present, or None when neither is set
+    """
+    return cfg.api_key or cfg.ingest_key
+
+
 def _call(
     url: str,
     method: str,
@@ -360,7 +375,7 @@ def _call(
     json_body: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, bytes]:
     """
-    Make one HTTP request against collect, as the `api` actor.
+    Make one HTTP request against collect, with the retry key.
 
     Unlike `gate.py`'s equivalent, this returns the status on a non-2xx
     response instead of raising, because callers here need to branch on
@@ -378,7 +393,7 @@ def _call(
         json.dumps(json_body).encode("utf-8") if json_body is not None else None
     )
     headers = {
-        "Authorization": f"Bearer {cfg.api_key}",
+        "Authorization": f"Bearer {_key(cfg)}",
         "User-Agent": f"convalesce-emit/{ceversio.__version__}",
     }
     if data is not None:

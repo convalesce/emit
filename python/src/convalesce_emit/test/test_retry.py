@@ -225,7 +225,7 @@ class Test_claim1(_ServerCase):
     def test1(self) -> None:
         """
         Test that a real 201 with claimed=true returns True, and that the
-        owner and api key -- never the ingest key -- travel as sent.
+        owner and api key travel as sent, the api key ahead of the ingest key.
         """
         _Recorder.status = 201
         _Recorder.body = b'{"remedy_id": "r1", "claimed": true}'
@@ -245,6 +245,23 @@ class Test_claim1(_ServerCase):
             request["headers"]["Authorization"], "Bearer api-secret"
         )
         self.assertNotIn("ingest-secret", json.dumps(request["headers"]))
+
+    def test_ingest_key_alone(self) -> None:
+        """
+        Test that a deployment with only its ingest key presents that one.
+        """
+        _Recorder.status = 201
+        _Recorder.body = b'{"remedy_id": "r1", "claimed": true}'
+        result = ceretry.claim(
+            "r1",
+            owner="worker-7",
+            config=self._config(api_key=None, ingest_key="ingest-secret"),
+        )
+        self.assertTrue(result)
+        self.assertEqual(
+            _Recorder.requests[0]["headers"]["Authorization"],
+            "Bearer ingest-secret",
+        )
 
     def test2(self) -> None:
         """
