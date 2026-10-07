@@ -52,6 +52,7 @@ import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import convalesce_emit as cemit
+import convalesce_emit_airflow._env as cealenv
 import convalesce_emit_airflow.carried as cealcar
 import convalesce_emit_airflow.listener as cealist
 
@@ -370,7 +371,7 @@ def _flag(env: Mapping[str, str], name: str) -> Optional[bool]:
     :return: False when it is set to a false value, True when set to
         anything else, None when unset
     """
-    raw = env.get(name)
+    raw = cealenv.read(name, env)
     if raw is None:
         return None
     return raw.strip().lower() not in _FALSY

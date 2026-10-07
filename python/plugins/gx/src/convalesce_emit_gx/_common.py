@@ -42,13 +42,28 @@ _QUERY_CUT = "query cut"
 _SKIP_ARGS = frozenset({"data_asset"})
 
 
+# What a platform may put in front of a setting's name, as AWS Glue does
+# with the variables it hands a job. Read here for the same reason.
+_PLATFORM_PREFIX = "CUSTOMER_"
+
+
+def read_setting(name: str) -> Optional[str]:
+    """
+    Read one of this plugin's settings, under either of its names.
+
+    :param name: the setting, such as `CONVALESCE_SEND_SOURCE`
+    :return: its value as set, or None when it is set under neither name
+    """
+    return os.environ.get(name, os.environ.get(_PLATFORM_PREFIX + name))
+
+
 def send_samples() -> bool:
     """
     Whether the operator has opted into sending row values.
 
     :return: True when `CONVALESCE_GX_SEND_SAMPLES` is set truthy
     """
-    raw = os.environ.get("CONVALESCE_GX_SEND_SAMPLES", "")
+    raw = read_setting("CONVALESCE_GX_SEND_SAMPLES") or ""
     return raw.strip().lower() in _TRUTHY
 
 
@@ -58,7 +73,7 @@ def send_query() -> bool:
 
     :return: False only when `CONVALESCE_SEND_SOURCE` says so
     """
-    raw = os.environ.get(_SEND_SOURCE_ENV, "")
+    raw = read_setting(_SEND_SOURCE_ENV) or ""
     return raw.strip().lower() not in _FALSY
 
 

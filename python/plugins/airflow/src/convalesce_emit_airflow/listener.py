@@ -68,7 +68,6 @@ import functools
 import importlib
 import inspect
 import logging
-import os
 import re
 from typing import (
     Any,
@@ -86,6 +85,7 @@ from typing import (
 import convalesce_emit as cemit
 import convalesce_emit.source as cesource
 import convalesce_emit.sqlcapture as cesqlcap
+import convalesce_emit_airflow._env as cealenv
 
 _LOG = logging.getLogger(__name__)
 
@@ -315,9 +315,8 @@ def send_arguments() -> bool:
     :return: False only when `CONVALESCE_SEND_ARGUMENTS` says so
     """
     return (
-        os.environ.get("CONVALESCE_SEND_ARGUMENTS", "").strip().lower()
-        not in _FALSY
-    )
+        cealenv.read("CONVALESCE_SEND_ARGUMENTS") or ""
+    ).strip().lower() not in _FALSY
 
 
 def _own_statement(row: Mapping[str, Any]) -> bool:

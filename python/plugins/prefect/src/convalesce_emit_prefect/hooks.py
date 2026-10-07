@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
 import convalesce_emit_prefect._capture as cecap
+import convalesce_emit_prefect._env as ceprefenv
 import convalesce_emit_prefect._lineage as celin
 
 _LOG = logging.getLogger(__name__)
@@ -171,7 +172,7 @@ def send_parameters() -> bool:
     :return: what `CONVALESCE_PREFECT_SEND_PARAMETERS` says where it is set
         to a yes or a no; otherwise whether arguments are sent at all
     """
-    raw = os.environ.get(_SEND_PARAMETERS_ENV, "").strip().lower()
+    raw = (ceprefenv.read(_SEND_PARAMETERS_ENV) or "").strip().lower()
     if raw in _TRUTHY:
         return True
     if raw in _FALSY:
@@ -265,7 +266,7 @@ def send_result() -> bool:
 
     :return: whether `CONVALESCE_PREFECT_SEND_RESULT` is not set falsy
     """
-    raw = os.environ.get(_SEND_RESULT_ENV, "")
+    raw = ceprefenv.read(_SEND_RESULT_ENV) or ""
     return raw.strip().lower() not in _FALSY
 
 
@@ -389,7 +390,7 @@ def api_reads_enabled() -> bool:
 
     :return: whether this event should also read the API
     """
-    raw = os.environ.get(_API_READS_ENV, "")
+    raw = ceprefenv.read(_API_READS_ENV) or ""
     return raw.strip().lower() not in _FALSY
 
 

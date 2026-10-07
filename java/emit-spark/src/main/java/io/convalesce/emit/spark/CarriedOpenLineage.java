@@ -1,5 +1,6 @@
 package io.convalesce.emit.spark;
 
+import io.convalesce.emit.Config;
 import java.io.File;
 import java.lang.ref.WeakReference;
 import java.util.Locale;
@@ -142,10 +143,10 @@ final class CarriedOpenLineage {
   }
 
   private static String switchedOff(Map<String, String> env) {
-    if (isFalse(env.get(OPT_OUT))) {
+    if (isFalse(Config.setting(env, OPT_OUT))) {
       return OPT_OUT + "=false";
     }
-    if (isFalse(env.get("CONVALESCE_ENABLED"))) {
+    if (isFalse(Config.setting(env, "CONVALESCE_ENABLED"))) {
       return "CONVALESCE_ENABLED=false";
     }
     return null;

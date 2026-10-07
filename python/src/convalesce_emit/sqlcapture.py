@@ -31,11 +31,12 @@ import importlib
 import importlib.abc
 import importlib.util
 import logging
-import os
 import re
 import sys
 import threading
 from typing import Any, Callable, Dict, List, Optional
+
+import convalesce_emit.config as ceconfig
 
 _LOG = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ def enabled() -> bool:
 
     :return: False only when the setting says so
     """
-    return os.environ.get(_ENV, "").strip().lower() not in _FALSY
+    return (ceconfig.read_setting(_ENV) or "").strip().lower() not in _FALSY
 
 
 def ignore(predicate: Callable[[Dict[str, Any]], bool]) -> None:

@@ -104,3 +104,11 @@ PySpark 3.3 to 4.0, on Python 3.9 and later.
 
 Read from the environment: see
 [convalesce-emit](https://pypi.org/project/convalesce-emit/).
+
+On AWS Glue, give every setting with `CUSTOMER_` in front, in the job
+parameter `--customer-driver-env-vars`:
+`CUSTOMER_CONVALESCE_INGEST_KEY=...,CUSTOMER_CONVALESCE_PYSPARK_DRIVER_HOOK=true`.
+Glue installs `--additional-python-modules` where Python runs the `.pth`
+file, so that last one turns the hook on with no code change. Call
+`install()` from the job's script instead to have `driver_script` carry
+that script.

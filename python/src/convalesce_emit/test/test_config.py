@@ -11,6 +11,8 @@ import unittest.mock
 
 import convalesce_emit.config as ceconfig
 import convalesce_emit.errors as ceerrors
+import convalesce_emit.source as cesource
+import convalesce_emit.sqlcapture as cesqlcap
 
 _LOG = logging.getLogger(__name__)
 
@@ -119,3 +121,51 @@ class Test_config_from_env1(unittest.TestCase):
                 endpoint="https://explicit.example"
             )
         self.assertEqual(config.endpoint, "https://explicit.example")
+
+    def test4(self) -> None:
+        """
+        Test that a setting is read under the prefix a platform puts on it.
+        """
+        env = {
+            "CUSTOMER_CONVALESCE_ENDPOINT": " https://prefixed.example ",
+            "CUSTOMER_CONVALESCE_INGEST_KEY": "from-prefixed",
+            "CUSTOMER_CONVALESCE_DRY_RUN": "true",
+            "CUSTOMER_CONVALESCE_BATCH_SIZE": "7",
+        }
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            config = ceconfig.Config.from_env()
+        self.assertEqual(config.endpoint, "https://prefixed.example")
+        self.assertEqual(config.ingest_key, "from-prefixed")
+        self.assertTrue(config.dry_run)
+        self.assertEqual(config.batch_size, 7)
+
+    def test5(self) -> None:
+        """
+        Test that a setting's own name wins over the prefixed one.
+        """
+        env = {
+            "CONVALESCE_ENDPOINT": "https://own.example",
+            "CUSTOMER_CONVALESCE_ENDPOINT": "https://prefixed.example",
+            "CONVALESCE_DRY_RUN": "false",
+            "CUSTOMER_CONVALESCE_DRY_RUN": "true",
+        }
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            config = ceconfig.Config.from_env()
+        self.assertEqual(config.endpoint, "https://own.example")
+        self.assertFalse(config.dry_run)
+
+    def test6(self) -> None:
+        """
+        Test that the switches read outside the configuration follow suit.
+        """
+        env = {
+            "CUSTOMER_CONVALESCE_SEND_SOURCE": "off",
+            "CUSTOMER_CONVALESCE_SQL_CAPTURE": "off",
+        }
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            self.assertFalse(cesource.enabled())
+            self.assertFalse(cesqlcap.enabled())
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(cesource.enabled())
+            self.assertTrue(cesqlcap.enabled())
+            self.assertIsNone(ceconfig.read_setting("CONVALESCE_ENDPOINT"))

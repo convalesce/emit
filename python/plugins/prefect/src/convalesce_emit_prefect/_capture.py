@@ -27,7 +27,6 @@ import convalesce_emit_prefect._capture as cecap
 import itertools
 import json
 import logging
-import os
 import sys
 import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,6 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import convalesce_emit as cemit
 import convalesce_emit.source as cesource
 import convalesce_emit.sqlcapture as cesqlcap
+import convalesce_emit_prefect._env as ceprefenv
 
 _LOG = logging.getLogger(__name__)
 
@@ -107,7 +107,7 @@ def send_arguments() -> bool:
 
     :return: False only when `CONVALESCE_SEND_ARGUMENTS` says so
     """
-    raw = os.environ.get(_SEND_ARGUMENTS_ENV, "")
+    raw = ceprefenv.read(_SEND_ARGUMENTS_ENV) or ""
     return raw.strip().lower() not in _FALSY
 
 

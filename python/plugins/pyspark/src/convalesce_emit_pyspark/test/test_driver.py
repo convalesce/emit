@@ -536,6 +536,18 @@ class Test_script1(_HookTestCase):
         self.assertEqual(script["argv"], [self.script])
         self.assertIn("source", script)
 
+    def test_arguments_can_be_switched_off_under_a_platforms_prefix(
+        self,
+    ) -> None:
+        """Arguments can be switched off under a platform's prefix."""
+        os.environ.pop("CONVALESCE_SEND_ARGUMENTS", None)
+        with mock.patch.dict(
+            os.environ, {"CUSTOMER_CONVALESCE_SEND_ARGUMENTS": "false"}
+        ):
+            self.install()
+            self.fail_main(ValueError("x"))
+        self.assertEqual(self.recorder.sent[0]["payload"]["argv"], [self.script])
+
     def test_a_script_a_launcher_ran_is_the_source(self) -> None:
         """A script a launcher ran is the source."""
         launcher = os.path.join(os.path.dirname(self.script), "runscript.py")
@@ -766,6 +778,22 @@ class Test_pth1(unittest.TestCase):
         install = mock.Mock()
         self._run({"CONVALESCE_PYSPARK_DRIVER_HOOK": "true"}, install)
         install.assert_called_once_with()
+
+    def test_on_when_asked_under_a_platforms_prefix(self) -> None:
+        """On when asked under a platform's prefix."""
+        install = mock.Mock()
+        self._run({"CUSTOMER_CONVALESCE_PYSPARK_DRIVER_HOOK": "true"}, install)
+        install.assert_called_once_with()
+
+    def test_the_settings_own_name_wins(self) -> None:
+        """The setting's own name wins."""
+        install = mock.Mock()
+        env = {
+            "CONVALESCE_PYSPARK_DRIVER_HOOK": "false",
+            "CUSTOMER_CONVALESCE_PYSPARK_DRIVER_HOOK": "true",
+        }
+        self._run(env, install)
+        install.assert_not_called()
 
     def test_a_failing_install_does_not_escape(self) -> None:
         """A failing install does not escape."""

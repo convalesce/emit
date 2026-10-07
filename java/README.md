@@ -34,6 +34,12 @@ Configure it with the same environment variables the Python client uses:
 `5`) sends a part batch in the background, and the JVM's shutdown sends what
 is left.
 
+AWS Glue hands a job only the variables whose names start with `CUSTOMER_`,
+so every setting here is also read with that in front. Give them in the job
+parameter `--customer-driver-env-vars`, separated by commas:
+`CUSTOMER_CONVALESCE_INGEST_KEY=...,CUSTOMER_CONVALESCE_ENDPOINT=...`. A
+setting given under both names is read from its own.
+
 One setting is Spark's own: `CONVALESCE_SPARK_EVENTS`. By default the
 listener forwards what describes a run, which is the application, the jobs
 and the SQL executions starting and ending. Task and stage events describe

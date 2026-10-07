@@ -57,6 +57,12 @@ Set these on the worker; no code changes are needed.
 Try it against a real pipeline before pointing it at an account:
 `CONVALESCE_DRY_RUN=true`.
 
+AWS Glue hands a job only the variables whose names start with `CUSTOMER_`,
+so every setting is also read with that in front. Give them in the job
+parameter `--customer-driver-env-vars`, separated by commas:
+`CUSTOMER_CONVALESCE_INGEST_KEY=...,CUSTOMER_CONVALESCE_ENDPOINT=...`. A
+setting given under both names is read from its own.
+
 ## Check the connection
 
 Run this where the tool runs, with the same environment it has:

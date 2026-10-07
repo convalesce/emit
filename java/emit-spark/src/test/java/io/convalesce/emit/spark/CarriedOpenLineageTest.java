@@ -130,6 +130,19 @@ public class CarriedOpenLineageTest {
   }
 
   @Test
+  public void itCanBeSwitchedOffUnderThePrefixAPlatformPutsOnASetting() {
+    for (String name : new String[] {"CONVALESCE_OPENLINEAGE", "CONVALESCE_ENABLED"}) {
+      SparkConf conf = new SparkConf(false);
+      assertNull(name, CarriedOpenLineage.start(conf, env("CUSTOMER_" + name, "false"), STAND_IN));
+      assertFalse(name, conf.contains(CarriedOpenLineage.TRANSPORT_TYPE));
+    }
+    // The setting's own name wins where both are set.
+    Map<String, String> both = env("CUSTOMER_CONVALESCE_OPENLINEAGE", "false");
+    both.put("CONVALESCE_OPENLINEAGE", "true");
+    assertNotNull(CarriedOpenLineage.start(new SparkConf(false), both, STAND_IN));
+  }
+
+  @Test
   public void ourTransportNamedWithoutItsListenerStillStartsIt() {
     SparkConf conf = new SparkConf(false).set(CarriedOpenLineage.TRANSPORT_TYPE, "convalesce");
     assertNotNull(CarriedOpenLineage.start(conf, NO_ENV, STAND_IN));

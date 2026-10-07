@@ -47,6 +47,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
 import convalesce_emit.source as cesource
+import convalesce_emit_pyspark._env as cepysenv
 
 _LOG = logging.getLogger(__name__)
 
@@ -797,7 +798,7 @@ def _arguments_enabled() -> bool:
 
     :return: False only when `CONVALESCE_SEND_ARGUMENTS` says so
     """
-    return os.environ.get(_ARGUMENTS_ENV, "").strip().lower() not in _FALSY
+    return (cepysenv.read(_ARGUMENTS_ENV) or "").strip().lower() not in _FALSY
 
 
 def _caller_script(frame: Any) -> Optional[str]:
