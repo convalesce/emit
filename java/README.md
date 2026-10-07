@@ -76,9 +76,14 @@ What the listener sets, on the driver's own configuration and only where the job
 | --- | --- | --- |
 | `spark.openlineage.transport.type` | `convalesce` | sends each event through this jar |
 | `spark.openlineage.columnLineage.datasetLineageEnabled` | `true` | the columns a join, filter or grouping read are reported once for the table |
+| `spark.openlineage.capturedProperties` | `spark.master,spark.app.name,spark.glue.JOB_NAME,spark.glue.JOB_RUN_ID` | on AWS Glue, names the job and the run whatever the script calls its application |
+| `spark.openlineage.facets.custom_environment_variables` | `[AWS_DEFAULT_REGION;GLUE_VERSION;GLUE_COMMAND_CRITERIA;GLUE_PYTHON_VERSION;]` | on AWS Glue only: the region and the Glue version the run used |
 
-Every other `spark.openlineage.*` setting is yours and is kept: `namespace`, `appName`,
-`capturedProperties`, the parent job settings an orchestrator adds.
+Every other `spark.openlineage.*` setting is yours and is kept: `namespace`, `appName`, the parent
+job settings an orchestrator adds.
+
+The driver's log says in one line when a job will send no table or column lineage and why: a
+warning when OpenLineage-Spark is not on the classpath, a note when the job runs its own.
 
 Column lineage follows the plan. A column computed by a Python UDF is traced to the columns passed
 to the UDF. Code that leaves the plan, an RDD `map` or a `collect()` whose rows are written back,

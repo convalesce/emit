@@ -18,6 +18,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeSet;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.apache.spark.SparkConf;
 import org.apache.spark.scheduler.SparkListener;
 import org.apache.spark.scheduler.SparkListenerInterface;
@@ -142,6 +146,87 @@ public class CarriedOpenLineageTest {
   }
 
   @Test
+  public void aGlueRunIsNamedByItsJobAndRunWhateverTheScriptCallsItself() {
+    SparkConf conf = new SparkConf(false);
+    assertNotNull(CarriedOpenLineage.start(conf, NO_ENV, STAND_IN));
+    assertEquals(
+        "spark.master,spark.app.name,spark.glue.JOB_NAME,spark.glue.JOB_RUN_ID",
+        conf.get(CarriedOpenLineage.CAPTURED_PROPERTIES));
+    // Off Glue there are no Glue variables to read.
+    assertFalse(conf.contains(CarriedOpenLineage.ENVIRONMENT_VARIABLES));
+  }
+
+  @Test
+  public void onGlueTheVariablesAwsNamesAreRead() {
+    String expected =
+        "[AWS_DEFAULT_REGION;GLUE_VERSION;GLUE_COMMAND_CRITERIA;GLUE_PYTHON_VERSION;]";
+    SparkConf bySetting = new SparkConf(false).set("spark.glue.GLUE_VERSION", "4.0");
+    assertNotNull(CarriedOpenLineage.start(bySetting, NO_ENV, STAND_IN));
+    assertEquals(expected, bySetting.get(CarriedOpenLineage.ENVIRONMENT_VARIABLES));
+    SparkConf byVariable = new SparkConf(false);
+    assertNotNull(CarriedOpenLineage.start(byVariable, env("GLUE_VERSION", "5.0"), STAND_IN));
+    assertEquals(expected, byVariable.get(CarriedOpenLineage.ENVIRONMENT_VARIABLES));
+  }
+
+  @Test
+  public void aJobsOwnCapturedPropertiesAndVariablesAreKept() {
+    SparkConf conf =
+        new SparkConf(false)
+            .set("spark.glue.GLUE_VERSION", "4.0")
+            .set(CarriedOpenLineage.CAPTURED_PROPERTIES, "spark.master")
+            .set(CarriedOpenLineage.ENVIRONMENT_VARIABLES, "[TEAM;]");
+    assertNotNull(CarriedOpenLineage.start(conf, NO_ENV, STAND_IN));
+    assertEquals("spark.master", conf.get(CarriedOpenLineage.CAPTURED_PROPERTIES));
+    assertEquals("[TEAM;]", conf.get(CarriedOpenLineage.ENVIRONMENT_VARIABLES));
+  }
+
+  @Test
+  public void aJobWithoutOpenLineageIsToldOnceWhyItHasNoLineage() {
+    List<LogRecord> said = new ArrayList<LogRecord>();
+    Handler handler = listening(said);
+    try {
+      SparkConf conf = new SparkConf(false);
+      assertNull(CarriedOpenLineage.start(conf));
+      assertNull(CarriedOpenLineage.start(conf));
+      assertEquals(1, said.size());
+      assertEquals(Level.WARNING, said.get(0).getLevel());
+      assertTrue(said.get(0).getMessage().contains("not on the classpath"));
+    } finally {
+      LOG.removeHandler(handler);
+    }
+  }
+
+  @Test
+  public void aJobRunningItsOwnOpenLineageIsToldOnceWhereItsLineageGoes() {
+    List<LogRecord> said = new ArrayList<LogRecord>();
+    Handler handler = listening(said);
+    try {
+      SparkConf conf = new SparkConf(false).set("spark.openlineage.transport.type", "http");
+      assertNull(CarriedOpenLineage.start(conf, NO_ENV, STAND_IN));
+      assertNull(CarriedOpenLineage.start(conf, NO_ENV, STAND_IN));
+      assertEquals(1, said.size());
+      assertEquals(Level.INFO, said.get(0).getLevel());
+      assertTrue(said.get(0).getMessage().contains("spark.openlineage.transport.type"));
+    } finally {
+      LOG.removeHandler(handler);
+    }
+  }
+
+  @Test
+  public void aJobThatSwitchedItOffIsToldNothing() {
+    List<LogRecord> said = new ArrayList<LogRecord>();
+    Handler handler = listening(said);
+    try {
+      assertNull(
+          CarriedOpenLineage.start(
+              new SparkConf(false), env("CONVALESCE_OPENLINEAGE", "false"), STAND_IN));
+      assertTrue(said.toString(), said.isEmpty());
+    } finally {
+      LOG.removeHandler(handler);
+    }
+  }
+
+  @Test
   public void twoListenersOnOneContextStartItOnce() {
     SparkConf conf = new SparkConf(false);
     assertNotNull(CarriedOpenLineage.start(conf, NO_ENV, STAND_IN));
@@ -216,6 +301,29 @@ public class CarriedOpenLineageTest {
                 return null;
               }
             });
+  }
+
+  private static final Logger LOG = Logger.getLogger(CarriedOpenLineage.class.getName());
+
+  /** Collects what is logged at the level a job sees without asking for more. */
+  private static Handler listening(final List<LogRecord> said) {
+    Handler handler =
+        new Handler() {
+          @Override
+          public void publish(LogRecord record) {
+            if (record.getLevel().intValue() >= Level.INFO.intValue()) {
+              said.add(record);
+            }
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    LOG.addHandler(handler);
+    return handler;
   }
 
   private static Map<String, String> env(String name, String value) {
