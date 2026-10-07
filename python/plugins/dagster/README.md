@@ -87,6 +87,24 @@ Text, markdown, JSON, tables, paths and links are replaced by a count of
 what was withheld. Set `CONVALESCE_DAGSTER_SEND_METADATA=false` where your
 sensor runs to send the first part only.
 
+The `path` an IO manager records is sent when it is the URI of a place in
+an object store, such as `s3://my-bucket/orders`, which names a dataset. A
+path on a local disk is counted with what was withheld. Set
+`CONVALESCE_DAGSTER_SEND_LOCAL_PATHS=true` where your sensor runs to send
+local paths too.
+
+## What identifies the deployment
+
+On Dagster+ the sensor sends the deployment name, whether it is a branch
+deployment, the code location, the commit and branch, the repository and
+its URL, and the pull request number and status, as the agent sets them in
+`DAGSTER_CLOUD_*` variables. The commit's author and message stay where
+they are.
+
+A run's tags are sent, yours and Dagster's `dagster/` ones. Of the
+`.dagster/` tags Dagster keeps for itself, the scheduled execution time and
+the repository are sent.
+
 ## Declare what an op reads and writes
 
 An asset names its own table. For an op whose datasets appear nowhere in

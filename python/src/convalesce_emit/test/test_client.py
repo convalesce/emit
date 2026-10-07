@@ -10,6 +10,7 @@ Run with `make test`.
 
 import gzip
 import http.server
+import io
 import json
 import logging
 import os
@@ -289,6 +290,42 @@ class Test_emitter_modes1(_ServerCase):
         self.assertEqual(_Recorder.received, [])
         self.assertIn("dry-run", "\n".join(logs.output))
         self.assertIn('"x": 1', "\n".join(logs.output))
+
+    def test3(self) -> None:
+        """
+        Test that dry-run is seen where no logging is set up: Python then
+        prints warnings and above to stderr and drops the rest.
+        """
+        emitter = self._emitter(dry_run=True)
+        stream = io.StringIO()
+        last_resort = logging.StreamHandler(stream)
+        last_resort.setLevel(logging.WARNING)
+        # A logger that hands its records to no handler, as in a process
+        # that never configured logging.
+        log = logging.getLogger(ceclient.__name__)
+        with unittest.mock.patch.object(log, "propagate", False):
+            with unittest.mock.patch.object(logging, "lastResort", last_resort):
+                emitter.emit(tool="airflow", event="e", payload={"x": 1})
+        self.assertIn("convalesce dry-run:", stream.getvalue())
+        self.assertIn('"x": 1', stream.getvalue())
+
+    def test4(self) -> None:
+        """
+        Test that dry-run stays at INFO where logging is set up, so an
+        application that shows warnings only is not written to.
+        """
+        emitter = self._emitter(dry_run=True)
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        log = logging.getLogger(ceclient.__name__)
+        log.addHandler(handler)
+        log.setLevel(logging.WARNING)
+        try:
+            emitter.emit(tool="airflow", event="e", payload={"x": 1})
+        finally:
+            log.removeHandler(handler)
+            log.setLevel(logging.NOTSET)
+        self.assertEqual(stream.getvalue(), "")
 
 
 # #############################################################################

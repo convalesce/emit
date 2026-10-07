@@ -14,6 +14,7 @@ import convalesce_emit_dagster.sensor as cedsens
 import logging
 import math
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
@@ -160,13 +161,41 @@ METADATA_ALLOWED = frozenset(
 # free text, like the metadata around them.
 _SCHEMA_COLUMN_FIELDS = ("name", "type", "description", "constraints")
 
-# Dagster Cloud's own build of the deployment: which one, and from which
-# commit. Name-prefixed rather than read off any tool object, the same as
-# the Cloud UI itself documents these. `_CLOUD_ENV_SECRET_MARKERS` is a
-# second guard beyond the documented list, in case a future variable in this
-# namespace ever carries a credential.
-_CLOUD_ENV_PREFIX = "DAGSTER_CLOUD_"
-_CLOUD_ENV_SECRET_MARKERS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
+# Dagster+'s own account of the deployment: which one, and from which
+# commit. A fixed list, because the agent sets more under the same prefix
+# than names a deployment or its code: `DAGSTER_CLOUD_GIT_AUTHOR_NAME`,
+# `DAGSTER_CLOUD_GIT_AUTHOR_EMAIL` and `DAGSTER_CLOUD_GIT_MESSAGE` are a
+# person and their words, and anything a later release adds stays behind
+# until it is listed here.
+CLOUD_ENV_ALLOWED = (
+    "DAGSTER_CLOUD_DEPLOYMENT_NAME",
+    "DAGSTER_CLOUD_IS_BRANCH_DEPLOYMENT",
+    "DAGSTER_CLOUD_LOCATION_NAME",
+    "DAGSTER_CLOUD_GIT_SHA",
+    "DAGSTER_CLOUD_GIT_BRANCH",
+    "DAGSTER_CLOUD_GIT_URL",
+    "DAGSTER_CLOUD_GIT_REPO",
+    "DAGSTER_CLOUD_PULL_REQUEST_ID",
+    "DAGSTER_CLOUD_PULL_REQUEST_STATUS",
+)
+
+# The metadata entry an IO manager writes for where it put a value. In an
+# object store that names a dataset; on a local disk it names the machine
+# and, under a home directory, the person.
+_PATH_KEY = "path"
+_LOCAL_PATHS_ENV = "CONVALESCE_DAGSTER_SEND_LOCAL_PATHS"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_URI_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*)://")
+_LOCAL_SCHEMES = frozenset({"file"})
+
+# Tags Dagster puts on a run for its own machinery and hides in its UI:
+# which host and socket the code server listens on, which worker took the
+# run. The two kept say when a schedule meant the run to start and which
+# repository it belongs to, and name no machine.
+_INTERNAL_TAG_PREFIX = ".dagster/"
+INTERNAL_TAGS_ALLOWED = frozenset(
+    {".dagster/scheduled_execution_time", ".dagster/repository"}
+)
 
 
 def emit_dagster_event(
@@ -284,6 +313,7 @@ def _sensor(
         }
     if not cedsteps.arguments_enabled():
         excluded = excluded + _without_run_config(body)
+    excluded = excluded + _without_internal_tags(body)
     for name in _EVENT_CARRIERS:
         if isinstance(body, dict) and name in body:
             events, withheld = redact_metadata(body[name], name)
@@ -316,6 +346,32 @@ def _without_run_config(body: Any) -> List[Dict[str, str]]:
         return []
     del run["run_config"]
     return [{"path": "dagster_run.run_config", "reason": "arguments not sent"}]
+
+
+def _without_internal_tags(body: Any) -> List[Dict[str, str]]:
+    """
+    Take Dagster's own machinery tags off the run.
+
+    :param body: the dumped payload, changed in place
+    :return: what was left out, by path and reason
+    """
+    run = body.get("dagster_run") if isinstance(body, dict) else None
+    tags = run.get("tags") if isinstance(run, dict) else None
+    if not isinstance(tags, dict):
+        return []
+    internal = sorted(
+        name
+        for name in tags
+        if isinstance(name, str)
+        and name.startswith(_INTERNAL_TAG_PREFIX)
+        and name not in INTERNAL_TAGS_ALLOWED
+    )
+    for name in internal:
+        del tags[name]
+    return [
+        {"path": f"dagster_run.tags.{name}", "reason": "internal tag not sent"}
+        for name in internal
+    ]
 
 
 def redact_metadata(value: Any, path: str) -> Tuple[Any, List[Dict[str, str]]]:
@@ -378,9 +434,12 @@ def _allowed_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
     out: Dict[str, Any] = {}
     plain = MAX_PLAIN_VALUES if metadata_enabled() else 0
+    local_paths = local_paths_enabled()
     for name, entry in metadata.items():
         if name == "dagster/column_schema":
             out[name] = _schema_only(entry)
+        elif name == _PATH_KEY and not local_paths and _is_local_path(entry):
+            continue
         elif name in METADATA_ALLOWED:
             out[name] = entry
         elif plain and _is_plain_value(name, entry):
@@ -419,6 +478,39 @@ def _is_plain_value(name: Any, entry: Any) -> bool:
     if isinstance(value, float):
         return math.isfinite(value)
     return isinstance(value, (bool, int))
+
+
+def _is_local_path(entry: Any) -> bool:
+    """
+    Whether a `path` entry is a place on a disk rather than in a store.
+
+    Dagster's `PathMetadataValue` dumps as `{"path": ...}`, with the same
+    text again under `fspath`, and a path an author passed bare crosses
+    bare. `s3://bucket/orders` is in a store; `/home/someone/orders` and
+    `file:///home/someone/orders` are on a disk. Anything that is not text
+    is not known to be in a store, and is treated as local.
+
+    :param entry: the dumped metadata value
+    :return: False only when every text in it is the URI of a store
+    """
+    texts = list(entry.values()) if isinstance(entry, dict) else [entry]
+    texts = [text for text in texts if text is not None]
+    if not texts:
+        return True
+    for text in texts:
+        match = _URI_SCHEME.match(text) if isinstance(text, str) else None
+        if match is None or match.group(1).lower() in _LOCAL_SCHEMES:
+            return True
+    return False
+
+
+def local_paths_enabled() -> bool:
+    """
+    Whether a path on a local disk is sent as an IO manager wrote it.
+
+    :return: True only when `CONVALESCE_DAGSTER_SEND_LOCAL_PATHS` turns it on
+    """
+    return (cedagenv.read(_LOCAL_PATHS_ENV) or "").strip().lower() in _TRUTHY
 
 
 def metadata_enabled() -> bool:
@@ -709,25 +801,20 @@ def _asset_key_text(key: Any) -> str:
 
 def cloud_environment() -> Dict[str, str]:
     """
-    Dagster Cloud's own deployment and commit info, from its environment.
+    Dagster+'s own deployment and commit info, from its environment.
 
-    Not read off any tool object: Dagster Cloud's agent sets these in the
-    process before user code ever runs, the same way the Cloud UI itself
-    documents them. `_CLOUD_ENV_SECRET_MARKERS` is a second guard beyond the
-    documented, credential-free list, in case a future variable in this
-    namespace ever carries one.
+    Not read off any tool object: the Dagster+ agent sets these in the
+    process before user code ever runs. Only the variables that name the
+    deployment and its code are taken; who wrote the commit and what they
+    said about it stay where they are.
 
-    :return: every `DAGSTER_CLOUD_*` variable found, minus anything whose
-        name suggests a credential
+    :return: each of `CLOUD_ENV_ALLOWED` that is set
     """
-    out: Dict[str, str] = {}
-    for name, value in os.environ.items():
-        if not name.startswith(_CLOUD_ENV_PREFIX):
-            continue
-        if any(marker in name.upper() for marker in _CLOUD_ENV_SECRET_MARKERS):
-            continue
-        out[name] = value
-    return out
+    return {
+        name: os.environ[name]
+        for name in CLOUD_ENV_ALLOWED
+        if os.environ.get(name) is not None
+    }
 
 
 def prune_snapshot(snapshot: Any) -> Any:

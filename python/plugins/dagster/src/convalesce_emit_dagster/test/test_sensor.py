@@ -412,7 +412,7 @@ class Test_redact_metadata1(unittest.TestCase):
             "dagster/row_count": {"value": 5},
             "dagster/table_name": {"text": "shop.orders"},
             "dagster/uri": {"text": "s3://b/orders"},
-            "path": {"path": "/data/orders.parquet"},
+            "path": {"path": "s3://b/orders.parquet"},
             "dagster/relation_identifier": {"text": "db.shop.orders"},
             "size_in_bytes": {"value": 10},
             "dagster/code_version": {"text": "abc"},
@@ -874,6 +874,177 @@ class Test_cloud_environment1(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, env, clear=False):
             out = cedsens.cloud_environment()
         self.assertNotIn("DAGSTER_CLOUD_API_TOKEN", out)
+
+    def test3(self) -> None:
+        """
+        Test that what names the deployment and its code crosses, and who
+        wrote the commit and what they said about it do not.
+        """
+        kept = {
+            "DAGSTER_CLOUD_DEPLOYMENT_NAME": "prod",
+            "DAGSTER_CLOUD_IS_BRANCH_DEPLOYMENT": "0",
+            "DAGSTER_CLOUD_LOCATION_NAME": "my_location",
+            "DAGSTER_CLOUD_GIT_SHA": "abc123",
+            "DAGSTER_CLOUD_GIT_BRANCH": "main",
+            "DAGSTER_CLOUD_GIT_URL": "https://example.com/my-org/my-repo",
+            "DAGSTER_CLOUD_GIT_REPO": "my-org/my-repo",
+            "DAGSTER_CLOUD_PULL_REQUEST_ID": "7",
+            "DAGSTER_CLOUD_PULL_REQUEST_STATUS": "OPEN",
+        }
+        personal = {
+            "DAGSTER_CLOUD_GIT_AUTHOR_EMAIL": "someone@example.com",
+            "DAGSTER_CLOUD_GIT_AUTHOR_NAME": "Some One",
+            "DAGSTER_CLOUD_GIT_MESSAGE": "fix the thing",
+            "DAGSTER_CLOUD_AGENT_SOMETHING_NEW": "host-17",
+        }
+        with unittest.mock.patch.dict(os.environ, {**kept, **personal}):
+            out = cedsens.cloud_environment()
+        self.assertEqual(out, kept)
+
+    def test4(self) -> None:
+        """
+        Test that the sensor sends the deployment without the commit's
+        author.
+        """
+        env = {
+            "DAGSTER_CLOUD_DEPLOYMENT_NAME": "prod",
+            "DAGSTER_CLOUD_GIT_AUTHOR_EMAIL": "someone@example.com",
+        }
+        recorder = _Recorder()
+        with unittest.mock.patch.dict(os.environ, env):
+            cedsens.convalesce_sensor(_Context(), emitter=recorder)
+        self.assertEqual(
+            recorder.sent[0]["payload"]["cloud_environment"],
+            {"DAGSTER_CLOUD_DEPLOYMENT_NAME": "prod"},
+        )
+        self.assertNotIn("someone@example.com", repr(recorder.sent[0]))
+
+
+# #############################################################################
+# Test_local_path1
+# #############################################################################
+
+
+class Test_local_path1(unittest.TestCase):
+    """
+    Test that where an IO manager put a value crosses when it is in a store
+    and stays behind when it is on a local disk.
+    """
+
+    def _metadata(self, path: Any) -> Dict[str, Any]:
+        out, _ = cedsens.redact_metadata(
+            {"metadata": {"path": path, "dagster/row_count": 5}}, "event_log"
+        )
+        kept: Dict[str, Any] = out["metadata"]
+        return kept
+
+    def test1(self) -> None:
+        """
+        Test that the URI of a path in an object store crosses as it is, as
+        Dagster dumps a path value and as a bare text.
+        """
+        for path in (
+            {"path": "s3://my-bucket/orders", "fspath": "s3://my-bucket/orders"},
+            "gs://my-bucket/orders",
+        ):
+            self.assertEqual(
+                self._metadata(path), {"path": path, "dagster/row_count": 5}
+            )
+
+    def test2(self) -> None:
+        """
+        Test that a path on a local disk is withheld and counted, whether
+        absolute, relative, a `file://` URI or not text at all.
+        """
+        for path in (
+            {"path": "/home/someone/storage/result", "fspath": "/home/someone"},
+            "/home/someone/storage/result",
+            "storage/result",
+            "file:///home/someone/storage/result",
+            {"path": None},
+            {},
+            17,
+        ):
+            self.assertEqual(
+                self._metadata(path),
+                {"dagster/row_count": 5, "redacted": True, "count": 1},
+            )
+
+    def test3(self) -> None:
+        """
+        Test that the switch sends a local path as it was written.
+        """
+        env = {"CONVALESCE_DAGSTER_SEND_LOCAL_PATHS": "true"}
+        with unittest.mock.patch.dict(os.environ, env):
+            kept = self._metadata("/data/orders.parquet")
+        self.assertEqual(
+            kept, {"path": "/data/orders.parquet", "dagster/row_count": 5}
+        )
+
+
+# #############################################################################
+# Test_internal_tags1
+# #############################################################################
+
+
+class Test_internal_tags1(unittest.TestCase):
+    """
+    Test that the tags Dagster keeps for its own machinery stay behind.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the code server's host and socket do not cross, that the
+        tags a run was launched with do, and that the removal is declared.
+        """
+        context = _Context(
+            run={
+                "job_name": "nightly",
+                "run_id": "abc",
+                "tags": {
+                    ".dagster/grpc_info": '{"host": "host-17", "socket": "/tmp/x"}',
+                    ".dagster/run_worker": "worker-3",
+                    ".dagster/scheduled_execution_time": "2026-01-01T00:00:00",
+                    ".dagster/repository": "__repository__@my_location",
+                    "dagster/sensor_name": "kick",
+                    "team": "data",
+                },
+            }
+        )
+        recorder = _Recorder()
+        cedsens.convalesce_sensor(context, emitter=recorder)
+        sent = recorder.sent[0]
+        self.assertEqual(
+            sent["payload"]["dagster_run"]["tags"],
+            {
+                ".dagster/scheduled_execution_time": "2026-01-01T00:00:00",
+                ".dagster/repository": "__repository__@my_location",
+                "dagster/sensor_name": "kick",
+                "team": "data",
+            },
+        )
+        self.assertNotIn("host-17", repr(sent["payload"]))
+        self.assertEqual(
+            sent["excluded"],
+            [
+                {
+                    "path": "dagster_run.tags..dagster/grpc_info",
+                    "reason": "internal tag not sent",
+                },
+                {
+                    "path": "dagster_run.tags..dagster/run_worker",
+                    "reason": "internal tag not sent",
+                },
+            ],
+        )
+
+    def test2(self) -> None:
+        """
+        Test that a run without tags crosses with nothing declared left out.
+        """
+        recorder = _Recorder()
+        cedsens.convalesce_sensor(_Context(), emitter=recorder)
+        self.assertEqual(recorder.sent[0]["excluded"], [])
 
 
 # #############################################################################

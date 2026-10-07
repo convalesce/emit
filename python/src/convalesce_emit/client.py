@@ -262,8 +262,10 @@ class Emitter:
         if not batch:
             return
         if self.config.dry_run:
+            level = _dry_run_level()
             for observation in batch:
-                _LOG.info(
+                _LOG.log(
+                    level,
                     "convalesce dry-run: %s",
                     json.dumps(observation.to_dict(), default=str),
                 )
@@ -442,6 +444,22 @@ def post(config: ceconfig.Config, url: str, body: bytes) -> None:
         raise ceerrors.TransportError(
             f"could not reach {url}: {exc.reason}"
         ) from exc
+
+
+def _dry_run_level() -> int:
+    """
+    The level a dry run's observations are logged at, so they are seen.
+
+    Printing them is all a dry run is for. Where the host process has set
+    up no logging, as a Dagster code server has not, Python drops INFO and
+    prints WARNING and above to stderr, so there they go out as warnings.
+    Where logging is set up they stay at INFO, and the application's own
+    configuration decides.
+
+    :return: `logging.INFO` when a handler will see the record, else
+        `logging.WARNING`
+    """
+    return logging.INFO if _LOG.hasHandlers() else logging.WARNING
 
 
 def _flush_at_exit(ref: "weakref.ReferenceType[Emitter]") -> None:
