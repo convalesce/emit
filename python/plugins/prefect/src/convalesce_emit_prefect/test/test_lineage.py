@@ -169,6 +169,32 @@ class Test_lineage1(unittest.TestCase):
         self.assertEqual(len(pending), limit)
         self.assertNotIn("tr-0", pending)
 
+    def test6(self) -> None:
+        """
+        Test that a dataset's platform instance is sent with it, and that
+        one that is not a name is left out.
+        """
+        module = _context_module("tr-6")
+        orders = {
+            "platform": "postgres",
+            "name": "shop.orders",
+            "platform_instance": "replica",
+        }
+        totals = {"platform": "postgres", "name": "shop.totals"}
+        with mock.patch.dict(sys.modules, {"prefect.context": module}):
+            ceprefec.lineage(
+                inputs=[orders],
+                outputs=[{**totals, "platform_instance": 3}],
+            )
+            declared = celin.take(types.SimpleNamespace(id="tr-6"))
+        self.assertEqual(
+            declared,
+            {
+                "inputs": [{**orders, "env": "PROD"}],
+                "outputs": [{**totals, "env": "PROD"}],
+            },
+        )
+
 
 # #############################################################################
 # Test_launched1

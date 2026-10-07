@@ -21,10 +21,13 @@ Import as:
 import convalesce_emit_prefect.hooks as cephooks
 """
 
+import asyncio
+import importlib
 import json
 import logging
 import os
 import re
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
@@ -106,6 +109,15 @@ _CLOUD_URL_RE = re.compile(
     r"^https://api\.prefect\.cloud/api/accounts/(?P<account>[^/]+)"
     r"/workspaces/(?P<workspace>[^/]+)/?"
 )
+
+# A workspace's name is not in the URL: Prefect Cloud is asked for it, once
+# per process, and the answer or the lack of one is kept. The first event
+# waits this long for it at most; a read still running after that is left
+# to finish on its own and its answer rides on the events that follow.
+_CLOUD_CLIENT = "prefect.client.cloud"
+_WORKSPACE_NAME_TIMEOUT_SECONDS = 3.0
+_WORKSPACE_NAME_LOCK = threading.Lock()
+_WORKSPACE_NAMES: Dict[str, Dict[str, str]] = {}
 
 
 def _emit(  # pylint: disable=too-many-arguments
@@ -412,6 +424,9 @@ def api_state(payload: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     workspace = cloud_workspace()
     if workspace:
+        name = cloud_workspace_name(workspace["workspace_id"])
+        if name:
+            workspace["workspace_name"] = name
         out["api_cloud_workspace"] = workspace
     flow_run = payload.get("flow_run")
     flow = payload.get("flow")
@@ -649,6 +664,85 @@ def cloud_workspace() -> Dict[str, str]:
     }
 
 
+def cloud_workspace_name(workspace_id: str) -> Optional[str]:
+    """
+    The name of the Cloud workspace this process talks to.
+
+    The URL names a workspace only by id, so Prefect Cloud is asked, once
+    per process. The read runs on a thread of its own: a hook can fire
+    inside a running event loop, where the Cloud client, which is
+    asynchronous on every supported Prefect, cannot be waited on. Only the
+    first call waits, and for `_WORKSPACE_NAME_TIMEOUT_SECONDS` at most, so
+    a flow is never held longer than that, once. A read that failed is not
+    tried again.
+
+    :param workspace_id: the workspace's id, as the API URL names it
+    :return: its name, or None when it is not known, or not known yet
+    """
+    try:
+        with _WORKSPACE_NAME_LOCK:
+            found = _WORKSPACE_NAMES.get(workspace_id)
+            reader = None
+            if found is None:
+                found = _WORKSPACE_NAMES[workspace_id] = {}
+                reader = threading.Thread(
+                    target=_read_workspace_name,
+                    args=(workspace_id, found),
+                    name="convalesce-prefect-workspace",
+                    daemon=True,
+                )
+                reader.start()
+        if reader is not None:
+            reader.join(_WORKSPACE_NAME_TIMEOUT_SECONDS)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # A process that cannot start a thread still sends the event.
+        _LOG.debug("convalesce: could not read the workspace name: %s", exc)
+        return None
+    return found.get("name")
+
+
+def _read_workspace_name(workspace_id: str, found: Dict[str, str]) -> None:
+    """
+    Ask Prefect Cloud for a workspace's name, on the calling thread.
+
+    `get_cloud_client()` and its `read_workspaces()` are the same on Prefect
+    2.20 and 3.x. Anything else -- no Prefect, a Prefect that moved them, no
+    API key, a Cloud that does not answer in time -- leaves the name unknown.
+
+    :param workspace_id: the workspace's id, as the API URL names it
+    :param found: where the name is put, under `name`, when it is read
+    :return: nothing
+    """
+    try:
+        cloud = importlib.import_module(_CLOUD_CLIENT)
+        workspaces = asyncio.run(
+            asyncio.wait_for(
+                _read_workspaces(cloud), _WORKSPACE_NAME_TIMEOUT_SECONDS
+            )
+        )
+        for workspace in workspaces:
+            if str(getattr(workspace, "workspace_id", "")) != workspace_id:
+                continue
+            name = getattr(workspace, "workspace_name", None)
+            if isinstance(name, str) and name:
+                found["name"] = name
+            return
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: could not read the workspace name: %s", exc)
+
+
+async def _read_workspaces(cloud: Any) -> List[Any]:
+    """
+    Every Cloud workspace the configured API key can see.
+
+    :param cloud: Prefect's `prefect.client.cloud` module
+    :return: the workspaces, each with a `workspace_id` and a
+        `workspace_name`
+    """
+    async with cloud.get_cloud_client() as client:
+        return list(await client.read_workspaces())
+
+
 def emit_flow_run(
     flow: Any = None,
     flow_run: Any = None,
@@ -692,8 +786,6 @@ def running_flow() -> Dict[str, Any]:
     :return: the flow and its run, or nothing when neither is at hand
     """
     try:
-        import importlib
-
         context = importlib.import_module(_FLOW_CONTEXT).FlowRunContext.get()
     except Exception:  # pylint: disable=broad-exception-caught
         # No Prefect, or a Prefect that moved its context: the task run

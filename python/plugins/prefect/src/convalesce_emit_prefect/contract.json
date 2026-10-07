@@ -1,6 +1,10 @@
 {
   "events": {
     "flow_run": [
+      "api_cloud_workspace",
+      "api_cloud_workspace.account_id",
+      "api_cloud_workspace.workspace_id",
+      "api_cloud_workspace.workspace_name",
       "api_deployment",
       "api_deployment.entrypoint",
       "api_deployment.id",
@@ -414,6 +418,10 @@
       "state.updated"
     ],
     "task_run": [
+      "api_cloud_workspace",
+      "api_cloud_workspace.account_id",
+      "api_cloud_workspace.workspace_id",
+      "api_cloud_workspace.workspace_name",
       "api_deployment",
       "api_deployment.entrypoint",
       "api_deployment.id",
@@ -771,10 +779,12 @@
       "lineage.inputs[].env",
       "lineage.inputs[].name",
       "lineage.inputs[].platform",
+      "lineage.inputs[].platform_instance",
       "lineage.outputs",
       "lineage.outputs[].env",
       "lineage.outputs[].name",
       "lineage.outputs[].platform",
+      "lineage.outputs[].platform_instance",
       "result_text",
       "sql_capture",
       "sql_capture.dropped",

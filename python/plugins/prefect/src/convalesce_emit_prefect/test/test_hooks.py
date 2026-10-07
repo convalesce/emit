@@ -4,10 +4,12 @@ Tests for the flow and task state hooks.
 Run with `make test`.
 """
 
+import asyncio
 import json
 import logging
 import os
 import sys
+import threading
 import types
 import unittest
 from typing import Any, Dict, List, Optional
@@ -458,6 +460,192 @@ class Test_cloud_workspace1(unittest.TestCase):
         url = "https://prefect.internal.example.com/api"
         with mock.patch.dict(os.environ, {"PREFECT_API_URL": url}, clear=False):
             self.assertEqual(cephooks.cloud_workspace(), {})
+
+
+# #############################################################################
+# Test_cloud_workspace_name1
+# #############################################################################
+
+
+class _Workspace:
+    """Stands in for one of Prefect Cloud's workspaces."""
+
+    def __init__(self, workspace_id: str, workspace_name: Any) -> None:
+        self.workspace_id = workspace_id
+        self.workspace_name = workspace_name
+
+
+class _CloudClient:
+    """Stands in for Prefect's Cloud client, asynchronous on both majors."""
+
+    def __init__(self, workspaces: Any, calls: List[str]) -> None:
+        self._workspaces = workspaces
+        self._calls = calls
+
+    async def __aenter__(self) -> "_CloudClient":
+        return self
+
+    async def __aexit__(self, *_args: Any) -> None:
+        return None
+
+    async def read_workspaces(self) -> Any:
+        """Every workspace the key can see, or the failure to list them."""
+        self._calls.append("read_workspaces")
+        if isinstance(self._workspaces, Exception):
+            raise self._workspaces
+        return self._workspaces
+
+
+def _cloud_modules(workspaces: Any, calls: List[str]) -> Dict[str, Any]:
+    """The `prefect.client.cloud` module the name is read through, faked."""
+    cloud = types.SimpleNamespace(
+        get_cloud_client=lambda: _CloudClient(workspaces, calls)
+    )
+    return {"prefect.client.cloud": cloud}
+
+
+_CLOUD_URL = "https://api.prefect.cloud/api/accounts/acct-1/workspaces/ws-1"
+
+
+class Test_cloud_workspace_name1(unittest.TestCase):
+    """
+    Test that the workspace's name is read from Prefect Cloud once, and
+    that nothing about the read can cost an event or hold a flow.
+    """
+
+    def setUp(self) -> None:
+        cephooks._WORKSPACE_NAMES.clear()  # pylint: disable=protected-access
+        self.addCleanup(
+            cephooks._WORKSPACE_NAMES.clear  # pylint: disable=protected-access
+        )
+
+    def test1(self) -> None:
+        """
+        Test that the name is sent beside the ids, and read only once
+        however many events are sent.
+        """
+        calls: List[str] = []
+        workspaces = [
+            _Workspace("ws-0", "sandbox"),
+            _Workspace("ws-1", "analytics"),
+        ]
+        with mock.patch.dict(os.environ, {"PREFECT_API_URL": _CLOUD_URL}):
+            with mock.patch.dict(sys.modules, _cloud_modules(workspaces, calls)):
+                first = cephooks.api_state({})
+                second = cephooks.api_state({})
+        expected = {
+            "api_cloud_workspace": {
+                "account_id": "acct-1",
+                "workspace_id": "ws-1",
+                "workspace_name": "analytics",
+            }
+        }
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
+        self.assertEqual(calls, ["read_workspaces"])
+
+    def test2(self) -> None:
+        """
+        Test that a Cloud that refuses the read leaves only the ids, and is
+        not asked again.
+        """
+        calls: List[str] = []
+        modules = _cloud_modules(RuntimeError("401"), calls)
+        with mock.patch.dict(os.environ, {"PREFECT_API_URL": _CLOUD_URL}):
+            with mock.patch.dict(sys.modules, modules):
+                first = cephooks.api_state({})
+                second = cephooks.api_state({})
+        expected = {
+            "api_cloud_workspace": {
+                "account_id": "acct-1",
+                "workspace_id": "ws-1",
+            }
+        }
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
+        self.assertEqual(calls, ["read_workspaces"])
+
+    def test3(self) -> None:
+        """
+        Test that a Prefect without the Cloud client names no workspace.
+        """
+        with mock.patch.dict(sys.modules, {"prefect.client.cloud": None}):
+            self.assertIsNone(cephooks.cloud_workspace_name("ws-1"))
+
+    def test4(self) -> None:
+        """
+        Test that a workspace the key cannot see, or one without a name,
+        is not named.
+        """
+        calls: List[str] = []
+        workspaces = [_Workspace("ws-0", "sandbox"), _Workspace("ws-1", None)]
+        with mock.patch.dict(sys.modules, _cloud_modules(workspaces, calls)):
+            self.assertIsNone(cephooks.cloud_workspace_name("ws-1"))
+            self.assertIsNone(cephooks.cloud_workspace_name("ws-2"))
+        self.assertEqual(calls, ["read_workspaces", "read_workspaces"])
+
+    def test5(self) -> None:
+        """
+        Test that a slow read holds the first event only for the timeout,
+        and that its answer rides on the events that follow.
+        """
+        release = threading.Event()
+        done = threading.Event()
+
+        def slow_read(_workspace_id: str, found: Dict[str, str]) -> None:
+            release.wait(5)
+            found["name"] = "analytics"
+            done.set()
+
+        with (
+            mock.patch.object(cephooks, "_WORKSPACE_NAME_TIMEOUT_SECONDS", 0.01),
+            mock.patch.object(cephooks, "_read_workspace_name", slow_read),
+        ):
+            self.assertIsNone(cephooks.cloud_workspace_name("ws-1"))
+            release.set()
+            self.assertTrue(done.wait(5))
+            self.assertEqual(cephooks.cloud_workspace_name("ws-1"), "analytics")
+
+    def test6(self) -> None:
+        """
+        Test that a read slower than the timeout is given up on.
+        """
+
+        async def never(_cloud: Any) -> List[Any]:
+            await asyncio.sleep(5)
+            return [_Workspace("ws-1", "analytics")]
+
+        found: Dict[str, str] = {}
+        with (
+            mock.patch.object(cephooks, "_WORKSPACE_NAME_TIMEOUT_SECONDS", 0.01),
+            mock.patch.object(cephooks, "_read_workspaces", never),
+        ):
+            with mock.patch.dict(sys.modules, _cloud_modules([], [])):
+                # pylint: disable-next=protected-access
+                cephooks._read_workspace_name("ws-1", found)
+        self.assertEqual(found, {})
+
+    def test7(self) -> None:
+        """
+        Test that a process that cannot start a thread still gets the ids,
+        and that a self-hosted server is never asked.
+        """
+        with mock.patch.object(
+            cephooks.threading,
+            "Thread",
+            side_effect=RuntimeError("no threads"),
+        ) as thread:
+            with mock.patch.dict(os.environ, {"PREFECT_API_URL": _CLOUD_URL}):
+                state = cephooks.api_state({})
+            self.assertEqual(thread.call_count, 1)
+            url = "https://prefect.internal.example.com/api"
+            with mock.patch.dict(os.environ, {"PREFECT_API_URL": url}):
+                self.assertEqual(cephooks.api_state({}), {})
+            self.assertEqual(thread.call_count, 1)
+        self.assertEqual(
+            state["api_cloud_workspace"],
+            {"account_id": "acct-1", "workspace_id": "ws-1"},
+        )
 
 
 # #############################################################################

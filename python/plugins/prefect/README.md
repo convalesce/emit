@@ -52,7 +52,8 @@ def load():
 ```
 
 Each dataset is a urn, or a `platform` and `name` with an optional `env`
-(`PROD` by default).
+(`PROD` by default) and an optional `platform_instance`, for a platform the
+catalogue holds more than one instance of.
 
 On Prefect 3, a task's own assets need none of this: the task-run hook of
 an `@materialize` task sends the assets it writes and the `asset_deps` it
@@ -96,7 +97,9 @@ Read from the environment: see
 Each event also reads the Prefect API directly for the flow record, the run
 graph, the full task-run list, the entrypoint of the deployment that started
 the run and, on Prefect Cloud, the workspace -- state a hook's own arguments
-never carry. This is on by default and needs no
+never carry. The workspace's name is read from Prefect Cloud once per
+process, with the API key Prefect is already configured with, and waited on
+for three seconds at most. This is on by default and needs no
 configuration beyond `CONVALESCE_INGEST_KEY`; set
 `CONVALESCE_PREFECT_API_READS=false` to turn it off if this process's
 Prefect API is locked down, and still get everything the hook's own
