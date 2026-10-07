@@ -22,6 +22,10 @@ be; what ran is the file on the machine that ran it. Arguments are sent
 unless `CONVALESCE_SEND_ARGUMENTS` is false, and the text unless
 `CONVALESCE_SEND_SOURCE` is.
 
+Where the platform says which of its runs the driver is, both say so too:
+on Databricks the job run, job, notebook, cluster and workspace
+(`databricks`), and on YARN which try of the application it is (`attempt`).
+
 A driver usually stops its session before it exits, and a stopped session
 no longer says which application it was. So `SparkContext.stop` is wrapped
 to read the application's id and name first, and nothing else about it
@@ -71,7 +75,18 @@ _YARN_CONTAINER_ENV = "CONTAINER_ID"
 _MAX_FRAMES = 64
 # How many imports are watched for the script before giving up.
 _MAX_LOOKS = 2000
-_YARN_CONTAINER = re.compile(r"^container_(?:e\d+_)?(\d+)_(\d+)_\d+_\d+$")
+_YARN_CONTAINER = re.compile(r"^container_(?:e\d+_)?(\d+)_(\d+)_(\d+)_\d+$")
+# What Databricks says of the job run a driver is for and of where it runs,
+# by the field each is sent as. A job run's id is a Spark job's local
+# property on a classic cluster; the rest is the cluster's configuration.
+_DATABRICKS = {
+    "job_run_id": "spark.databricks.job.runId",
+    "job_id": "spark.databricks.job.id",
+    "notebook_path": "spark.databricks.notebook.path",
+    "cluster_id": "spark.databricks.clusterUsageTags.clusterId",
+    "workspace_id": "spark.databricks.clusterUsageTags.clusterOwnerOrgId",
+    "workspace_url": "spark.databricks.workspaceUrl",
+}
 _ARGUMENTS_ENV = "CONVALESCE_SEND_ARGUMENTS"
 _FALSY = frozenset({"0", "false", "no", "off"})
 
@@ -176,6 +191,8 @@ class _Hook:
         self._script_sent = False
         # The application a stopped context was, read as it stopped.
         self._stopped: _Context = (None, None)
+        # What Databricks said of the run, kept from when it could be read.
+        self._databricks: Dict[str, str] = {}
         self._context_class: Any = None
         self._original_stop: Any = None
         self._finder: Optional["_Finder"] = None
@@ -279,6 +296,7 @@ class _Hook:
             app_id = _read(lambda: context.applicationId)
             if app_id is not None:
                 self._stopped = (app_id, _read(lambda: context.appName))
+            self.databricks()
         except Exception as err:  # pylint: disable=broad-exception-caught
             _LOG.debug("convalesce: could not read the application: %s", err)
 
@@ -296,6 +314,38 @@ class _Hook:
         if self._stopped[0] is not None:
             return self._stopped
         return _yarn_application(), None
+
+    def databricks(self) -> Dict[str, str]:
+        """
+        What Databricks says of the job run this driver is for.
+
+        Read while the session can still say, and kept: a stopped context
+        answers nothing, and what it said before it stopped still holds.
+
+        :return: the fields of `_DATABRICKS` that are set; none off
+            Databricks
+        """
+        try:
+            self._databricks.update(_databricks())
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOG.debug("convalesce: could not read the job run: %s", err)
+        return dict(self._databricks)
+
+    def describe(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Add to a payload which run of its platform this driver is.
+
+        :param payload: what is about to be sent
+        :return: it, with `databricks` where Databricks named the run or
+            the cluster, and `attempt` where YARN numbered the try
+        """
+        found = self.databricks()
+        if found:
+            payload["databricks"] = found
+        attempt = _yarn_attempt()
+        if attempt is not None:
+            payload["attempt"] = attempt
+        return payload
 
     def watch_cells(self) -> None:
         """
@@ -365,11 +415,13 @@ class _Hook:
             self._opened = True
         self._send(
             APPLICATION_START,
-            {
-                "App ID": app_id,
-                "App Name": app_name,
-                "Timestamp": self._attached_ms,
-            },
+            self.describe(
+                {
+                    "App ID": app_id,
+                    "App Name": app_name,
+                    "Timestamp": self._attached_ms,
+                }
+            ),
             [],
         )
 
@@ -450,6 +502,7 @@ class _Hook:
             ):
                 self._exit_code = code
                 self._exit_context = self.context()
+                self.databricks()
                 # A launcher that runs the script for the platform (AWS
                 # Glue's does) catches its exception and exits non-zero.
                 # The exception being handled then is why the driver failed.
@@ -513,7 +566,7 @@ class _Hook:
             "python_version": platform.python_version(),
             "pyspark_version": _pyspark_version(),
         }
-        self._send(EVENT, payload, excluded)
+        self._send(EVENT, self.describe(payload), excluded)
 
     def report_script(self, context: _Context) -> None:
         """
@@ -546,7 +599,7 @@ class _Hook:
         if source is not None:
             payload["source"] = source
             excluded.extend(masked)
-        self._send(SCRIPT_EVENT, payload, excluded)
+        self._send(SCRIPT_EVENT, self.describe(payload), excluded)
 
     def _send(
         self, event: str, payload: Dict[str, Any], excluded: List[Dict[str, str]]
@@ -697,6 +750,61 @@ def _yarn_application() -> Optional[str]:
     """
     match = _YARN_CONTAINER.match(os.environ.get(_YARN_CONTAINER_ENV, ""))
     return f"application_{match.group(1)}_{match.group(2)}" if match else None
+
+
+def _yarn_attempt() -> Optional[int]:
+    """
+    Which try of its YARN application this driver is.
+
+    YARN runs a failed cluster-mode driver again, under the same
+    application id, and every try sends what the one before it did. The
+    container's name numbers the try.
+
+    :return: the attempt, from 1, or None outside a YARN container
+    """
+    match = _YARN_CONTAINER.match(os.environ.get(_YARN_CONTAINER_ENV, ""))
+    return int(match.group(3)) if match else None
+
+
+def _databricks() -> Dict[str, str]:
+    """
+    What the driver's session says of Databricks, importing nothing.
+
+    Over Spark Connect the session's configuration is all there is to ask,
+    and a serverless platform does not answer for every name. With a
+    context, a job run's id is a local property of the thread its code
+    runs on, and the cluster's own settings are its configuration.
+
+    :return: the fields of `_DATABRICKS` that are set
+    """
+    session = _connect() if _over_connect() else None
+    module = sys.modules.get(_PYSPARK)
+    context_class = getattr(module, "SparkContext", None)
+    context = getattr(context_class, "_active_spark_context", None)
+    found: Dict[str, str] = {}
+    for field, name in _DATABRICKS.items():
+        value = _setting(session, context, name)
+        if value:
+            found[field] = value
+    return found
+
+
+def _setting(session: Any, context: Any, name: str) -> Optional[str]:
+    """
+    One Spark setting of the running driver.
+
+    :param session: its Spark Connect session, when it runs over one
+    :param context: else its Spark context, when it has one
+    :param name: the setting
+    :return: its value, or None when it is unset or cannot be read
+    """
+    if session is not None:
+        return _read(lambda: session.conf.get(name, None))
+    if context is None:
+        return None
+    return _read(lambda: context.getLocalProperty(name)) or _read(
+        lambda: context.getConf().get(name)
+    )
 
 
 def _over_connect() -> bool:

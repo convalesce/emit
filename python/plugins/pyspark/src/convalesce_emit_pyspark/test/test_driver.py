@@ -326,6 +326,27 @@ class Test_context1(_HookTestCase):
         )
         self.assertIsNone(payload["application_name"])
 
+    def test_a_yarn_container_numbers_the_attempt(self) -> None:
+        """A yarn container numbers the attempt."""
+        self.install()
+        container = "container_1791409434978_0014_02_000001"
+        with mock.patch.dict(os.environ, {"CONTAINER_ID": container}):
+            self.fail_main(RuntimeError("the second try failed too"))
+            hook = cepysdri._INSTALLED  # pylint: disable=protected-access
+            assert hook is not None
+            hook.at_exit()
+        failure, script = (sent["payload"] for sent in self.recorder.sent)
+        self.assertEqual(failure["attempt"], 2)
+        self.assertEqual(script["attempt"], 2)
+
+    def test_off_yarn_and_databricks_neither_is_said(self) -> None:
+        """Off yarn and databricks neither is said."""
+        self.install()
+        self.fail_main(ValueError("x"))
+        payload = self.recorder.sent[0]["payload"]
+        self.assertNotIn("attempt", payload)
+        self.assertNotIn("databricks", payload)
+
     def test_a_context_that_cannot_be_read_sends_nulls(self) -> None:
         """A context that cannot be read sends nulls."""
         context = mock.Mock()
@@ -752,6 +773,111 @@ class Test_stop1(_HookTestCase):
 
 
 # #############################################################################
+# Test_databricks
+# #############################################################################
+
+
+class _Cluster(_Stoppable):
+    """Stands in for the SparkContext of a Databricks classic cluster."""
+
+    local = {
+        "spark.databricks.job.runId": "456",
+        "spark.databricks.job.id": "123",
+        "spark.databricks.notebook.path": "/Repos/etl/orders_nightly",
+    }
+    settings = {
+        "spark.databricks.job.runId": "1",
+        "spark.databricks.clusterUsageTags.clusterId": "0921-133320-abcd1234",
+        "spark.databricks.clusterUsageTags.clusterOwnerOrgId": "1234567890123456",
+        "spark.databricks.workspaceUrl": "my-workspace.cloud.databricks.com",
+    }
+
+    def getLocalProperty(  # pylint: disable=invalid-name
+        self, name: str
+    ) -> Optional[str]:
+        """What the thread running the job run's code was given."""
+        if type(self)._active_spark_context is None:
+            raise RuntimeError("stopped")
+        return self.local.get(name)
+
+    def getConf(self) -> Dict[str, str]:  # pylint: disable=invalid-name
+        """The cluster's configuration."""
+        return self.settings
+
+
+class Test_databricks1(_HookTestCase):
+    """A driver on a Databricks cluster says which job run it is for."""
+
+    # pylint: disable=protected-access
+
+    _SAID = {
+        "job_run_id": "456",
+        "job_id": "123",
+        "notebook_path": "/Repos/etl/orders_nightly",
+        "cluster_id": "0921-133320-abcd1234",
+        "workspace_id": "1234567890123456",
+        "workspace_url": "my-workspace.cloud.databricks.com",
+    }
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.context = _Cluster()
+        _Cluster._active_spark_context = self.context
+        module = types.ModuleType("pyspark")
+        setattr(module, "__version__", "3.5.3")
+        setattr(module, "SparkContext", _Cluster)
+        patch = mock.patch.dict(sys.modules, {"pyspark": module})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(setattr, _Cluster, "stop", _Cluster.stop)
+
+    def test_a_failure_names_the_job_run_and_where_it_ran(self) -> None:
+        """A failure names the job run and where it ran."""
+        self.install()
+        self.fail_main(ValueError("no Spark job ran"))
+        hook = cepysdri._INSTALLED
+        assert hook is not None
+        hook.at_exit()
+        failure, script = (sent["payload"] for sent in self.recorder.sent)
+        # The thread's own run id, not whatever the configuration holds.
+        self.assertEqual(failure["databricks"], self._SAID)
+        self.assertEqual(script["databricks"], self._SAID)
+
+    def test_what_was_read_before_the_stop_is_kept(self) -> None:
+        """What was read before the stop is kept."""
+        self.install()
+        self.context.stop()
+        self.fail_main(ValueError("after the stop"))
+        self.assertEqual(
+            self.recorder.sent[0]["payload"]["databricks"], self._SAID
+        )
+
+    def test_what_was_read_as_the_driver_exited_is_kept(self) -> None:
+        """What was read as the driver exited is kept."""
+        self.install()
+        with self.assertRaises(SystemExit):
+            sys.exit(1)
+        _Cluster._active_spark_context = None
+        hook = cepysdri._INSTALLED
+        assert hook is not None
+        hook.at_exit()
+        self.assertEqual(
+            self.recorder.sent[0]["payload"]["databricks"], self._SAID
+        )
+
+    def test_a_session_that_cannot_be_asked_changes_nothing(self) -> None:
+        """A session that cannot be asked changes nothing."""
+        self.install()
+        with mock.patch.object(
+            cepysdri, "_databricks", side_effect=RuntimeError("gateway gone")
+        ):
+            self.fail_main(ValueError("x"))
+        payload = self.recorder.sent[0]["payload"]
+        self.assertNotIn("databricks", payload)
+        self.assertEqual(payload["application_id"], "local-1790387079999")
+
+
+# #############################################################################
 # Test_never_raises
 # #############################################################################
 
@@ -904,7 +1030,21 @@ class _ConnectSession:
     """Stands in for a Spark Connect session."""
 
     session_id = "0c067419-ce47-4441-98b0-47ea5a2a3882"
-    conf = types.SimpleNamespace(get=lambda _key: "Databricks Shell")
+    # What serverless answered when asked: the cluster, and no job run.
+    settings = {
+        "spark.app.name": "Databricks Shell",
+        "spark.databricks.clusterUsageTags.clusterId": "0921-133320-abcd1234",
+    }
+    conf = types.SimpleNamespace(
+        get=lambda key, default=None: _ConnectSession.read(key, default)
+    )
+
+    @classmethod
+    def read(cls, key: str, default: Optional[str]) -> Optional[str]:
+        """A setting, or what Spark Connect raises for one it will not say."""
+        if key == "spark.databricks.job.runId":
+            raise RuntimeError("[CONFIG_NOT_AVAILABLE]")
+        return cls.settings.get(key, default)
 
     @classmethod
     def getActiveSession(  # pylint: disable=invalid-name
@@ -969,6 +1109,11 @@ class Test_shell1(Test_script1):
         self.assertEqual(start["App ID"], _ConnectSession.session_id)
         self.assertEqual(start["App Name"], "revenue")
         self.assertEqual(failure["application_id"], _ConnectSession.session_id)
+        # Only what the session would say of Databricks, on all three.
+        cluster = {"cluster_id": "0921-133320-abcd1234"}
+        for sent in self.recorder.sent[:3]:
+            self.assertEqual(sent["payload"]["databricks"], cluster)
+        self.assertNotIn("databricks", self.recorder.sent[3]["payload"])
         self.assertEqual(
             self.recorder.sent[3]["payload"]["App ID"], start["App ID"]
         )

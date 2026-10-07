@@ -41,11 +41,14 @@ final class CarriedOpenLineage {
   // as inputs of every output column. On, they are reported once for the dataset.
   static final String DATASET_LINEAGE = "spark.openlineage.columnLineage.datasetLineageEnabled";
   // OpenLineage copies only spark.master and spark.app.name unless told otherwise. The two Glue
-  // settings name the job and the run even when the script gives its application another name;
-  // off Glue they are absent and nothing is copied for them.
+  // settings name the job and the run even when the script gives its application another name.
+  // The two Databricks settings name the workspace and the cluster, which every event of a run
+  // then says and not only the one built from a Spark job's start. Off either platform its
+  // settings are absent and nothing is copied for them.
   static final String CAPTURED_PROPERTIES = "spark.openlineage.capturedProperties";
   static final String CAPTURED =
-      "spark.master,spark.app.name,spark.glue.JOB_NAME,spark.glue.JOB_RUN_ID";
+      "spark.master,spark.app.name,spark.glue.JOB_NAME,spark.glue.JOB_RUN_ID,"
+          + "spark.databricks.workspaceUrl,spark.databricks.clusterUsageTags.clusterId";
   // The variables AWS's own OpenLineage setup for Glue asks for, in OpenLineage's list syntax.
   static final String ENVIRONMENT_VARIABLES =
       "spark.openlineage.facets.custom_environment_variables";

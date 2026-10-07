@@ -79,7 +79,18 @@ It carries the application's id and name, the exception (type, message,
 traceback, and its cause), `argv` as above, and the Python and PySpark
 versions.
 
-Both are sent before the driver exits, which delays that exit by at most
+### Which run of the platform, on both
+
+- `databricks`, on Databricks: the job run's id, the job's id, the notebook's
+  path, the cluster's id, and the workspace's id and URL, each one the
+  session says. A serverless session says the cluster and not the job run.
+  The job run's id puts a failure on the right job run of a cluster that
+  several job runs share.
+- `attempt`, in a YARN container: which try of the application the driver
+  is, from 1. YARN runs a failed cluster-mode driver again under the same
+  application id, and each try reports.
+
+Both observations are sent before the driver exits, which delays that exit by at most
 `CONVALESCE_TIMEOUT` per attempt. The hook never raises and never changes
 the exit code; the exception still prints as it would have.
 

@@ -13,6 +13,7 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -162,11 +163,26 @@ public class CarriedOpenLineageTest {
   public void aGlueRunIsNamedByItsJobAndRunWhateverTheScriptCallsItself() {
     SparkConf conf = new SparkConf(false);
     assertNotNull(CarriedOpenLineage.start(conf, NO_ENV, STAND_IN));
-    assertEquals(
-        "spark.master,spark.app.name,spark.glue.JOB_NAME,spark.glue.JOB_RUN_ID",
-        conf.get(CarriedOpenLineage.CAPTURED_PROPERTIES));
+    List<String> captured =
+        Arrays.asList(conf.get(CarriedOpenLineage.CAPTURED_PROPERTIES).split(","));
+    assertTrue(
+        captured.containsAll(
+            Arrays.asList(
+                "spark.master", "spark.app.name", "spark.glue.JOB_NAME", "spark.glue.JOB_RUN_ID")));
     // Off Glue there are no Glue variables to read.
     assertFalse(conf.contains(CarriedOpenLineage.ENVIRONMENT_VARIABLES));
+  }
+
+  @Test
+  public void aDatabricksRunSaysItsWorkspaceAndClusterOnEveryEvent() {
+    SparkConf conf = new SparkConf(false);
+    assertNotNull(CarriedOpenLineage.start(conf, NO_ENV, STAND_IN));
+    List<String> captured =
+        Arrays.asList(conf.get(CarriedOpenLineage.CAPTURED_PROPERTIES).split(","));
+    assertTrue(captured.contains("spark.databricks.workspaceUrl"));
+    assertTrue(captured.contains("spark.databricks.clusterUsageTags.clusterId"));
+    // One list, each name whole: a broken join would hide a setting from OpenLineage.
+    assertEquals(6, captured.size());
   }
 
   @Test
