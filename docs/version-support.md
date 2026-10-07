@@ -125,6 +125,25 @@ subprocess with the plugin discovered through the entry point; the failure
 message reaches the wire from Airflow 2.10 and not before; a Spark driver
 flushes what it batched before exiting.
 
+## Spark platforms
+
+Where a Spark driver runs decides how the listener and
+`convalesce-emit-pyspark` are installed and handed their settings. These were
+run for real, with the published install steps:
+
+| Platform | What ran |
+| --- | --- |
+| AWS Glue 4.0 and 5.0 | the listener with its jars by path and `--user-jars-first true`, the helper through `--additional-python-modules`, and every setting through `--customer-driver-env-vars` under its `CUSTOMER_` name |
+| Databricks serverless compute | the helper alone, reporting the Spark Connect session's run, since serverless compute takes no listener |
+| A YARN cluster | the listener and the helper in client and in cluster deploy mode, the driver's settings carried by `spark.yarn.appMasterEnv.*` in cluster mode |
+
+The Amazon EMR steps are the YARN ones, with the package and the settings in
+the cluster's `spark-defaults` and `spark-env` configurations and the helper
+installed by a bootstrap action. The Databricks classic compute steps (an init
+script that copies the jars, the listener named beside Databricks' own)
+follow Databricks' and OpenLineage's own documentation. Neither platform has
+been run.
+
 ## Why the payload is not read
 
 None of these plugins read a field off a tool object, and that is what keeps
