@@ -762,3 +762,125 @@ class Test_pth1(unittest.TestCase):
         lines = [line for line in _PTH.splitlines() if line.strip()]
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0].startswith("import "))
+
+
+# #############################################################################
+# Test_shell
+# #############################################################################
+
+
+class _Events:
+    """Stands in for IPython's event registry."""
+
+    def __init__(self) -> None:
+        self.callbacks: Dict[str, List[Any]] = {}
+
+    def register(self, name: str, callback: Any) -> None:
+        """Keep a callback."""
+        self.callbacks.setdefault(name, []).append(callback)
+
+    def unregister(self, name: str, callback: Any) -> None:
+        """Drop a callback."""
+        self.callbacks[name].remove(callback)
+
+
+class _Shell:
+    """Stands in for the IPython shell a platform runs a driver inside."""
+
+    def __init__(self) -> None:
+        self.events = _Events()
+
+    def run(self, error: Optional[BaseException] = None) -> None:
+        """End a cell, as IPython does, with what it raised."""
+        result = types.SimpleNamespace(
+            error_in_exec=error, error_before_exec=None
+        )
+        for callback in list(self.events.callbacks.get("post_run_cell", [])):
+            callback(result)
+
+
+class _ConnectSession:
+    """Stands in for a Spark Connect session."""
+
+    session_id = "0c067419-ce47-4441-98b0-47ea5a2a3882"
+    conf = types.SimpleNamespace(get=lambda _key: "Databricks Shell")
+
+    @classmethod
+    def getActiveSession(
+        cls,
+    ) -> "_ConnectSession":  # pylint: disable=invalid-name
+        """The session, as PySpark names it."""
+        return cls()
+
+
+class Test_shell1(Test_script1):
+    """A driver a shell runs: nothing is uncaught, and the process lives on."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.shell = _Shell()
+        ipython = types.ModuleType("IPython")
+        setattr(ipython, "get_ipython", lambda: self.shell)
+        patch = mock.patch.dict(sys.modules, {"IPython": ipython})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def over_connect(self) -> None:
+        """Give the driver a Connect session and no context, as serverless does."""
+        connect = types.ModuleType("pyspark.sql.connect.session")
+        setattr(connect, "SparkSession", _ConnectSession)
+        patch = mock.patch.dict(
+            sys.modules,
+            {"pyspark": _pyspark(None), "pyspark.sql.connect.session": connect},
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_a_cell_that_raises_is_reported_with_the_script(self) -> None:
+        """A cell that raises is reported with the script."""
+        self.install()
+        self.shell.run(_raised(LookupError("table orders is not there")))
+        events = [sent["event"] for sent in self.recorder.sent]
+        self.assertEqual(events, ["driver_failure", "driver_script"])
+        detail = self.recorder.sent[0]["payload"]["error_detail"]
+        self.assertEqual(detail["type"], "builtins.LookupError")
+
+    def test_a_session_over_connect_is_a_run_this_opens_and_closes(self) -> None:
+        """A session over connect is a run this opens and closes."""
+        self.over_connect()
+        self.install()
+        self.shell.run(_raised(LookupError("table orders is not there")))
+        self.shell.run()
+        events = [sent["event"] for sent in self.recorder.sent]
+        self.assertEqual(
+            events,
+            [
+                "SparkListenerApplicationStart",
+                "driver_failure",
+                "driver_script",
+                "SparkListenerApplicationEnd",
+            ],
+        )
+        start, failure = (
+            self.recorder.sent[0]["payload"],
+            self.recorder.sent[1]["payload"],
+        )
+        self.assertEqual(start["App ID"], _ConnectSession.session_id)
+        self.assertEqual(start["App Name"], "revenue")
+        self.assertEqual(failure["application_id"], _ConnectSession.session_id)
+        self.assertEqual(
+            self.recorder.sent[3]["payload"]["App ID"], start["App ID"]
+        )
+
+    def test_a_listener_s_application_is_not_opened_again(self) -> None:
+        """A listener s application is not opened again."""
+        self.install()
+        self.shell.run()
+        events = [sent["event"] for sent in self.recorder.sent]
+        self.assertEqual(events, ["driver_script"])
+
+    def test_uninstall_leaves_the_shell(self) -> None:
+        """Uninstall leaves the shell."""
+        self.install()
+        cepysdri.uninstall()
+        self.assertEqual(self.shell.events.callbacks.get("post_run_cell"), [])

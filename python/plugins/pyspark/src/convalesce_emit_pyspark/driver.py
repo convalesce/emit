@@ -40,6 +40,7 @@ import os
 import platform
 import sys
 import threading
+import time
 import types
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -51,8 +52,17 @@ _LOG = logging.getLogger(__name__)
 TOOL = "spark"
 EVENT = "driver_failure"
 SCRIPT_EVENT = "driver_script"
+# Spark's own events for an application's start and end, which this sends
+# itself only where no listener can (`_Hook.open`).
+APPLICATION_START = "SparkListenerApplicationStart"
+APPLICATION_END = "SparkListenerApplicationEnd"
 
 _PYSPARK = "pyspark"
+_CONNECT = "pyspark.sql.connect.session"
+_IPYTHON = "IPython"
+_CELL_EVENT = "post_run_cell"
+# Set by Databricks on serverless compute.
+_SERVERLESS_ENV = "IS_SERVERLESS"
 _ARGUMENTS_ENV = "CONVALESCE_SEND_ARGUMENTS"
 _FALSY = frozenset({"0", "false", "no", "off"})
 
@@ -163,6 +173,11 @@ class _Hook:
         self._exit_code: Any = None
         self._exit_context: _Context = (None, None)
         self._exit_cause: Optional[BaseException] = None
+        self._shell: Any = None
+        self._attached_ms = int(time.time() * 1000)
+        # A Spark Connect session's run, which this opens and closes itself.
+        self._opened = False
+        self._closed = False
         self._previous_excepthook: Callable[..., Any] = sys.excepthook
         self._previous_threading: Callable[..., Any] = threading.excepthook
         self._original_exit: Callable[..., Any] = sys.exit
@@ -180,6 +195,8 @@ class _Hook:
         threading.excepthook = self.threading_excepthook
         sys.exit = self.exit  # type: ignore[assignment]
         atexit.register(self.at_exit)
+        self._attached_ms = int(time.time() * 1000)
+        self.watch_cells()
         if not self.wrap_stop():
             # Hooked before the driver imported PySpark, as the `.pth` does.
             self._finder = _Finder(self)
@@ -199,6 +216,12 @@ class _Hook:
         if sys.exit == self.exit:
             sys.exit = self._original_exit
         atexit.unregister(self.at_exit)
+        if self._shell is not None:
+            try:
+                self._shell.events.unregister(_CELL_EVENT, self.after_cell)
+            except Exception as err:  # pylint: disable=broad-exception-caught
+                _LOG.debug("convalesce: could not leave the shell: %s", err)
+            self._shell = None
         if self._finder in sys.meta_path:
             sys.meta_path.remove(self._finder)
         self._finder = None
@@ -256,8 +279,107 @@ class _Hook:
 
         :return: its id and name, or None for either
         """
+        if _over_connect():
+            return _connect_session()
         live = _spark_context()
         return live if live[0] is not None else self._stopped
+
+    def watch_cells(self) -> None:
+        """
+        Hear of a failure from an IPython shell, where one runs the driver.
+
+        A notebook, and a Python task on Databricks, run inside a shell that
+        catches every exception itself: `sys.excepthook` never sees it and
+        the process does not exit when the code does. The shell says so
+        after each cell instead.
+
+        :return: nothing
+        """
+        try:
+            module = sys.modules.get(_IPYTHON)
+            shell = module.get_ipython() if module is not None else None
+            if shell is None:
+                return
+            shell.events.register(_CELL_EVENT, self.after_cell)
+            self._shell = shell
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOG.debug("convalesce: could not watch the shell: %s", err)
+
+    def after_cell(self, result: Any = None) -> None:
+        """
+        Report a cell that raised, and the script when the shell ran one.
+
+        A shell that runs a script file runs it as its one cell, so the
+        script and the run's end are sent as that cell ends. In a notebook
+        there is no file and no last cell to wait for: only a failure is
+        reported, with the run it ends.
+
+        :param result: IPython's `ExecutionResult` for the cell
+        :return: nothing
+        """
+        try:
+            exc = getattr(result, "error_in_exec", None) or getattr(
+                result, "error_before_exec", None
+            )
+            if exc is None and _script_path() is None:
+                return
+            context = self.context()
+            if exc is not None:
+                self.report(exc, context)
+            self.report_script(context)
+            self.close(context)
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOG.debug("convalesce: could not report the cell: %s", err)
+
+    def open(self, context: _Context) -> None:
+        """
+        Say a Spark Connect session's run started, once.
+
+        With Spark Connect the driver's Python has no JVM beside it, and a
+        serverless platform takes no listener, so nothing else reports the
+        application. This sends Spark's own start event, as the listener
+        would have, before the first thing said of the run.
+
+        :param context: the application's id and name
+        :return: nothing
+        """
+        app_id, app_name = context
+        if app_id is None or not _over_connect() or not _is_driver():
+            return
+        with self._lock:
+            if self._opened:
+                return
+            self._opened = True
+        self._send(
+            APPLICATION_START,
+            {
+                "App ID": app_id,
+                "App Name": app_name,
+                "Timestamp": self._attached_ms,
+            },
+            [],
+        )
+
+    def close(self, context: _Context) -> None:
+        """
+        Say the run `open` started has ended, once.
+
+        :param context: the application's id and name
+        :return: nothing
+        """
+        app_id, _ = context
+        with self._lock:
+            if not self._opened or self._closed:
+                return
+            self._closed = True
+        self._send(
+            APPLICATION_END,
+            {
+                "App ID": app_id,
+                "Timestamp": int(time.time() * 1000),
+            },
+            [],
+        )
 
     # -- the hooks --------------------------------------------------------
 
@@ -342,6 +464,7 @@ class _Hook:
             _LOG.debug("convalesce: could not report the driver: %s", err)
         try:
             self.report_script(self.context())
+            self.close(self.context())
         except Exception as err:  # pylint: disable=broad-exception-caught
             _LOG.debug("convalesce: could not report the script: %s", err)
 
@@ -366,6 +489,7 @@ class _Hook:
                 return
             self._sent = True
         app_id, app_name = context
+        self.open(context)
         argv, excluded = _argv()
         payload: Dict[str, Any] = {
             "application_id": app_id,
@@ -395,6 +519,7 @@ class _Hook:
             if self._script_sent:
                 return
             self._script_sent = True
+        self.open(context)
         argv, excluded = _argv()
         payload: Dict[str, Any] = {
             "application_id": app_id,
@@ -428,7 +553,7 @@ class _Hook:
             event=event,
             payload=payload,
             emitter=emitter,
-            tool_version=payload["pyspark_version"],
+            tool_version=_pyspark_version(),
             excluded=excluded,
         )
 
@@ -532,6 +657,67 @@ def _spark_context() -> _Context:
         _read(lambda: context.applicationId),
         _read(lambda: context.appName),
     )
+
+
+def _over_connect() -> bool:
+    """
+    Whether this driver talks to Spark over Spark Connect, with no JVM of
+    its own and so no application a listener could have reported.
+
+    A serverless platform can keep a local context in the process that runs
+    the shell, shared by every run it serves and reported by nothing: there
+    the Connect session is the run, whatever context is beside it.
+
+    :return: a Connect session was made, and no Spark context of the
+        application's own
+    """
+    if _connect() is None:
+        return False
+    if os.environ.get(_SERVERLESS_ENV, "").strip().lower() == "true":
+        return True
+    module = sys.modules.get(_PYSPARK)
+    context_class = getattr(module, "SparkContext", None)
+    return getattr(context_class, "_active_spark_context", None) is None
+
+
+def _connect() -> Any:
+    """
+    The Spark Connect session this driver made, without importing anything.
+
+    :return: the session, or None
+    """
+    session_class = getattr(sys.modules.get(_CONNECT), "SparkSession", None)
+    if session_class is None:
+        return None
+    for name in ("getActiveSession", "getDefaultSession"):
+        try:
+            session = getattr(session_class, name)()
+        except Exception:  # pylint: disable=broad-exception-caught
+            session = None
+        if session is not None:
+            return session
+    return getattr(session_class, "_default_session", None)
+
+
+def _connect_session() -> _Context:
+    """
+    A Spark Connect session as the application it stands for.
+
+    The session's id is the only identity the client holds. Its name is the
+    script's file name, which says what ran, else the session's
+    `spark.app.name` where the server says one.
+
+    :return: the session's id and a name, or None for both
+    """
+    session = _connect()
+    session_id = (
+        _read(lambda: session.session_id) if session is not None else None
+    )
+    if session_id is None:
+        return None, None
+    path = _script_path()
+    name = os.path.splitext(os.path.basename(path))[0] if path else None
+    return session_id, name or _read(lambda: session.conf.get("spark.app.name"))
 
 
 def _read(getter: Callable[[], Any]) -> Optional[str]:
