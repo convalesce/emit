@@ -958,11 +958,13 @@ class Test_run_pending_retries_on_three1(unittest.TestCase):
         return over_api, locally
 
     def test1(self) -> None:
+        """Test that Airflow 3 is asked through its API."""
         over_api, locally = self._run(3)
         over_api.assert_called_once()
         locally.assert_not_called()
 
     def test2(self) -> None:
+        """Test that Airflow 2 is asked through its dag bag."""
         over_api, locally = self._run(2)
         locally.assert_called_once()
         over_api.assert_not_called()
