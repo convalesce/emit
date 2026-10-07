@@ -78,6 +78,7 @@ Import as:
 import convalesce_emit_prefect.retry as ceprefretry
 """
 
+import base64
 import dataclasses
 import json
 import logging
@@ -107,6 +108,10 @@ _LOG = logging.getLogger(__name__)
 
 _API_URL_ENV = "CONVALESCE_PREFECT_RETRY_API_URL"
 _API_KEY_ENV = "CONVALESCE_PREFECT_RETRY_API_KEY"
+# A self-hosted server that is secured takes `user:password`, the same value
+# as Prefect's own `PREFECT_API_AUTH_STRING`. One that is not takes nothing.
+_AUTH_STRING_ENV = "CONVALESCE_PREFECT_RETRY_AUTH_STRING"
+_CLOUD_HOST_SUFFIX = "prefect.cloud"
 
 
 # #############################################################################
@@ -122,18 +127,23 @@ class _RetryTarget:
     :param base_url: the API's base URL, no trailing slash -- the same
         shape as `PREFECT_API_URL`, including `/api` and any Cloud
         account/workspace path segments
-    :param api_key: sent as a bearer token; never logged
+    :param api_key: a Prefect Cloud API key, sent as a bearer token;
+        never logged
+    :param auth_string: a self-hosted server's `user:password`, sent as
+        basic auth when there is no key; never logged
     """
 
     base_url: str
-    api_key: str
+    api_key: Optional[str] = None
+    auth_string: Optional[str] = None
 
 
 def _read_target() -> Optional[_RetryTarget]:
     """
     Resolve the retry credential, failing closed on anything missing.
 
-    :return: the target to call, or None when the url or key is unset
+    :return: the target to call, or None when the url is unset, or it
+        is Prefect Cloud's and no key is
     """
     url = os.environ.get(_API_URL_ENV)
     api_key = os.environ.get(_API_KEY_ENV)
@@ -143,15 +153,37 @@ def _read_target() -> Optional[_RetryTarget]:
             _API_URL_ENV,
         )
         return None
-    if not api_key or not api_key.strip():
+    base_url = url.strip().rstrip("/")
+    api_key = api_key.strip() if api_key and api_key.strip() else None
+    auth_string = os.environ.get(_AUTH_STRING_ENV)
+    auth_string = (
+        auth_string.strip() if auth_string and auth_string.strip() else None
+    )
+    host = urllib.parse.urlparse(base_url).hostname or ""
+    if api_key is None and host.endswith(_CLOUD_HOST_SUFFIX):
         _LOG.warning(
             "convalesce: %s is not set; not executing prefect retries",
             _API_KEY_ENV,
         )
         return None
     return _RetryTarget(
-        base_url=url.strip().rstrip("/"), api_key=api_key.strip()
+        base_url=base_url, api_key=api_key, auth_string=auth_string
     )
+
+
+def _sign_in(target: _RetryTarget) -> Dict[str, str]:
+    """
+    The header that signs a request in to this Prefect API, if it takes one.
+
+    :param target: where and how to call it
+    :return: the header, or nothing when the server is open
+    """
+    if target.api_key is not None:
+        return {"Authorization": f"Bearer {target.api_key}"}
+    if target.auth_string is not None:
+        pair = base64.b64encode(target.auth_string.encode("utf-8"))
+        return {"Authorization": "Basic " + pair.decode("ascii")}
+    return {}
 
 
 # #############################################################################
@@ -183,7 +215,7 @@ def _call(
         json.dumps(json_body).encode("utf-8") if json_body is not None else None
     )
     headers = {
-        "Authorization": f"Bearer {target.api_key}",
+        **_sign_in(target),
         "User-Agent": f"convalesce-emit-prefect/{ceprefectver.__version__}",
     }
     if data is not None:

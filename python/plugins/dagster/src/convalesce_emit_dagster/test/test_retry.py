@@ -92,13 +92,46 @@ class Test_read_target1(unittest.TestCase):
             self.assertIsNone(cedagretry._read_target())
 
     def test3(self) -> None:
-        """Test that a missing token fails closed."""
+        """
+        Test that a webserver somebody runs themselves needs no token: it
+        has no sign-in of its own, so none is sent.
+        """
         with unittest.mock.patch.dict(
             "os.environ",
             {"CONVALESCE_DAGSTER_RETRY_HOST": "http://dagster:3000"},
             clear=True,
         ):
+            target = cedagretry._read_target()
+        assert target is not None
+        self.assertIsNone(target.token)
+        self.assertEqual(cedagretry._sign_in(target), {})
+
+    def test4(self) -> None:
+        """Test that Dagster+ with no token fails closed: it always takes one."""
+        with unittest.mock.patch.dict(
+            "os.environ",
+            {"CONVALESCE_DAGSTER_RETRY_HOST": "https://acme.dagster.cloud/prod"},
+            clear=True,
+        ):
             self.assertIsNone(cedagretry._read_target())
+
+    def test5(self) -> None:
+        """
+        Test that the token goes in the header each kind of webserver
+        reads: Dagster+'s own, and a bearer token anywhere else.
+        """
+        cloud = cedagretry._RetryTarget(
+            base_url="https://acme.eu.dagster.cloud/prod", token="user-token"
+        )
+        self.assertEqual(
+            cedagretry._sign_in(cloud), {"Dagster-Cloud-Api-Token": "user-token"}
+        )
+        proxied = cedagretry._RetryTarget(
+            base_url="https://dagster.example.com", token="proxy-token"
+        )
+        self.assertEqual(
+            cedagretry._sign_in(proxied), {"Authorization": "Bearer proxy-token"}
+        )
 
 
 # #############################################################################
