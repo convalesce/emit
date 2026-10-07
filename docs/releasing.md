@@ -34,17 +34,21 @@ at a commit on it. Three things enforce this, so a slip cannot publish:
    ```
 
 The `publish` workflow then checks the tag against every declared version,
-builds and uploads the Python packages to PyPI (the five in the publish
-matrix; `convalesce-emit-pyspark` joins once its trusted publisher is
-registered), builds, signs and
+builds and uploads the six Python packages to PyPI, builds, signs and
 deploys the two jars to Maven Central's staging area, and creates the
 GitHub release with generated notes.
+
+## A package that missed a release
+
+Run the workflow by hand on `release` with *rehearse* off and *python_only*
+on. Packages PyPI already holds are skipped, the missing one is uploaded,
+and Maven Central is left alone.
 
 ## Rehearse first
 
 The workflow can be run by hand from the Actions tab with *Upload to
 TestPyPI* ticked, or with `gh workflow run publish.yml --ref <branch> -f
-rehearse=true`. That builds and uploads the same five packages to
+rehearse=true`. That builds and uploads the same six packages to
 https://test.pypi.org, from whatever ref is chosen, and touches nothing
 else: the tag and branch checks are for a tag push, and a rehearsal can only
 claim the `testpypi*` environments, so it has no way to reach PyPI or
@@ -63,9 +67,9 @@ Trusted publishing, so no API token exists to leak or rotate.
 
 - One GitHub environment per package, because PyPI allows a single pending
   publisher per owner, repository, workflow and environment: `pypi` for
-  `convalesce-emit`, then `pypi-airflow`, `pypi-dagster`, `pypi-prefect` and
-  `pypi-gx`. The rehearsal uses the same names with `testpypi` in front.
-- On PyPI, add a *pending publisher* for each of the five names: owner
+  `convalesce-emit`, then `pypi-airflow`, `pypi-dagster`, `pypi-prefect`,
+  `pypi-gx` and `pypi-pyspark`. The rehearsal uses the same names with `testpypi` in front.
+- On PyPI, add a *pending publisher* for each of the six names: owner
   `convalesce`, repository `emit`, workflow `publish.yml`, and that package's
   environment. The first upload claims the name.
 
