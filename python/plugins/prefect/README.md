@@ -96,14 +96,35 @@ Read from the environment: see
 
 Each event also reads the Prefect API directly for the flow record, the run
 graph, the full task-run list, the entrypoint of the deployment that started
-the run and, on Prefect Cloud, the workspace -- state a hook's own arguments
-never carry. The workspace's name is read from Prefect Cloud once per
-process, with the API key Prefect is already configured with, and waited on
-for three seconds at most. This is on by default and needs no
-configuration beyond `CONVALESCE_INGEST_KEY`; set
-`CONVALESCE_PREFECT_API_READS=false` to turn it off if this process's
-Prefect API is locked down, and still get everything the hook's own
-arguments already carry.
+the run and, on Prefect Cloud, the workspace: state a hook's own arguments
+never carry. This is on by default and needs no configuration beyond
+`CONVALESCE_INGEST_KEY`; set `CONVALESCE_PREFECT_API_READS=false` to turn it
+off if this process's Prefect API is locked down, and still get everything
+the hook's own arguments already carry.
+
+- **Workspace.** The account and workspace are read from the API URL
+  Prefect is configured with, whether a profile (`prefect cloud login`) or
+  `PREFECT_API_URL` holds it. The workspace's name is read from Prefect
+  Cloud once per process, with the API key Prefect is already configured
+  with, and waited on for three seconds at most.
+- **Run graph.** Read from `graph-v2`, which Prefect 2.20 and every 3.x
+  server serve, and sent as `api_flow_run_graph_v2`: each task run and
+  subflow run of the flow run, with its parents. Artifacts are left out. A
+  server that does not answer for it is asked for the older graph, sent as
+  `api_flow_run_graph`.
+- **Task runs.** Prefect 3 reports a task run to the API after the fact,
+  so the API can list a run's task runs a few seconds late. The hook that
+  ends a flow run (completion, failure, crash or cancellation) waits for
+  the list to catch up: until every task run in the graph, and every task
+  run this process saw, is listed in a state that ended it. It reads again
+  after 0.25, 0.5, 1, 1.5 and 1.5 seconds and stops at five seconds in
+  total, counting the reads themselves, then sends what it has. Task hooks
+  and `on_running` never wait.
+
+Left out of every event: who started a run beyond `created_by.type` (the
+user's id and handle stay behind), and where a persisted result is stored.
+The plugin's own log lines mask the account and workspace ids of a Prefect
+Cloud URL.
 
 ## What a run says it ran
 

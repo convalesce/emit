@@ -26,7 +26,6 @@ import convalesce_emit_prefect._capture as cecap
 
 import itertools
 import json
-import logging
 import sys
 import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,8 +34,9 @@ import convalesce_emit as cemit
 import convalesce_emit.source as cesource
 import convalesce_emit.sqlcapture as cesqlcap
 import convalesce_emit_prefect._env as ceprefenv
+import convalesce_emit_prefect._mask as cemask
 
-_LOG = logging.getLogger(__name__)
+_LOG = cemask.logger(__name__)
 
 # Where Prefect keeps the running task and flow. Read from the modules
 # already loaded, never imported: where it is not loaded, nothing is running.

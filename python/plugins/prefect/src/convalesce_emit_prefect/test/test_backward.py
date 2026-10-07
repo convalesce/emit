@@ -91,6 +91,11 @@ _MODELS: Dict[str, Tuple[str, Tuple[str, ...]]] = {
         ("task_run.empirical_policy", "api_task_runs[].empirical_policy"),
     ),
     "Flow": ("prefect.client.schemas.objects", ("api_flow",)),
+    "Graph": ("prefect.server.schemas.graph", ("api_flow_run_graph_v2",)),
+    "Node": (
+        "prefect.server.schemas.graph",
+        ("api_flow_run_graph_v2.nodes[]",),
+    ),
     "Deployment": ("prefect.client.schemas.objects", ("api_deployment",)),
     "WorkPool": ("prefect.client.schemas.objects", ()),
     "Asset": ("prefect.assets", ("task.assets[]", "task.asset_deps[]")),

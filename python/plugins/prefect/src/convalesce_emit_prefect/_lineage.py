@@ -28,11 +28,12 @@ import convalesce_emit_prefect._lineage as celin
 
 import collections
 import importlib
-import logging
 import threading
 from typing import Any, Dict, List, Optional, Sequence, Union
 
-_LOG = logging.getLogger(__name__)
+import convalesce_emit_prefect._mask as cemask
+
+_LOG = cemask.logger(__name__)
 
 DEFAULT_ENV = "PROD"
 

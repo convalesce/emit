@@ -233,6 +233,41 @@ class _HttpClient:
         return _APIResponse({"flow": "raw"})
 
 
+def _graph_v2() -> Dict[str, Any]:
+    """`/flow_runs/{id}/graph-v2` as Prefect Cloud answered it for a run of
+    two task runs, the second fed by the first, with an artifact on each
+    level."""
+    artifact = {"id": "a1", "key": "report", "type": "table", "data": "rows"}
+    first = {
+        "kind": "task-run",
+        "id": "t1",
+        "label": "extract-12f",
+        "state_type": "COMPLETED",
+        "start_time": "2026-10-07T23:05:00Z",
+        "end_time": "2026-10-07T23:05:01Z",
+        "parents": [],
+        "children": [{"id": "t2"}],
+        "encapsulating": [],
+        "artifacts": [artifact],
+    }
+    second = {
+        **first,
+        "id": "t2",
+        "label": "load-9e6",
+        "parents": [{"id": "t1"}],
+        "children": [],
+        "artifacts": [],
+    }
+    return {
+        "start_time": "2026-10-07T23:05:00Z",
+        "end_time": "2026-10-07T23:05:03Z",
+        "root_node_ids": ["t1"],
+        "nodes": [["t1", first], ["t2", second]],
+        "artifacts": [artifact],
+        "states": [{"id": "s1", "type": "RUNNING", "name": "Running"}],
+    }
+
+
 class _SyncClient:
     """Stands in for `SyncPrefectClient`, configurably missing a method or
     two, the way Prefect 2's actually is."""
@@ -242,9 +277,15 @@ class _SyncClient:
         task_pages: Optional[List[List[Any]]] = None,
         has_read_flow: bool = True,
         has_request: bool = True,
+        graph_v2: Any = None,
     ) -> None:
         self.calls: List[Any] = []
         self._task_pages = task_pages or []
+        # What each raw path answers with, by its last segment.
+        self.bodies: Dict[str, Any] = {
+            "graph": [{"id": "t2", "upstream_dependencies": [{"id": "t1"}]}],
+            "graph-v2": _graph_v2() if graph_v2 is None else graph_v2,
+        }
         self._http = _HttpClient(self.calls)
         if has_read_flow:
             self.read_flow = self._read_flow
@@ -282,7 +323,7 @@ class _SyncClient:
 
     def _request(self, method: str, path: str) -> _APIResponse:
         self.calls.append(("request", method, path))
-        return _APIResponse({"nodes": ["extract", "load"]})
+        return _APIResponse(self.bodies.get(path.rsplit("/", 1)[-1]))
 
 
 class _FlowRunFilterId:
@@ -344,9 +385,18 @@ class Test_api_state1(unittest.TestCase):
         self.assertEqual(payload["flow"]["name"], "nightly")
         self.assertEqual(payload["api_flow"]["name"], "nightly")
         self.assertEqual(payload["api_flow_run"]["name"], "helpful-marmot")
-        self.assertEqual(
-            payload["api_flow_run_graph"]["nodes"], ["extract", "load"]
+        # The newer graph answered, so the older one was never asked for.
+        graph = payload["api_flow_run_graph_v2"]
+        self.assertEqual([node["id"] for node in graph["nodes"]], ["t1", "t2"])
+        self.assertEqual(graph["nodes"][1]["parents"], [{"id": "t1"}])
+        self.assertEqual(graph["root_node_ids"], ["t1"])
+        self.assertNotIn("api_flow_run_graph", payload)
+        self.assertNotIn(
+            "/flow_runs/a64690f5/graph", [call[-1] for call in client.calls]
         )
+        # An artifact is customer-authored: none crosses, on either level.
+        self.assertNotIn("artifacts", graph)
+        self.assertNotIn("artifacts", graph["nodes"][0])
         self.assertEqual(payload["api_task_runs"], ["t1", "t2", "t3"])
         offsets = [
             call[3] for call in client.calls if call[0] == "read_task_runs"
@@ -1440,3 +1490,489 @@ class Test_deployment1(unittest.TestCase):
         plain = _Raw()
         self.assertNotIn("api_deployment", self._send(plain, _FlowRun()))
         self.assertNotIn(("request", "GET", "/deployments/d-1"), plain.calls)
+
+
+# #############################################################################
+# Test_configured_api_url1
+# #############################################################################
+
+
+def _settings_modules(value: Any) -> Dict[str, Any]:
+    """A stand-in `prefect.settings` whose API URL setting answers `value`,
+    or raises it."""
+
+    def read() -> Any:
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    setting = types.SimpleNamespace(value=read)
+    return {"prefect.settings": types.SimpleNamespace(PREFECT_API_URL=setting)}
+
+
+class Test_configured_api_url1(unittest.TestCase):
+    """
+    Test that the API URL is read the way Prefect resolved it, so a
+    workspace signed in to by profile is found without the environment.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a URL only a profile holds still names the workspace.
+        """
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "PREFECT_API_URL"
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.dict(sys.modules, _settings_modules(_CLOUD_URL)):
+                workspace = cephooks.cloud_workspace()
+        self.assertEqual(
+            workspace, {"account_id": "acct-1", "workspace_id": "ws-1"}
+        )
+
+    def test2(self) -> None:
+        """
+        Test that settings that cannot be read, or that hold no URL, leave
+        the environment's.
+        """
+        for value in (RuntimeError("no profile"), None):
+            with self.subTest(value=value):
+                env = {"PREFECT_API_URL": _CLOUD_URL}
+                with mock.patch.dict(os.environ, env, clear=False):
+                    with mock.patch.dict(sys.modules, _settings_modules(value)):
+                        url = cephooks.configured_api_url()
+                self.assertEqual(url, _CLOUD_URL)
+
+
+# #############################################################################
+# Test_read_run1
+# #############################################################################
+
+
+class _Typed:
+    """Stands in for a state's type, an enum on every supported Prefect."""
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+
+class _Ended:
+    """Stands in for the state a flow hook is handed."""
+
+    def __init__(self, kind: str) -> None:
+        self.type = _Typed(kind)
+        self.name = kind.title()
+
+
+class _ListedRun:
+    """Stands in for a `TaskRun` as the API lists it."""
+
+    def __init__(self, run_id: str, kind: str = "COMPLETED") -> None:
+        self.id = run_id
+        self.state_type = _Typed(kind)
+
+
+class _LateClient(_SyncClient):
+    """A client whose list of task runs catches up read by read, the way
+    Prefect Cloud's does."""
+
+    def __init__(self, reads: List[List[Any]], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._reads = reads
+        self.listed = 0
+
+    def read_task_runs(
+        self, *, flow_run_filter: Any, limit: int, offset: int
+    ) -> List[Any]:
+        """The next read's task runs; the last read's from then on."""
+        read = self._reads[min(self.listed, len(self._reads) - 1)]
+        self.listed += 1
+        return read
+
+
+class _Clock:
+    """Time that passes only while something waits on it."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.waits: List[float] = []
+
+    def monotonic(self) -> float:
+        """The time so far."""
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        """Wait, by moving the time on."""
+        self.waits.append(seconds)
+        self.now += seconds
+
+
+class Test_read_run1(unittest.TestCase):
+    """
+    Test the read of a run's graph and task runs: which graph is sent, and
+    the wait for the API's list at the hook that ends the flow run.
+    """
+
+    # The waits, the registry and the mask are private to the plugin.
+    # pylint: disable=protected-access
+
+    def setUp(self) -> None:
+        self.clock = _Clock()
+        patcher = mock.patch.object(cephooks, "time", self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(cephooks._HOOKED.clear)
+
+    def _flow_event(self, client: Any, kind: str) -> Dict[str, Any]:
+        recorder = _Recorder()
+        with mock.patch.dict(sys.modules, _prefect_modules(client)):
+            cephooks.emit_flow_run(
+                flow=_Flow(),
+                flow_run=_FlowRun(),
+                state=_Ended(kind),
+                emitter=recorder,
+            )
+        payload: Dict[str, Any] = recorder.sent[0]["payload"]
+        return payload
+
+    def test1(self) -> None:
+        """
+        Test that a server without the newer graph is asked for the older
+        one, which crosses under its own name.
+        """
+        client = _SyncClient(graph_v2={"detail": "Not Found"})
+        payload = self._flow_event(client, "RUNNING")
+        self.assertNotIn("api_flow_run_graph_v2", payload)
+        self.assertEqual(payload["api_flow_run_graph"][0]["id"], "t2")
+
+    def test2(self) -> None:
+        """
+        Test that the hook that ends the flow run waits for a list that is
+        shorter than the graph, and stops as soon as it is whole.
+        """
+        late = [[], [_ListedRun("t1")], [_ListedRun("t1"), _ListedRun("t2")]]
+        client = _LateClient(late)
+        payload = self._flow_event(client, "COMPLETED")
+        self.assertEqual(len(payload["api_task_runs"]), 2)
+        self.assertEqual(self.clock.waits, [0.25, 0.5])
+
+    def test3(self) -> None:
+        """
+        Test that an empty list is waited on when a task hook fired in this
+        process, though the graph is empty too.
+        """
+        task_run = _TaskRun()
+        task_run.id = "t9"  # type: ignore[attr-defined]
+        cephooks.emit_task_run(
+            task=object(), task_run=task_run, state="S", emitter=_Recorder()
+        )
+        client = _LateClient([[], [_ListedRun("t9")]], graph_v2={"nodes": []})
+        payload = self._flow_event(client, "FAILED")
+        self.assertEqual(len(payload["api_task_runs"]), 1)
+        self.assertEqual(self.clock.waits, [0.25])
+        # Read once, then forgotten.
+        self.assertEqual(cephooks._HOOKED, {})
+
+    def test4(self) -> None:
+        """
+        Test that a task run listed as still running is waited on, and that
+        the wait never passes its budget.
+        """
+        stuck = [[_ListedRun("t1"), _ListedRun("t2", "RUNNING")]]
+        client = _LateClient(stuck)
+        payload = self._flow_event(client, "CRASHED")
+        self.assertEqual(len(payload["api_task_runs"]), 2)
+        self.assertEqual(self.clock.waits, [0.25, 0.5, 1.0, 1.5, 1.5])
+        self.assertLessEqual(
+            sum(self.clock.waits), cephooks._COMPLETE_READ_BUDGET_SECONDS
+        )
+
+    def test5(self) -> None:
+        """
+        Test that a wait that would pass the budget, counting a read as
+        slow as the last, is not started.
+        """
+        client = _LateClient([[]])
+        real = client.read_task_runs
+
+        def slow(**kwargs: Any) -> List[Any]:
+            self.clock.now += 1.0
+            return real(**kwargs)
+
+        client.read_task_runs = slow  # type: ignore[method-assign]
+        with self.assertLogs(cephooks._LOG, level="DEBUG") as logs:
+            payload = self._flow_event(client, "CANCELLED")
+        self.assertNotIn("api_task_runs", payload)
+        # 1.0 to read, then 0.25 and 0.5 each with a read after it end at
+        # 3.75; a wait of 1.0 and one more read would end past the budget.
+        self.assertEqual(self.clock.waits, [0.25, 0.5])
+        self.assertTrue(any("incompletely" in line for line in logs.output))
+
+    def test6(self) -> None:
+        """
+        Test that nothing waits where the flow is still running, at a task
+        hook, or where the list is already whole.
+        """
+        client = _LateClient([[]])
+        self._flow_event(client, "RUNNING")
+        recorder = _Recorder()
+        with mock.patch.dict(sys.modules, _prefect_modules(_LateClient([[]]))):
+            cephooks.emit_task_run(
+                task=object(),
+                task_run=_TaskRun(),
+                flow=_Flow(),
+                flow_run=_FlowRun(),
+                state=_Ended("COMPLETED"),
+                emitter=recorder,
+            )
+        whole = _LateClient([[_ListedRun("t1"), _ListedRun("t2")]])
+        self._flow_event(whole, "COMPLETED")
+        self.assertEqual(self.clock.waits, [])
+        self.assertIn("api_flow_run_graph_v2", recorder.sent[0]["payload"])
+
+    def test7(self) -> None:
+        """
+        Test that a task run whose result Prefect is tracking is waited for,
+        though no hook is attached to it and the graph is empty.
+        """
+
+        class _Tracked:
+            """Stands in for the state of a task run that returned."""
+
+            def __init__(self, run_id: Any) -> None:
+                self.state_details = types.SimpleNamespace(task_run_id=run_id)
+
+        context = _Context()
+        # Prefect 3 keeps the state first in a tuple; Prefect 2 keeps it
+        # bare. A subflow's state names no task run.
+        setattr(
+            context,
+            "run_results",
+            {1: (_Tracked("t1"), "task_run", None), 2: (_Tracked(None),)},
+        )
+        setattr(context, "task_run_results", {3: _Tracked("t2")})
+        client = _LateClient(
+            [[], [_ListedRun("t1")], [_ListedRun("t1"), _ListedRun("t2")]],
+            graph_v2={"nodes": []},
+        )
+        modules = {"prefect.context": _ContextModule(context)}
+        with mock.patch.dict(sys.modules, modules):
+            payload = self._flow_event(client, "COMPLETED")
+        self.assertEqual(len(payload["api_task_runs"]), 2)
+        self.assertEqual(self.clock.waits, [0.25, 0.5])
+
+    def test8(self) -> None:
+        """
+        Test that the context of another flow run, or one that cannot be
+        read, names no task run.
+        """
+        other = _Context()
+        other.flow_run.id = "another"
+        setattr(other, "run_results", {1: (object(),)})
+        modules = {"prefect.context": _ContextModule(other)}
+        with mock.patch.dict(sys.modules, modules):
+            self.assertEqual(cephooks._tracked_task_runs("a64690f5"), set())
+        broken = types.SimpleNamespace()
+        with mock.patch.dict(sys.modules, {"prefect.context": broken}):
+            self.assertEqual(cephooks._tracked_task_runs("a64690f5"), set())
+
+    def test9(self) -> None:
+        """
+        Test that the task runs remembered per flow run are bounded, oldest
+        flow run first, and that a task run naming no flow run is not kept.
+        """
+        with mock.patch.object(cephooks, "_HOOKED_FLOW_RUNS", 2):
+            for flow_run_id in ("f1", "f2", "f3"):
+                run = types.SimpleNamespace(id="t1", flow_run_id=flow_run_id)
+                cephooks._note_hooked(run)
+            cephooks._note_hooked(types.SimpleNamespace(id="t1"))
+        self.assertEqual(list(cephooks._HOOKED), ["f2", "f3"])
+
+    def test10(self) -> None:
+        """
+        Test that a raw record of a task run reads as a typed one does.
+        """
+        graph = {"nodes": [{"kind": "flow-run", "id": "child"}]}
+        listed = [{"id": "t1", "state_type": "COMPLETED"}]
+        self.assertFalse(cephooks._incomplete(graph, listed, {"t1"}))
+        self.assertTrue(cephooks._incomplete(None, listed, {"t2"}))
+
+
+# #############################################################################
+# Test_withhold_private1
+# #############################################################################
+
+
+class Test_withhold_private1(unittest.TestCase):
+    """
+    Test what is taken out of a payload because it names a person or a
+    place on disk.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that who started a run keeps only its type, on the hook's
+        flow run and on the API's.
+        """
+        who = {"id": "u-1", "type": "USER", "display_value": "a-handle"}
+        body = {
+            "flow_run": {"created_by": dict(who)},
+            "api_flow_run": {"created_by": dict(who)},
+        }
+        out, excluded = cephooks.withhold_private(body)
+        self.assertEqual(out["flow_run"]["created_by"], {"type": "USER"})
+        self.assertEqual(out["api_flow_run"]["created_by"], {"type": "USER"})
+        self.assertEqual(
+            [each["path"] for each in excluded],
+            [
+                "flow_run.created_by.id",
+                "flow_run.created_by.display_value",
+                "api_flow_run.created_by.id",
+                "api_flow_run.created_by.display_value",
+            ],
+        )
+
+    def test2(self) -> None:
+        """
+        Test that a starter dumped as its text is dropped whole, and that a
+        run nobody is named on is left alone.
+        """
+        body = {
+            "flow_run": {"created_by": "CreatedBy(display_value='a-handle')"},
+            "api_flow_run": {"created_by": None},
+        }
+        out, excluded = cephooks.withhold_private(body)
+        self.assertEqual(out["flow_run"], {})
+        self.assertEqual(out["api_flow_run"], {"created_by": None})
+        self.assertEqual(
+            [each["path"] for each in excluded], ["flow_run.created_by"]
+        )
+        self.assertEqual(cephooks.withhold_private("text"), ("text", []))
+
+    def test3(self) -> None:
+        """
+        Test that a persisted result's record is taken off every run in a
+        list of runs, and named in what was excluded.
+        """
+        stored = {"storage_key": "/home/a-handle/results/abc"}
+        body = {
+            "api_task_runs": [
+                {"id": "t1", "state": {"type": "COMPLETED", "data": None}},
+                {"id": "t2", "state": {"type": "COMPLETED", "data": stored}},
+                "a task run dumped as text",
+            ],
+            "api_flow_run_graph": [{"id": "t2", "state": {"data": stored}}],
+        }
+        out, excluded = cephooks.withhold_private(body)
+        self.assertNotIn("a-handle", json.dumps(out))
+        self.assertEqual(
+            [each["path"] for each in excluded],
+            ["api_task_runs[1].state.data", "api_flow_run_graph[0].state.data"],
+        )
+
+    def test4(self) -> None:
+        """
+        Test that an event sends neither, end to end: the API's flow run
+        loses its state's data and its starter's name.
+        """
+
+        class _Named(_SyncClient):
+            """A client whose flow run was started by a person."""
+
+            def read_flow_run(self, flow_run_id: str) -> Any:
+                """The flow run record, as Prefect Cloud returns it."""
+                return {
+                    "id": flow_run_id,
+                    "created_by": {"id": "u-1", "type": "USER"},
+                    "state": {"data": {"storage_key": "/home/a-handle/r"}},
+                }
+
+        recorder = _Recorder()
+        with mock.patch.dict(sys.modules, _prefect_modules(_Named())):
+            cephooks.emit_flow_run(
+                flow=_Flow(), flow_run=_FlowRun(), state="S", emitter=recorder
+            )
+        sent = recorder.sent[0]
+        record = sent["payload"]["api_flow_run"]
+        self.assertEqual(record["created_by"], {"type": "USER"})
+        self.assertNotIn("data", record["state"])
+        paths = [each["path"] for each in sent["excluded"]]
+        self.assertIn("api_flow_run.state.data", paths)
+        self.assertIn("api_flow_run.created_by.id", paths)
+
+
+# #############################################################################
+# Test_masked_logs1
+# #############################################################################
+
+
+class Test_masked_logs1(unittest.TestCase):
+    """
+    Test that no line the plugin logs names a Cloud account or workspace.
+    """
+
+    # The waits, the registry and the mask are private to the plugin.
+    # pylint: disable=protected-access
+
+    def test1(self) -> None:
+        """
+        Test that a failed read, whose error quotes the URL it failed on,
+        is logged with both ids masked.
+        """
+
+        class _Failing(_SyncClient):
+            """A client whose raw reads fail the way Prefect Cloud's do."""
+
+            def _request(self, method: str, path: str) -> Any:
+                raise RuntimeError(
+                    f"Server error '500' for url '{_CLOUD_URL}{path}'"
+                )
+
+        client = _Failing(has_read_flow=False)
+        with self.assertLogs(cephooks._LOG, level="DEBUG") as logs:
+            with mock.patch.dict(sys.modules, _prefect_modules(client)):
+                cephooks.emit_flow_run(
+                    flow=_Flow(),
+                    flow_run=_FlowRun(),
+                    state="S",
+                    emitter=_Recorder(),
+                )
+        text = "\n".join(logs.output)
+        self.assertIn("accounts/***/workspaces/***/flow_runs/a64690f5", text)
+        self.assertNotIn("acct-1", text)
+        self.assertNotIn("ws-1", text)
+
+    def test2(self) -> None:
+        """
+        Test that every module of the plugin logs through the mask, and
+        that the mask is put on a logger once.
+        """
+        import convalesce_emit_prefect._lineage as celin
+        import convalesce_emit_prefect._mask as cemask
+        import convalesce_emit_prefect.retry as ceretry
+
+        for module in (cephooks, cecap, celin, ceretry):
+            with self.subTest(module=module.__name__):
+                log = cemask.logger(module.__name__)
+                self.assertIs(log, module._LOG)
+                masks = [
+                    each
+                    for each in log.filters
+                    if isinstance(each, cemask._MaskIds)
+                ]
+                self.assertEqual(len(masks), 1)
+
+    def test3(self) -> None:
+        """
+        Test that a record whose message cannot be formatted is passed on
+        as it is.
+        """
+        import convalesce_emit_prefect._mask as cemask
+
+        record = logging.LogRecord(
+            "name", logging.DEBUG, __file__, 1, "%d", ("not a number",), None
+        )
+        self.assertTrue(cemask._MaskIds().filter(record))
+        self.assertEqual(record.args, ("not a number",))
