@@ -127,6 +127,21 @@ Nothing here raises into your pipeline. If our endpoint is down, the
 observation is logged and dropped. A DAG must not go red because we had a bad
 minute: we are watching your pipeline, not standing in it.
 
+## Releasing
+
+[docs/releasing.md](docs/releasing.md) has the steps. The two registries a
+release lands in, for whoever is cutting one:
+
+- **PyPI**: [log in](https://pypi.org/account/login/), then
+  [trusted publishers](https://pypi.org/manage/account/publishing/) lists the
+  package each workflow environment may upload, and
+  [your projects](https://pypi.org/manage/projects/) lists what is published.
+- **Maven Central**: [log in](https://central.sonatype.com/account), then
+  [deployments](https://central.sonatype.com/publishing/deployments) holds the
+  jars a release uploaded. They stay in staging until someone presses
+  Publish there, and take a while to appear on
+  [repo1](https://repo1.maven.org/maven2/io/convalesce/) afterwards.
+
 ## Contributing
 
 Plugins for more tools are the most useful contribution, and the open
