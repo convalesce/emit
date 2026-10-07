@@ -93,4 +93,45 @@ public class RedactionTest {
     assertFalse(Redaction.of("(unclosed").apply(json).contains("\"p\""));
     assertEquals(null, DEFAULT.apply(null));
   }
+
+  @Test
+  public void anOpenLineageRunEventLosesTheSecretsItsFacetsCaptured() {
+    String json =
+        "{\"run\":{\"facets\":{\"spark_properties\":{\"_producer\":\"p\",\"properties\":{"
+            + "\"spark.master\":\"local\",\"spark.hadoop.fs.s3a.secret.key\":\"hunter2\","
+            + "\"spark.jdbc.url\":\"jdbc:postgresql://db/shop?password=hunter2\"}},"
+            + "\"environment-properties\":{\"_producer\":\"p\",\"environment-properties\":{"
+            + "\"mountPoints\":[{\"mountPoint\":\"/mnt\",\"source\":\"s3a://b\"}],"
+            + "\"cores\":8,\"api.token\":{\"value\":\"hunter2\"},\"cluster\":\"etl\","
+            + "\"tags\":{\"owner\":\"etl\",\"db.password\":\"hunter2\"}}}}},"
+            + "\"job\":{\"name\":\"token_refresh\"}}";
+    String sent = DEFAULT.applyToRunEvent(json);
+    assertFalse(sent, sent.contains("hunter2"));
+    assertTrue(sent, sent.contains("\"spark.master\":\"local\""));
+    assertTrue(
+        sent,
+        sent.contains("\"spark.hadoop.fs.s3a.secret.key\":\"" + Redaction.REPLACEMENT + "\""));
+    // What is not a string is kept as it was, unless its key names a credential.
+    assertTrue(sent, sent.contains("\"mountPoints\":[{\"mountPoint\":\"/mnt\""));
+    assertTrue(sent, sent.contains("\"cores\":8,\"api.token\":\"" + Redaction.REPLACEMENT));
+    assertTrue(sent, sent.contains("\"cluster\":\"etl\""));
+    assertTrue(
+        sent,
+        sent.contains(
+            "\"tags\":{\"owner\":\"etl\",\"db.password\":\"" + Redaction.REPLACEMENT + "\"}"));
+    // A job's name can say "token" without holding one.
+    assertTrue(sent, sent.contains("\"name\":\"token_refresh\""));
+  }
+
+  @Test
+  public void aRunEventWithNothingToHideIsSentAsItWas() {
+    String json =
+        "{\"run\":{\"facets\":{\"spark_properties\":{\"properties\":{\"spark.master\":\"local\"}}}},"
+            + "\"inputs\":[{\"name\":\"shop.orders\"}]}";
+    assertEquals(json, DEFAULT.applyToRunEvent(json));
+    assertEquals(null, DEFAULT.applyToRunEvent(null));
+    // Cut short, it is left alone rather than guessed at.
+    String cut = "{\"properties\":{\"password\":\"p\",\"a\":[1,";
+    assertEquals(cut, DEFAULT.applyToRunEvent(cut));
+  }
 }

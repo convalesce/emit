@@ -1,7 +1,7 @@
 [project]
 name = "convalesce-emit-pyspark"
 dynamic = ["version"]
-description = "Report a PySpark driver that fails in Python to Convalesce."
+description = "Report a PySpark driver to Convalesce: what it ran, and whether it failed in Python."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

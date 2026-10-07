@@ -1,5 +1,5 @@
 """
-Report a PySpark driver that fails in Python to Convalesce.
+Report a PySpark driver to Convalesce: what it ran, and whether it failed.
 
 Import as:
 

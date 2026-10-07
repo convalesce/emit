@@ -97,6 +97,38 @@ public class ConvalesceTransportTest {
   }
 
   @Test
+  public void capturedSparkPropertiesAreSentWithoutTheirSecrets() {
+    Emitter emitter = new Emitter(Config.of(url, "secret-key", 50, 0));
+    ConvalesceTransport transport = new ConvalesceTransport(emitter, "3.5.3");
+    OpenLineage ol = new OpenLineage(PRODUCER);
+    // The shape openlineage-spark's SparkPropertyFacet serialises to.
+    java.util.Map<String, Object> properties = new java.util.LinkedHashMap<String, Object>();
+    properties.put("spark.master", "local[2]");
+    properties.put("spark.hadoop.fs.s3a.secret.key", "hunter2");
+    properties.put("spark.jdbc.url", "jdbc:postgresql://db/shop?password=hunter2");
+    OpenLineage.RunFacet captured = ol.newRunFacet();
+    captured.getAdditionalProperties().put("properties", properties);
+    OpenLineage.RunEvent event =
+        ol.newRunEventBuilder()
+            .eventType(OpenLineage.RunEvent.EventType.COMPLETE)
+            .eventTime(ZonedDateTime.now())
+            .run(
+                ol.newRunBuilder()
+                    .runId(UUID.randomUUID())
+                    .facets(ol.newRunFacetsBuilder().put("spark_properties", captured).build())
+                    .build())
+            .job(ol.newJobBuilder().namespace("spark_ns").name("orders.daily").build())
+            .build();
+    transport.emit(event);
+    String body = bodies.get(0);
+    assertFalse(body, body.contains("hunter2"));
+    assertTrue(body, body.contains("\"spark.master\":\"local[2]\""));
+    assertTrue(body, body.contains("\"spark.hadoop.fs.s3a.secret.key\":\"*********(redacted)\""));
+    // The event itself is left as OpenLineage built it, for any transport after this one.
+    assertEquals("hunter2", properties.get("spark.hadoop.fs.s3a.secret.key"));
+  }
+
+  @Test
   public void aRunStartingIsQueuedUntilSomethingFlushes() {
     Emitter emitter = new Emitter(Config.of(url, "secret-key", 50, 0));
     ConvalesceTransport transport = new ConvalesceTransport(emitter, null);
