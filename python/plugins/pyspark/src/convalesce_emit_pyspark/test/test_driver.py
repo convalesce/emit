@@ -574,6 +574,57 @@ class Test_script1(_HookTestCase):
             self.recorder.sent[0]["payload"]["source"]["file"], self.script
         )
 
+    def test_a_script_a_launcher_ran_is_learnt_from_what_it_imports(
+        self,
+    ) -> None:
+        """A script a launcher ran is learnt from what it imports."""
+        launcher = os.path.join(os.path.dirname(self.script), "runscript.py")
+        pathlib.Path(launcher).write_text("# the launcher\n", encoding="utf-8")
+        setattr(sys.modules["__main__"], "__file__", launcher)
+        self.install()
+        kind = cepysdri._Finder  # pylint: disable=protected-access
+        finder = next(f for f in sys.meta_path if isinstance(f, kind))
+        scope = {
+            "__name__": "__main__",
+            "__file__": self.script,
+            "finder": finder,
+        }
+        exec(  # pylint: disable=exec-used
+            compile("finder.find_spec('decimal', None)\n", self.script, "exec"),
+            scope,
+        )
+        self.at_exit()
+        self.assertEqual(
+            self.recorder.sent[0]["payload"]["source"]["file"], self.script
+        )
+
+    def test_a_script_a_launcher_ran_is_learnt_from_the_error_it_caught(
+        self,
+    ) -> None:
+        """A script a launcher ran is learnt from the error it caught."""
+        launcher = os.path.join(os.path.dirname(self.script), "runscript.py")
+        pathlib.Path(launcher).write_text("# the launcher\n", encoding="utf-8")
+        setattr(sys.modules["__main__"], "__file__", launcher)
+        self.install()
+        scope = {"__name__": "__main__", "__file__": self.script}
+        with self.assertRaises(SystemExit):
+            try:
+                exec(  # pylint: disable=exec-used
+                    compile(
+                        "raise LookupError('no table')\n", self.script, "exec"
+                    ),
+                    scope,
+                )
+            except LookupError:
+                sys.exit(1)
+        self.at_exit()
+        events = {sent["event"]: sent["payload"] for sent in self.recorder.sent}
+        self.assertEqual(events["driver_script"]["source"]["file"], self.script)
+        self.assertEqual(
+            events["driver_failure"]["error_detail"]["type"],
+            "builtins.LookupError",
+        )
+
     def test_a_module_that_installs_is_not_taken_for_the_script(self) -> None:
         """A module that installs is not taken for the script."""
         self.install()
@@ -669,6 +720,11 @@ class Test_stop1(_HookTestCase):
         # PySpark's own imports, once its context class exists, wrap it.
         setattr(self.module, "SparkContext", _Stoppable)
         self.assertIsNone(finder.find_spec("pyspark.sql", None))
+        # It stays a while longer, in case a launcher's script is yet to
+        # import something, and leaves once it has looked enough.
+        self.assertIn(finder, sys.meta_path)
+        with mock.patch.object(cepysdri, "_MAX_LOOKS", 0):
+            self.assertIsNone(finder.find_spec("json.encoder", None))
         self.assertNotIn(finder, sys.meta_path)
         self.context.stop()
         hook = cepysdri._INSTALLED  # pylint: disable=protected-access

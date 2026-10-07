@@ -67,6 +67,10 @@ _CELL_EVENT = "post_run_cell"
 _SERVERLESS_ENV = "IS_SERVERLESS"
 # What YARN names a container, which carries the application it belongs to.
 _YARN_CONTAINER_ENV = "CONTAINER_ID"
+# How far up the stack an import is followed to the script that made it.
+_MAX_FRAMES = 64
+# How many imports are watched for the script before giving up.
+_MAX_LOOKS = 2000
 _YARN_CONTAINER = re.compile(r"^container_(?:e\d+_)?(\d+)_(\d+)_\d+_\d+$")
 _ARGUMENTS_ENV = "CONVALESCE_SEND_ARGUMENTS"
 _FALSY = frozenset({"0", "false", "no", "off"})
@@ -450,6 +454,7 @@ class _Hook:
                 # Glue's does) catches its exception and exits non-zero.
                 # The exception being handled then is why the driver failed.
                 handled = sys.exc_info()[1]
+                _note_script_of(handled)
                 self._exit_cause = (
                     handled if isinstance(handled, Exception) else None
                 )
@@ -578,14 +583,17 @@ class _Finder:
 
     The `.pth` hooks the interpreter before the driver's script has
     imported anything. This sits on `sys.meta_path`, finds nothing, and at
-    each PySpark import asks the hook to wrap `SparkContext.stop`; once that
-    succeeds it takes itself off the path.
+    each PySpark import asks the hook to wrap `SparkContext.stop`. It also
+    learns the script a launcher runs as the main program, from the first
+    thing that script imports. With both done it takes itself off the path.
 
     :param hook: the installed hooks
     """
 
     def __init__(self, hook: _Hook) -> None:
         self._hook = hook
+        self._wrapped = False
+        self._looks = 0
 
     def find_spec(self, name: str, path: Any = None, target: Any = None) -> None:
         """
@@ -598,7 +606,17 @@ class _Finder:
         """
         del path, target
         try:
-            if name.startswith(f"{_PYSPARK}.") and self._hook.wrap_stop():
+            if _CALLER_SCRIPT is None and self._looks < _MAX_LOOKS:
+                # A launcher may have imported PySpark already, so the
+                # script is looked for at whatever it imports first.
+                self._looks += 1
+                importer = sys._getframe(1)  # pylint: disable=protected-access
+                _note_script(importer)
+            if name.startswith(f"{_PYSPARK}."):
+                self._wrapped = self._wrapped or self._hook.wrap_stop()
+            if self._wrapped and (
+                _CALLER_SCRIPT is not None or self._looks >= _MAX_LOOKS
+            ):
                 sys.meta_path.remove(self)
         except Exception:  # pylint: disable=broad-exception-caught
             pass
@@ -820,6 +838,47 @@ def _caller_script(frame: Any) -> Optional[str]:
     if not path or not os.path.isfile(str(path)):
         return None
     return os.path.abspath(str(path))
+
+
+def _note_script(frame: Any, depth: int = _MAX_FRAMES) -> None:
+    """
+    Learn the script from whoever is importing PySpark, when a launcher
+    runs it as the main program and nothing called `install()`.
+
+    The `.pth` hooks the interpreter before any script runs, so there is no
+    caller to ask. The first code to import PySpark under the name
+    `__main__`, from a file that is not the process's own main file, is the
+    job's script.
+
+    :param frame: where to start looking, innermost first
+    :param depth: how many frames outward to look
+    :return: nothing
+    """
+    global _CALLER_SCRIPT
+    if _CALLER_SCRIPT is not None:
+        return
+    main = getattr(sys.modules.get("__main__"), "__file__", None)
+    seen = 0
+    while frame is not None and seen < depth:
+        found = _caller_script(frame)
+        if found is not None and found != os.path.abspath(str(main or "")):
+            _CALLER_SCRIPT = found
+            return
+        frame, seen = frame.f_back, seen + 1
+
+
+def _note_script_of(exc: Optional[BaseException]) -> None:
+    """
+    Learn the script from the traceback of the error a launcher caught.
+
+    :param exc: the exception being handled as the launcher exits
+    :return: nothing
+    """
+    tb = getattr(exc, "__traceback__", None)
+    seen = 0
+    while tb is not None and _CALLER_SCRIPT is None and seen < _MAX_FRAMES:
+        _note_script(tb.tb_frame, depth=1)
+        tb, seen = tb.tb_next, seen + 1
 
 
 def _script_path() -> Optional[str]:
