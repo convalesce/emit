@@ -59,6 +59,8 @@ _FALSY = frozenset({"0", "false", "no", "off"})
 _Context = Tuple[Optional[str], Optional[str]]
 
 _INSTALLED: Optional["_Hook"] = None
+# The script that called `install()` as the main program, when not `__main__`'s file.
+_CALLER_SCRIPT: Optional[str] = None
 _INSTALL_LOCK = threading.Lock()
 
 
@@ -79,11 +81,14 @@ def install(emitter: Optional[cemit.EmitterLike] = None) -> bool:
         when a failure is reported, when not given
     :return: whether the hooks are in place
     """
-    global _INSTALLED
+    global _INSTALLED, _CALLER_SCRIPT
     try:
         with _INSTALL_LOCK:
             if _INSTALLED is not None:
                 return True
+            _CALLER_SCRIPT = _caller_script(
+                sys._getframe(1)  # pylint: disable=protected-access
+            )
             config = None
             if emitter is None:
                 config = _config()
@@ -104,11 +109,12 @@ def uninstall() -> None:
 
     :return: nothing
     """
-    global _INSTALLED
+    global _INSTALLED, _CALLER_SCRIPT
     with _INSTALL_LOCK:
         if _INSTALLED is not None:
             _INSTALLED.detach()
             _INSTALLED = None
+        _CALLER_SCRIPT = None
 
 
 def _config() -> Optional[cemit.Config]:
@@ -156,6 +162,7 @@ class _Hook:
         self._finder: Optional["_Finder"] = None
         self._exit_code: Any = None
         self._exit_context: _Context = (None, None)
+        self._exit_cause: Optional[BaseException] = None
         self._previous_excepthook: Callable[..., Any] = sys.excepthook
         self._previous_threading: Callable[..., Any] = threading.excepthook
         self._original_exit: Callable[..., Any] = sys.exit
@@ -308,6 +315,13 @@ class _Hook:
             ):
                 self._exit_code = code
                 self._exit_context = self.context()
+                # A launcher that runs the script for the platform (AWS
+                # Glue's does) catches its exception and exits non-zero.
+                # The exception being handled then is why the driver failed.
+                handled = sys.exc_info()[1]
+                self._exit_cause = (
+                    handled if isinstance(handled, Exception) else None
+                )
         except Exception as err:  # pylint: disable=broad-exception-caught
             _LOG.debug("convalesce: could not read the exit: %s", err)
         self._original_exit(code)
@@ -320,7 +334,10 @@ class _Hook:
         """
         try:
             if self._exit_code is not None:
-                self.report(SystemExit(self._exit_code), self._exit_context)
+                self.report(
+                    self._exit_cause or SystemExit(self._exit_code),
+                    self._exit_context,
+                )
         except Exception as err:  # pylint: disable=broad-exception-caught
             _LOG.debug("convalesce: could not report the driver: %s", err)
         try:
@@ -576,15 +593,39 @@ def _arguments_enabled() -> bool:
     return os.environ.get(_ARGUMENTS_ENV, "").strip().lower() not in _FALSY
 
 
+def _caller_script(frame: Any) -> Optional[str]:
+    """
+    The script that called `install()`, when a launcher runs it as the main
+    program.
+
+    A platform's launcher (AWS Glue's `runscript.py`) is the process's
+    `__main__` and runs the job's script under that name. The script is then
+    the file whose code runs as `__main__` and is not the launcher's own.
+
+    :param frame: the frame `install()` was called from
+    :return: that file, or None when the caller is not such a script
+    """
+    scope = getattr(frame, "f_globals", None) or {}
+    if scope.get("__name__") != "__main__":
+        return None
+    path = scope.get("__file__") or getattr(frame.f_code, "co_filename", None)
+    if not path or not os.path.isfile(str(path)):
+        return None
+    return os.path.abspath(str(path))
+
+
 def _script_path() -> Optional[str]:
     """
     The file this driver is running.
 
     A driver started as `python -m package` is a launcher, such as a
-    notebook kernel, and its file is not the job.
+    notebook kernel, and its file is not the job. A script that a launcher
+    ran as the main program, and that called `install()`, is.
 
     :return: the script's path, or None when there is no such file
     """
+    if _CALLER_SCRIPT is not None:
+        return _CALLER_SCRIPT
     main = sys.modules.get("__main__")
     if getattr(main, "__spec__", None) is not None:
         return None

@@ -262,6 +262,23 @@ class Test_exit1(_HookTestCase):
         self.assertEqual(payload["error_detail"]["message"], "3")
         self.assertEqual(payload["application_id"], "local-1790387078840")
 
+    def test_an_exit_while_handling_an_error_reports_that_error(self) -> None:
+        """An exit while handling an error reports that error."""
+        self.install()
+        with self.assertRaises(SystemExit):
+            try:
+                raise LookupError("table orders is not there")
+            except LookupError:
+                # As a platform's launcher does with the script it ran.
+                sys.exit(1)
+        hook = cepysdri._INSTALLED  # pylint: disable=protected-access
+        assert hook is not None
+        hook.at_exit()
+        detail = self.recorder.sent[0]["payload"]["error_detail"]
+        self.assertEqual(detail["type"], "builtins.LookupError")
+        self.assertEqual(detail["message"], "table orders is not there")
+        self.assertIn("raise LookupError", detail["traceback"])
+
     def test_a_zero_exit_is_not(self) -> None:
         """A zero exit is not."""
         self.install()
@@ -501,6 +518,42 @@ class Test_script1(_HookTestCase):
         self.assertEqual(failure["argv"], [self.script])
         self.assertEqual(script["argv"], [self.script])
         self.assertIn("source", script)
+
+    def test_a_script_a_launcher_ran_is_the_source(self) -> None:
+        """A script a launcher ran is the source."""
+        launcher = os.path.join(os.path.dirname(self.script), "runscript.py")
+        pathlib.Path(launcher).write_text(
+            "# the platform's launcher\n", encoding="utf-8"
+        )
+        setattr(sys.modules["__main__"], "__file__", launcher)
+        scope = {
+            "__name__": "__main__",
+            "__file__": self.script,
+            "emitter": self.recorder,
+        }
+        exec(  # pylint: disable=exec-used
+            compile(
+                "import convalesce_emit_pyspark\n"
+                "convalesce_emit_pyspark.install(emitter=emitter)\n",
+                self.script,
+                "exec",
+            ),
+            scope,
+        )
+        self.at_exit()
+        self.assertEqual(
+            self.recorder.sent[0]["payload"]["source"]["file"], self.script
+        )
+
+    def test_a_module_that_installs_is_not_taken_for_the_script(self) -> None:
+        """A module that installs is not taken for the script."""
+        self.install()
+        self.at_exit()
+        self.assertEqual(
+            self.recorder.sent[0]["payload"]["source"]["file"], self.script
+        )
+        caller = cepysdri._CALLER_SCRIPT  # pylint: disable=protected-access
+        self.assertIsNone(caller)
 
     def test_a_launcher_module_has_no_source(self) -> None:
         """A launcher module has no source."""
