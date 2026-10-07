@@ -21,7 +21,6 @@ hooks:
     on_dataset_changed: "Airflow 2 only: a dataset updated; the task that updated it already carries it on task.outlets, and collect ignores the Airflow 3 twin (asset.*)"
     on_asset_alias_created: "Airflow 3: an alias declared, with no asset resolved yet; the resolution arrives on on_asset_event_emitted and task_instance.asset_aliases"
   uncaptured:
-    on_dag_run_success: "forwarded (generated from the hookspec, same payload as on_dag_run_failed); no released capture has a successful dag run end yet"
     on_task_instance_skipped: "Airflow 3 only; forwarded, never captured"
     on_asset_created: "Airflow 3 only; forwarded, never captured (fires once per asset, on first registration)"
 
