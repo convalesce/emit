@@ -17,6 +17,19 @@ _LOG = logging.getLogger(__name__)
 TOOL = "great_expectations"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSY = frozenset({"0", "false", "no", "off"})
+
+# A query asset's query is code, so it follows the setting every plugin
+# sends code under. Read here rather than through `convalesce_emit.source`,
+# which a `convalesce-emit` older than that module does not have.
+_SEND_SOURCE_ENV = "CONVALESCE_SEND_SOURCE"
+
+# A query longer than this is cut, keeping its head, as the SQL the other
+# plugins see a step run is.
+MAX_QUERY_CHARS = 20_000
+
+_QUERY_NOT_SENT = "query not sent"
+_QUERY_CUT = "query cut"
 
 # Arguments that are the Great Expectations runtime rather than the result of
 # a validation. `data_asset` on 0.x is a live Validator, and through its data
@@ -37,6 +50,74 @@ def send_samples() -> bool:
     """
     raw = os.environ.get("CONVALESCE_GX_SEND_SAMPLES", "")
     return raw.strip().lower() in _TRUTHY
+
+
+def send_query() -> bool:
+    """
+    Whether a query asset's query may be sent.
+
+    :return: False only when `CONVALESCE_SEND_SOURCE` says so
+    """
+    raw = os.environ.get(_SEND_SOURCE_ENV, "")
+    return raw.strip().lower() not in _FALSY
+
+
+def bound_queries(payload: Any) -> Tuple[Any, List[Dict[str, str]]]:
+    """
+    Cut, or leave out, the query each query asset's batch was read with.
+
+    GX keeps it on the batch spec of every result validated over a query
+    asset or a runtime query, on both majors. It is what a receiver reads
+    the tables and columns behind the batch from, so it crosses whole up to
+    `MAX_QUERY_CHARS`; one cut short is marked `query_truncated`, because
+    the head of a query can read as a different, complete one.
+
+    :param payload: the dumped payload
+    :return: the same shape, and what was left out or cut, by path and
+        reason
+    """
+    excluded: List[Dict[str, str]] = []
+    return _walk_queries(payload, "", send_query(), excluded), excluded
+
+
+def _walk_queries(
+    value: Any, path: str, send: bool, excluded: List[Dict[str, str]]
+) -> Any:
+    """
+    Recurse through one value, bounding the query of each batch spec in it.
+
+    :param value: the value being walked
+    :param path: dotted path of `value` from the payload root
+    :param send: whether a query may cross at all
+    :param excluded: accumulator every change is appended to
+    :return: the same shape, queries bounded
+    """
+    if isinstance(value, list):
+        return [
+            _walk_queries(item, f"{path}[{i}]", send, excluded)
+            for i, item in enumerate(value)
+        ]
+    if not isinstance(value, dict):
+        return value
+    out = {
+        key: _walk_queries(
+            item, f"{path}.{key}" if path else str(key), send, excluded
+        )
+        for key, item in value.items()
+    }
+    spec = out.get("batch_spec")
+    if isinstance(spec, dict) and isinstance(spec.get("query"), str):
+        where = f"{path}.batch_spec.query" if path else "batch_spec.query"
+        spec = dict(spec)
+        if not send:
+            del spec["query"]
+            excluded.append({"path": where, "reason": _QUERY_NOT_SENT})
+        elif len(spec["query"]) > MAX_QUERY_CHARS:
+            spec["query"] = spec["query"][:MAX_QUERY_CHARS]
+            spec["query_truncated"] = True
+            excluded.append({"path": where, "reason": _QUERY_CUT})
+        out["batch_spec"] = spec
+    return out
 
 
 def is_runtime(value: Any) -> bool:
@@ -707,7 +788,10 @@ def forward(
         # Always, samples or not: a pandas `read_sql_*` asset keeps its `con`,
         # the connection string, in the batch spec every result carries.
         body, secrets = cemit.redact_secrets(body)
-        excluded = budget.excluded + secrets
+        # After the masking, so a password a query names is hidden before
+        # the query is cut and cannot be left half masked.
+        body, queries = bound_queries(body)
+        excluded = budget.excluded + secrets + queries
         if redact:
             body, redacted = cemit.redact_samples(body)
             body, values = redact_values(body)

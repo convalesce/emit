@@ -656,6 +656,30 @@ def _schema_fields(config: Any) -> List[str]:
 # #############################################################################
 
 
+def _values_at(value: Any, suffix: str) -> List[Any]:
+    """
+    Every value a payload carries at a path ending in `suffix`.
+
+    :param value: the payload, or part of one
+    :param suffix: the last keys of the path, dotted
+    :return: the values
+    """
+    keys = suffix.split(".")
+    out: List[Any] = []
+    if isinstance(value, dict):
+        found: Any = value
+        for key in keys:
+            found = found.get(key) if isinstance(found, dict) else None
+        if found is not None:
+            out.append(found)
+        for item in value.values():
+            out.extend(_values_at(item, suffix))
+    elif isinstance(value, list):
+        for item in value:
+            out.extend(_values_at(item, suffix))
+    return out
+
+
 _RUN: Optional[_Run] = None
 
 
@@ -771,6 +795,29 @@ class Test_backward_fields1(unittest.TestCase):
             set(payload["result_urls"]),
             set(payload["kwargs"]["checkpoint_result"]["run_results"]),
         )
+
+    def test7(self) -> None:
+        """
+        Test that the query a query asset's batch was read with crosses
+        whole on this GX, beside the platform it ran on.
+
+        A receiver reads the tables and columns behind the batch from it,
+        and needs the platform to read it as that platform's SQL.
+        """
+        run = _run()
+        query = "select * from orders where status = 'paid'"
+        carried = [
+            payload
+            for payload in run.payloads
+            if query in _values_at(payload, "batch_spec.query")
+        ]
+        self.assertTrue(carried, "no observation carries the query")
+        for payload in carried:
+            platform = (
+                payload.get("dialect_name")
+                or payload["datasources"]["lite"]["type"]
+            )
+            self.assertEqual(platform, "sqlite")
 
     def test4(self) -> None:
         """
