@@ -309,6 +309,23 @@ class Test_context1(_HookTestCase):
         self.assertIsNone(payload["application_id"])
         self.assertIsNone(payload["application_name"])
 
+    def test_a_yarn_container_names_the_application_before_any_session(
+        self,
+    ) -> None:
+        """A yarn container names the application before any session."""
+        self.install()
+        container = "container_e12_1791409434978_0014_01_000001"
+        with (
+            mock.patch.dict(sys.modules, {"pyspark": _pyspark(None)}),
+            mock.patch.dict(os.environ, {"CONTAINER_ID": container}),
+        ):
+            self.fail_main(RuntimeError("no session yet"))
+        payload = self.recorder.sent[0]["payload"]
+        self.assertEqual(
+            payload["application_id"], "application_1791409434978_0014"
+        )
+        self.assertIsNone(payload["application_name"])
+
     def test_a_context_that_cannot_be_read_sends_nulls(self) -> None:
         """A context that cannot be read sends nulls."""
         context = mock.Mock()

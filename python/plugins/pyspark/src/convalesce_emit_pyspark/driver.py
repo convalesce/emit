@@ -38,6 +38,7 @@ import hashlib
 import logging
 import os
 import platform
+import re
 import sys
 import threading
 import time
@@ -63,6 +64,9 @@ _IPYTHON = "IPython"
 _CELL_EVENT = "post_run_cell"
 # Set by Databricks on serverless compute.
 _SERVERLESS_ENV = "IS_SERVERLESS"
+# What YARN names a container, which carries the application it belongs to.
+_YARN_CONTAINER_ENV = "CONTAINER_ID"
+_YARN_CONTAINER = re.compile(r"^container_(?:e\d+_)?(\d+)_(\d+)_\d+_\d+$")
 _ARGUMENTS_ENV = "CONVALESCE_SEND_ARGUMENTS"
 _FALSY = frozenset({"0", "false", "no", "off"})
 
@@ -282,7 +286,11 @@ class _Hook:
         if _over_connect():
             return _connect_session()
         live = _spark_context()
-        return live if live[0] is not None else self._stopped
+        if live[0] is not None:
+            return live
+        if self._stopped[0] is not None:
+            return self._stopped
+        return _yarn_application(), None
 
     def watch_cells(self) -> None:
         """
@@ -657,6 +665,19 @@ def _spark_context() -> _Context:
         _read(lambda: context.applicationId),
         _read(lambda: context.appName),
     )
+
+
+def _yarn_application() -> Optional[str]:
+    """
+    The YARN application this driver is, read from its container's name.
+
+    A cluster-mode driver that fails before it starts a Spark session has
+    no context to ask, yet YARN already made its application.
+
+    :return: `application_<cluster>_<n>`, or None outside a YARN container
+    """
+    match = _YARN_CONTAINER.match(os.environ.get(_YARN_CONTAINER_ENV, ""))
+    return f"application_{match.group(1)}_{match.group(2)}" if match else None
 
 
 def _over_connect() -> bool:
