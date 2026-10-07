@@ -874,3 +874,288 @@ class Test_cloud_environment1(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, env, clear=False):
             out = cedsens.cloud_environment()
         self.assertNotIn("DAGSTER_CLOUD_API_TOKEN", out)
+
+
+# #############################################################################
+# Test_plain_metadata1
+# #############################################################################
+
+
+class Test_plain_metadata1(unittest.TestCase):
+    """
+    Test that the numbers an author attached cross under their own names,
+    and everything that can hold the data itself stays redacted.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a number, a flag and a timestamp cross as they are, as a
+        Dagster value class dumps them and as a bare value; that text, a
+        table, markdown, JSON, a path and a link do not; and that the rest
+        are counted into the marker.
+        """
+        plain = {
+            "rows_rejected": {"value": 12},
+            "mean_amount": {"value": 41.5},
+            "within_threshold": {"value": True},
+            "loaded_at": {"value": 1790383261.0},
+            "bare_count": 7,
+        }
+        withheld = {
+            "preview": {"md_str": "| alice@x.com |"},
+            "sample": {"records": [{"email": "alice@x.com"}], "schema": {}},
+            "note": {"text": "alice@x.com"},
+            "bare_text": "alice@x.com",
+            "config": {"data": {"owner": "alice@x.com"}},
+            "export": {"path": "/exports/alice"},
+            "dashboard": {"url": "https://example.com/alice"},
+            "wrapped_text": {"value": "alice@x.com"},
+            "not_finite": {"value": float("inf")},
+            "empty": {"value": None},
+        }
+        out, excluded = cedsens.redact_metadata(
+            {"materialization": {"metadata": {**plain, **withheld}}}, "event_log"
+        )
+        self.assertEqual(
+            out["materialization"]["metadata"],
+            {**plain, "redacted": True, "count": len(withheld)},
+        )
+        self.assertNotIn("alice", str(out))
+        self.assertEqual(
+            [entry["path"] for entry in excluded],
+            ["event_log.materialization.metadata"],
+        )
+
+    def test2(self) -> None:
+        """
+        Test that the switch restores what crossed before: the allowed
+        entries, and the marker for every other one.
+        """
+        metadata = {"dagster/row_count": {"value": 5}, "rows_rejected": 12}
+        env = {"CUSTOMER_CONVALESCE_DAGSTER_SEND_METADATA": "false"}
+        with unittest.mock.patch.dict(os.environ, env, clear=False):
+            out, _ = cedsens.redact_metadata({"metadata": metadata}, "")
+        self.assertEqual(
+            out["metadata"],
+            {"dagster/row_count": {"value": 5}, "redacted": True, "count": 1},
+        )
+
+    def test3(self) -> None:
+        """
+        Test that only so many of an author's entries cross from one
+        mapping, and that a name too long to be one, a name that is not
+        text, and the marker's own names never do.
+        """
+        metadata: Dict[Any, Any] = {
+            f"m{i:03}": i for i in range(cedsens.MAX_PLAIN_VALUES + 5)
+        }
+        metadata["n" * (cedsens.MAX_PLAIN_NAME_CHARS + 1)] = 1
+        metadata[7] = 1
+        out, _ = cedsens.redact_metadata({"metadata": metadata}, "")
+        kept = out["metadata"]
+        self.assertEqual(kept["count"], 7)
+        self.assertEqual(
+            sorted(name for name in kept if name not in ("redacted", "count")),
+            [f"m{i:03}" for i in range(cedsens.MAX_PLAIN_VALUES)],
+        )
+        # An author's own `count` is never taken for the marker's.
+        out, _ = cedsens.redact_metadata(
+            {"metadata": {"count": 9, "x": "y"}}, ""
+        )
+        self.assertEqual(out["metadata"], {"redacted": True, "count": 2})
+
+    def test4(self) -> None:
+        """
+        Test that what an observation, an asset check and a `Failure` carry
+        is treated the same way, where the event log holds it and where the
+        event that ended the run repeats the failure.
+        """
+
+        def failure() -> Dict[str, Any]:
+            return {"user_failure_data": {"metadata": _author_metadata()}}
+
+        class Instance(_Instance):
+            """An instance whose event log holds one event of each kind."""
+
+            def get_records_for_run(
+                self, run_id: str, of_type: Any = None
+            ) -> types.SimpleNamespace:
+                """The event log, the shape `EventLogConnection` has."""
+                self.asked.append(run_id)
+                self.of_type = of_type
+                data = [
+                    {"asset_observation": {"metadata": _author_metadata()}},
+                    {"check_name": "fresh", "metadata": _author_metadata()},
+                    failure(),
+                ]
+                return types.SimpleNamespace(
+                    records=[
+                        {
+                            "event_log_entry": {
+                                "dagster_event": {"event_specific_data": item}
+                            }
+                        }
+                        for item in data
+                    ]
+                )
+
+        class Context(_ReachableContext):
+            """A context whose run ended on that failure."""
+
+            @property
+            def dagster_event(self) -> Dict[str, Any]:
+                return {
+                    "event_specific_data": {
+                        "first_step_failure_event": {
+                            "event_specific_data": failure()
+                        }
+                    }
+                }
+
+        fake_module = types.SimpleNamespace(
+            DagsterEventType=_fake_dagster_event_type()
+        )
+        recorder = _Recorder()
+        with unittest.mock.patch.dict(sys.modules, {"dagster": fake_module}):
+            cedsens.convalesce_sensor(Context(Instance()), emitter=recorder)
+        payload = recorder.sent[0]["payload"]
+        expected = {"rows_seen": {"value": 3}, "redacted": True, "count": 1}
+        log = [
+            entry["event_log_entry"]["dagster_event"]["event_specific_data"]
+            for entry in payload["event_log"]
+        ]
+        self.assertEqual(log[0]["asset_observation"]["metadata"], expected)
+        self.assertEqual(log[1]["metadata"], expected)
+        self.assertEqual(log[2]["user_failure_data"]["metadata"], expected)
+        ended = payload["dagster_event"]["event_specific_data"]
+        self.assertEqual(
+            ended["first_step_failure_event"]["event_specific_data"][
+                "user_failure_data"
+            ]["metadata"],
+            expected,
+        )
+        self.assertNotIn("alice@x.com", str(payload))
+
+
+def _author_metadata() -> Dict[str, Any]:
+    """
+    What an author might attach: one number, one line of text.
+
+    :return: a fresh mapping, since redaction is checked on each copy
+    """
+    return {"rows_seen": {"value": 3}, "note": {"text": "alice@x.com"}}
+
+
+# #############################################################################
+# Test_dagster_url1
+# #############################################################################
+
+
+class Test_dagster_url1(unittest.TestCase):
+    """
+    Test that the deployment's own UI address crosses with every run.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the address is sent as set, without a trailing slash, and
+        read under the prefix a platform puts on a setting.
+        """
+        recorder = _Recorder()
+        env = {
+            "CUSTOMER_CONVALESCE_DAGSTER_URL": " https://dagster.example.com/ "
+        }
+        with unittest.mock.patch.dict(os.environ, env, clear=False):
+            cedsens.convalesce_sensor(_Context(), emitter=recorder)
+        self.assertEqual(
+            recorder.sent[0]["payload"]["dagster_url"],
+            "https://dagster.example.com",
+        )
+
+    def test2(self) -> None:
+        """
+        Test that nothing is sent when the address is not set.
+        """
+        recorder = _Recorder()
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            cedsens.convalesce_sensor(_Context(), emitter=recorder)
+        self.assertNotIn("dagster_url", recorder.sent[0]["payload"])
+
+
+# #############################################################################
+# Test_declared_lineage1
+# #############################################################################
+
+
+class Test_declared_lineage1(unittest.TestCase):
+    """
+    Test the `lineage=` keyword: the datasets an author declares for an op.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a mapping crosses as each op's sorted references, whether
+        a side is one reference, a list or a set, and that an op with
+        nothing declared is left out.
+        """
+        urn = "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.raw.orders,PROD)"
+        recorder = _Recorder()
+        cedsens.convalesce_sensor(
+            _Context(),
+            emitter=recorder,
+            lineage={
+                "load_orders": {
+                    "inputs": {urn, "s3://my-bucket/exports/orders"},
+                    "outputs": urn,
+                },
+                "tidy": {"inputs": [], "outputs": None},
+            },
+        )
+        self.assertEqual(
+            recorder.sent[0]["payload"]["lineage"],
+            {
+                "load_orders": {
+                    "inputs": ["s3://my-bucket/exports/orders", urn],
+                    "outputs": [urn],
+                }
+            },
+        )
+
+    def test2(self) -> None:
+        """
+        Test that a function is called with the context, and that what it
+        returns may hold objects with `inputs` and `outputs` of their own.
+        """
+        seen: List[Any] = []
+
+        def extract(context: Any) -> Dict[str, Any]:
+            seen.append(context)
+            sides = types.SimpleNamespace(inputs=[], outputs=["s3://b/out"])
+            return {"export": sides}
+
+        context = _Context()
+        recorder = _Recorder()
+        cedsens.convalesce_sensor(context, emitter=recorder, lineage=extract)
+        self.assertEqual(seen, [context])
+        self.assertEqual(
+            recorder.sent[0]["payload"]["lineage"],
+            {"export": {"outputs": ["s3://b/out"]}},
+        )
+
+    def test3(self) -> None:
+        """
+        Test that a declaration that cannot be read costs the declaration
+        and never the run's report.
+        """
+
+        def broken(context: Any) -> Dict[str, Any]:
+            raise RuntimeError("no catalogue")
+
+        for lineage in (broken, 7, {"load": {"inputs": 7}}):
+            recorder = _Recorder()
+            cedsens.convalesce_sensor(
+                _Context(), emitter=recorder, lineage=lineage
+            )
+            payload = recorder.sent[0]["payload"]
+            self.assertEqual(payload["dagster_run"]["job_name"], "nightly")
+            self.assertNotIn("lineage", payload)

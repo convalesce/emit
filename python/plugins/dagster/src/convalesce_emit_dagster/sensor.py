@@ -12,10 +12,12 @@ import convalesce_emit_dagster.sensor as cedsens
 """
 
 import logging
+import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
+import convalesce_emit_dagster._env as cedagenv
 import convalesce_emit_dagster.steps as cedsteps
 from convalesce_emit_dagster.retry import RETRY_JOB_NAME
 
@@ -88,9 +90,32 @@ EVENT_LOG_TYPE_NAMES = (
 # touched.
 _EVENT_LOG_SAMPLE_KEYS = frozenset({"metadata"})
 
-# Where materialisation events cross: the event log, and each step's stats,
-# which carry the same events again under `materialization_events`.
-_EVENT_CARRIERS = ("event_log", "step_stats")
+# Where an author's metadata crosses: the event log, each step's stats,
+# which carry the same materialisations again under `materialization_events`,
+# and the event that ended the run, whose first step failure carries the
+# metadata of a `Failure` the step raised.
+_EVENT_CARRIERS = ("event_log", "step_stats", "dagster_event")
+
+# Where this deployment's Dagster UI is, for the links to a run and a job.
+# Set where the sensor runs: one receiver hears from many deployments, and
+# only each of them knows its own address.
+_URL_ENV = "CONVALESCE_DAGSTER_URL"
+
+# Whether the numbers an author attached cross under their own names. On
+# unless turned off; off, only `METADATA_ALLOWED` crosses, as before 0.2.1.
+_METADATA_ENV = "CONVALESCE_DAGSTER_SEND_METADATA"
+_FALSY = frozenset({"0", "false", "no", "off"})
+
+# What the redaction marker is written under, which no entry may pass for.
+_MARKER_KEYS = frozenset({"redacted", "count"})
+# How many of an author's own entries cross from one metadata mapping, and
+# how long a name one may have: a mapping with thousands of entries, or a
+# name that is itself a value, is not a measurement.
+MAX_PLAIN_VALUES = 50
+MAX_PLAIN_NAME_CHARS = 128
+
+# The sides of the lineage a sensor's author may declare for an op.
+_LINEAGE_SIDES = ("inputs", "outputs")
 
 # The metadata entries that describe a table rather than hold its rows: the
 # ones Dagster itself writes for a materialisation, and the urns an asset's
@@ -175,6 +200,7 @@ def emit_dagster_event(
 def convalesce_sensor(
     context: Any = None,
     emitter: Optional[cemit.EmitterLike] = None,
+    lineage: Any = None,
     **kwargs: Any,
 ) -> None:
     """
@@ -189,11 +215,15 @@ def convalesce_sensor(
 
     :param context: Dagster's run-status context
     :param emitter: emitter to send through
+    :param lineage: the datasets each op reads and writes, for ops whose
+        code names none: op name to `{"inputs": [...], "outputs": [...]}`,
+        each a dataset urn or the URI of a path, or a function of the
+        context that returns such a mapping
     :param kwargs: whatever else Dagster passes; forwarded untouched
     :return: nothing
     """
     try:
-        _sensor(context, emitter, **kwargs)
+        _sensor(context, emitter, lineage, **kwargs)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         # A sensor that raises fails its tick in the customer's Dagster UI;
         # nothing about reporting on a run is worth that.
@@ -201,7 +231,10 @@ def convalesce_sensor(
 
 
 def _sensor(
-    context: Any, emitter: Optional[cemit.EmitterLike], **kwargs: Any
+    context: Any,
+    emitter: Optional[cemit.EmitterLike],
+    lineage: Any,
+    **kwargs: Any,
 ) -> None:
     parts = unwrap_context(context)
     had_parts = bool(parts)
@@ -230,6 +263,12 @@ def _sensor(
     cloud_env = cloud_environment()
     if cloud_env:
         parts["cloud_environment"] = cloud_env
+    url = dagster_url()
+    if url:
+        parts["dagster_url"] = url
+    declared = declared_lineage(context, lineage)
+    if declared:
+        parts["lineage"] = declared
     payload = (
         {**parts, **kwargs} if had_parts else {"context": context, **kwargs}
     )
@@ -281,7 +320,8 @@ def _without_run_config(body: Any) -> List[Dict[str, str]]:
 
 def redact_metadata(value: Any, path: str) -> Tuple[Any, List[Dict[str, str]]]:
     """
-    Redact every `metadata` entry but the ones that describe a table.
+    Redact every `metadata` entry but the ones that describe a table and
+    the numbers its author attached.
 
     A `metadata` mapping keeps its allowed entries as they are; the rest are
     counted into the same marker a fully redacted one carries, so a receiver
@@ -324,22 +364,134 @@ def redact_metadata(value: Any, path: str) -> Tuple[Any, List[Dict[str, str]]]:
 
 def _allowed_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
-    One `metadata` mapping, down to the entries that describe a table.
+    One `metadata` mapping, down to the entries that describe a table and
+    the numbers its author attached.
+
+    A number, a flag or a timestamp is a measurement of what ran -- rows
+    rejected, a mean, whether a threshold held -- and crosses under its own
+    name. Text, tables, markdown, JSON, paths and links can each hold the
+    data itself, and stay behind the marker unless their name is allowed.
 
     :param metadata: the dumped mapping, entry name to value
     :return: the allowed entries, plus `redacted` and `count` for the rest
         when there were any
     """
     out: Dict[str, Any] = {}
+    plain = MAX_PLAIN_VALUES if metadata_enabled() else 0
     for name, entry in metadata.items():
         if name == "dagster/column_schema":
             out[name] = _schema_only(entry)
         elif name in METADATA_ALLOWED:
             out[name] = entry
+        elif plain and _is_plain_value(name, entry):
+            out[name] = entry
+            plain -= 1
     withheld = len(metadata) - len(out)
     if withheld:
         out.update({"redacted": True, "count": withheld})
     return out
+
+
+def _is_plain_value(name: Any, entry: Any) -> bool:
+    """
+    Whether one metadata entry is a number, a flag or a timestamp.
+
+    Dagster's `IntMetadataValue`, `FloatMetadataValue`, `BoolMetadataValue`
+    and `TimestampMetadataValue` each dump as `{"value": ...}` and nothing
+    else, and a value an author passed bare crosses bare. A float that is
+    not finite has no JSON form and is not sent.
+
+    :param name: the entry's name
+    :param entry: its dumped value
+    :return: whether it may cross under its own name
+    """
+    if (
+        not isinstance(name, str)
+        or name in _MARKER_KEYS
+        or len(name) > MAX_PLAIN_NAME_CHARS
+    ):
+        return False
+    value = entry
+    if isinstance(entry, dict):
+        if set(entry) != {"value"}:
+            return False
+        value = entry["value"]
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return isinstance(value, (bool, int))
+
+
+def metadata_enabled() -> bool:
+    """
+    Whether the numbers an author attached are sent under their own names.
+
+    :return: False when `CONVALESCE_DAGSTER_SEND_METADATA` turns it off
+    """
+    return (cedagenv.read(_METADATA_ENV) or "").strip().lower() not in _FALSY
+
+
+def dagster_url() -> Optional[str]:
+    """
+    Where this deployment's Dagster UI is, as `CONVALESCE_DAGSTER_URL` says.
+
+    :return: the address without a trailing slash, or None when it is unset
+    """
+    url = (cedagenv.read(_URL_ENV) or "").strip().rstrip("/")
+    return url or None
+
+
+def declared_lineage(
+    context: Any, lineage: Any
+) -> Dict[str, Dict[str, List[str]]]:
+    """
+    The datasets a sensor's author declared each op reads and writes.
+
+    Each is a dataset urn, as an op's `convalesce.inputs` and
+    `convalesce.outputs` metadata take, or the URI of a path, for ops whose
+    code names neither. A function is
+    called with the context, so it can answer for the run at hand; one that
+    raises, or anything that is not this shape, costs the declaration and
+    never the run's report.
+
+    :param context: Dagster's run-status context
+    :param lineage: op name to `{"inputs": [...], "outputs": [...]}` or to
+        an object with those attributes, or a function returning one
+    :return: op name to its sides, each a sorted list of references as
+        text; empty when nothing usable was declared
+    """
+    try:
+        found = lineage(context) if callable(lineage) else lineage
+        out: Dict[str, Dict[str, List[str]]] = {}
+        for op_name, sides in dict(found or {}).items():
+            entry = {
+                side: _references(
+                    sides.get(side)
+                    if isinstance(sides, dict)
+                    else getattr(sides, side, None)
+                )
+                for side in _LINEAGE_SIDES
+            }
+            entry = {side: refs for side, refs in entry.items() if refs}
+            if entry:
+                out[str(op_name)] = entry
+        return out
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.warning("convalesce: could not read the declared lineage: %s", exc)
+        return {}
+
+
+def _references(value: Any) -> List[str]:
+    """
+    One side of a declaration, as text.
+
+    :param value: one reference, or any collection of them
+    :return: each as its `str()`, sorted, so a set crosses the same way
+        every time
+    """
+    if value is None:
+        return []
+    items = [value] if isinstance(value, str) else list(value)
+    return sorted({str(item) for item in items if item})
 
 
 def _schema_only(entry: Any) -> Any:
