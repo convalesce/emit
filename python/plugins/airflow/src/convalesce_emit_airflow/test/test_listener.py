@@ -190,6 +190,22 @@ class Test_listener_forwarding1(unittest.TestCase):
         # listener; if the event is still queued at that point it is gone.
         self.assertEqual(recorder.flushes, 1)
 
+    def test_own_retry_dag_is_not_reported(self) -> None:
+        """
+        Test that the dag that asks which retries are approved is left
+        unreported, task and run alike, while any other dag still crosses.
+        """
+        recorder = _Recorder()
+        cls = cealist.build_listener_class(_FAILED_SPEC)
+        listener = cls(emitter=recorder)
+        ours = types.SimpleNamespace(dag_id="convalesce_retries", task_id="t")
+        listener.send("on_task_instance_failed", task_instance=ours)
+        listener.send("on_dag_run_success", dag_run=ours)
+        self.assertEqual(recorder.sent, [])
+        theirs = types.SimpleNamespace(dag_id="orders", task_id="t")
+        listener.send("on_task_instance_failed", task_instance=theirs)
+        self.assertEqual(len(recorder.sent), 1)
+
     def test2(self) -> None:
         """
         Test that a task instance crosses without being read for fields.

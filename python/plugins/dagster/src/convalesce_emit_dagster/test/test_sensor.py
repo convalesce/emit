@@ -85,6 +85,21 @@ class Test_convalesce_sensor1(unittest.TestCase):
         self.assertEqual(payload["sensor_name"], "convalesce_on_failure")
         self.assertNotIn("context", payload)
 
+    def test_own_retry_job_is_not_reported(self) -> None:
+        """
+        Test that a run of the job that asks which retries are approved is
+        left unreported: it runs every minute and is not the customer's.
+        """
+
+        class _RetryRun(_Context):
+            @property
+            def dagster_run(self) -> Dict[str, Any]:
+                return {"job_name": "convalesce_retries", "run_id": "r1"}
+
+        recorder = _Recorder()
+        cedsens.convalesce_sensor(_RetryRun(), emitter=recorder)
+        self.assertEqual(recorder.sent, [])
+
     def test2(self) -> None:
         """
         Test that something that is not a context still crosses whole.

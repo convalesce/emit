@@ -44,12 +44,17 @@ The credentials used to reach the webserver are `CONVALESCE_DAGSTER_
 RETRY_HOST` and `CONVALESCE_DAGSTER_RETRY_TOKEN` -- a separate, narrowly-
 scoped, network-reached credential, never the sensor's in-process
 `DagsterInstance`, and never `CONVALESCE_API_KEY`/`CONVALESCE_INGEST_KEY`
-(those talk to collect; this talks to Dagster's webserver). Sent as a
-bearer token, matching this distribution's own convention elsewhere --
-documented as an assumption, not verified against a live Dagster+ or
-reverse-proxied deployment: Dagster OSS's webserver GraphQL API carries
-no authentication of its own by default, so what actually enforces this
-token is whatever the customer puts in front of it.
+(those talk to collect; this talks to Dagster's webserver). How the token
+is sent follows where the webserver is:
+
+- Dagster+ takes a user token in its own `Dagster-Cloud-Api-Token` header,
+  so a host under `dagster.cloud` is sent it there.
+- A webserver somebody runs themselves has no sign-in of its own, so the
+  token is optional. When one is set it is sent as a bearer token, which
+  is what a proxy in front of the webserver would check.
+
+Neither was tried against a live Dagster+ or a proxied deployment: the
+Dagster+ header is the one Dagster's own client documentation gives.
 
 Import as:
 
@@ -62,6 +67,7 @@ import logging
 import os
 import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional
 
@@ -75,6 +81,14 @@ _LOG = logging.getLogger(__name__)
 
 _HOST_ENV = "CONVALESCE_DAGSTER_RETRY_HOST"
 _TOKEN_ENV = "CONVALESCE_DAGSTER_RETRY_TOKEN"
+
+# The job the customer schedules to call `run_pending_retries`. Named here
+# so the sensor can leave its own runs unreported: it runs every minute, and
+# a run of it says nothing about the customer's pipelines.
+RETRY_JOB_NAME = "convalesce_retries"
+
+_CLOUD_HOST_SUFFIX = ".dagster.cloud"
+_CLOUD_TOKEN_HEADER = "Dagster-Cloud-Api-Token"
 
 # FROM_FAILURE re-executes only the failed step and everything downstream
 # of it -- Dagster's own "Re-execute from failure" scope, and the closest
@@ -132,18 +146,20 @@ class _RetryTarget:
     Where and how to call this webserver's GraphQL API.
 
     :param base_url: the webserver's base URL, no trailing slash
-    :param token: sent as a bearer token; never logged
+    :param token: the token to sign in with, when the webserver takes
+        one; never logged
     """
 
     base_url: str
-    token: str
+    token: Optional[str] = None
 
 
 def _read_target() -> Optional[_RetryTarget]:
     """
     Resolve the retry credential, failing closed on anything missing.
 
-    :return: the target to call, or None when the host or token is unset
+    :return: the target to call, or None when the host is unset, or it
+        is a Dagster+ host and no token is
     """
     host = os.environ.get(_HOST_ENV)
     token = os.environ.get(_TOKEN_ENV)
@@ -153,15 +169,40 @@ def _read_target() -> Optional[_RetryTarget]:
             _HOST_ENV,
         )
         return None
-    if not token or not token.strip():
+    base_url = _normalize_host(host.strip())
+    token = token.strip() if token and token.strip() else None
+    if token is None and _is_cloud(base_url):
         _LOG.warning(
             "convalesce: %s is not set; not executing dagster retries",
             _TOKEN_ENV,
         )
         return None
-    return _RetryTarget(
-        base_url=_normalize_host(host.strip()), token=token.strip()
-    )
+    return _RetryTarget(base_url=base_url, token=token)
+
+
+def _is_cloud(base_url: str) -> bool:
+    """
+    Whether a webserver address is Dagster+'s own.
+
+    :param base_url: the webserver's base URL
+    :return: True for a host under `dagster.cloud`
+    """
+    host = urllib.parse.urlparse(base_url).hostname or ""
+    return host.endswith(_CLOUD_HOST_SUFFIX)
+
+
+def _sign_in(target: _RetryTarget) -> Dict[str, str]:
+    """
+    The header that signs a request in to this webserver, if it takes one.
+
+    :param target: where and how to call it
+    :return: the header, or nothing when no token is set
+    """
+    if target.token is None:
+        return {}
+    if _is_cloud(target.base_url):
+        return {_CLOUD_TOKEN_HEADER: target.token}
+    return {"Authorization": f"Bearer {target.token}"}
 
 
 def _normalize_host(host: str) -> str:
@@ -208,7 +249,7 @@ def _call_graphql(
     url = target.base_url + "/graphql"
     body = json.dumps({"query": query, "variables": variables}).encode("utf-8")
     headers = {
-        "Authorization": f"Bearer {target.token}",
+        **_sign_in(target),
         "Content-Type": "application/json",
         "User-Agent": f"convalesce-emit-dagster/{cedagsterver.__version__}",
     }

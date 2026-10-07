@@ -23,6 +23,16 @@ The credential used to call Airflow's REST API is
 in-process access, and never `CONVALESCE_API_KEY`/`CONVALESCE_INGEST_KEY`
 (those talk to collect; this talks to Airflow itself).
 
+That connection carries either an Airflow user or a ready-made token, and
+which one decides how the call signs in:
+
+- a login and a password: the way stock Airflow signs an API client in.
+  Airflow 2's API takes them as HTTP basic auth. Airflow 3's takes a
+  short-lived token, so they are exchanged for one at `/auth/token` on
+  every run -- nothing stored ever expires.
+- a password and no login: a token the deployment issues itself and
+  accepts as a bearer token, as a managed Airflow's own API tokens are.
+
 Airflow's REST base path for clearing task instances moved between majors
 -- confirmed against Airflow's own source, not guessed: `/api/v1/dags/
 {dag_id}/clearTaskInstances` through Airflow 2, `/api/v2/dags/{dag_id}/
@@ -38,6 +48,7 @@ Import as:
 import convalesce_emit_airflow.retry as cealretry
 """
 
+import base64
 import dataclasses
 import json
 import logging
@@ -69,6 +80,10 @@ TOOL = "airflow"
 # in this process's environment as plaintext.
 _RETRY_CONNECTION_ENV = "CONVALESCE_AIRFLOW_RETRY_TOKEN"
 
+# Where Airflow 3 exchanges a user's login and password for an API token.
+_TOKEN_PATH = "/auth/token"
+_FIRST_MAJOR_WITH_TOKENS = 3
+
 _CLEAR_PATH_V1 = "/api/v1/dags/{dag_id}/clearTaskInstances"
 _CLEAR_PATH_V2 = "/api/v2/dags/{dag_id}/clearTaskInstances"
 
@@ -84,11 +99,15 @@ class _RetryTarget:
     Where and how to call this Airflow's own REST API.
 
     :param base_url: the webserver's base URL, no trailing slash
-    :param token: sent as a bearer token; never logged
+    :param token: the connection's password: a user's password when
+        `login` is set, otherwise a token sent as a bearer token; never
+        logged
+    :param login: the connection's login, when it names an Airflow user
     """
 
     base_url: str
     token: str
+    login: Optional[str] = None
 
 
 def _read_target() -> Optional[_RetryTarget]:
@@ -121,7 +140,10 @@ def _read_target() -> Optional[_RetryTarget]:
             "convalesce: retry connection %s has no host or no token", conn_id
         )
         return None
-    return _RetryTarget(base_url=base_url, token=token)
+    login = getattr(connection, "login", None)
+    return _RetryTarget(
+        base_url=base_url, token=token, login=str(login) if login else None
+    )
 
 
 def _get_connection(conn_id: str) -> Any:
@@ -165,6 +187,66 @@ def _webserver_base_url(connection: Any) -> Optional[str]:
 # #############################################################################
 # local scope
 # #############################################################################
+
+
+def _token_for(target: _RetryTarget, timeout: float) -> str:
+    """
+    Exchange an Airflow user's login and password for an API token.
+
+    :param target: where this Airflow is, and the user to sign in as
+    :param timeout: seconds to wait on the request
+    :return: the access token
+    :raises RuntimeError: on any non-2xx response, or one with no token
+    """
+    request = urllib.request.Request(  # nosec B310
+        target.base_url + _TOKEN_PATH,
+        data=json.dumps(
+            {"username": target.login, "password": target.token}
+        ).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": f"convalesce-emit-airflow/{ceairflowver.__version__}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(  # nosec B310
+            request, timeout=timeout
+        ) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"{_TOKEN_PATH} returned HTTP {exc.code}") from exc
+    token = body.get("access_token") if isinstance(body, dict) else None
+    if not token:
+        raise RuntimeError(f"{_TOKEN_PATH} returned no access_token")
+    return str(token)
+
+
+def _authorization(
+    target: _RetryTarget, major: Optional[int], timeout: float
+) -> str:
+    """
+    The Authorization header this Airflow's API accepts from `target`.
+
+    :param target: where and how to call this Airflow
+    :param major: the running Airflow's major version; None when it could
+        not be read
+    :param timeout: seconds to wait, where a token has to be fetched
+    :return: the header's value
+    :raises RuntimeError: if a user is given and the version cannot be
+        read -- which of the two ways to sign a user in is not guessed --
+        or if Airflow will not issue a token
+    """
+    if target.login is None:
+        return f"Bearer {target.token}"
+    if major is None:
+        raise RuntimeError(
+            "could not determine the running Airflow's major version"
+        )
+    if major < _FIRST_MAJOR_WITH_TOKENS:
+        pair = f"{target.login}:{target.token}".encode("utf-8")
+        return "Basic " + base64.b64encode(pair).decode("ascii")
+    return f"Bearer {_token_for(target, timeout)}"
 
 
 def _dag_exists_locally(dag_id: str) -> bool:
@@ -248,6 +330,7 @@ def _clear_task_instance(  # pylint: disable=too-many-arguments,too-many-positio
     run_id: str,
     map_index: Optional[int],
     timeout: float,
+    authorization: Optional[str] = None,
 ) -> str:
     """
     Clear one task instance via Airflow's own REST API -- the primitive
@@ -260,6 +343,8 @@ def _clear_task_instance(  # pylint: disable=too-many-arguments,too-many-positio
     :param run_id: the dag run the task instance belongs to
     :param map_index: the mapped task index, when the task is mapped
     :param timeout: seconds to wait on the request
+    :param authorization: the Authorization header to send, when the
+        caller has already worked it out; worked out here when not given
     :return: a native run reference identifying what was cleared
     :raises RuntimeError: on any non-2xx response or unreadable version
     :raises Exception: on anything that means the request never got a
@@ -277,7 +362,7 @@ def _clear_task_instance(  # pylint: disable=too-many-arguments,too-many-positio
         "task_ids": task_ids,
     }
     headers = {
-        "Authorization": f"Bearer {target.token}",
+        "Authorization": authorization or _authorization(target, major, timeout),
         "Content-Type": "application/json",
         "User-Agent": f"convalesce-emit-airflow/{ceairflowver.__version__}",
     }
@@ -377,6 +462,17 @@ def run_pending_retries(  # pylint: disable=too-many-locals
         return RetryRunSummary(considered=considered, skipped=considered)
 
     major = _airflow_major_version()
+    # Signed in once, and before anything is claimed: a claim is a single
+    # shot, and it is not spent on a sign-in that was never going to work.
+    try:
+        authorization = _authorization(target, major, timeout)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.warning(
+            "convalesce: could not sign in to Airflow's API; not executing "
+            "airflow retries: %s",
+            exc,
+        )
+        return RetryRunSummary(considered=considered, skipped=considered)
     claim_owner = owner or _default_owner()
     claimed = triggered = failed = skipped = 0
     for candidate in candidates:
@@ -422,6 +518,7 @@ def run_pending_retries(  # pylint: disable=too-many-locals
                 run_id=run_id,
                 map_index=map_index,
                 timeout=timeout,
+                authorization=authorization,
             )
         except Exception as exc:  # pylint: disable=broad-exception-caught
             _LOG.warning(
