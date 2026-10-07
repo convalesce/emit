@@ -80,7 +80,7 @@ Run this where the tool runs, with the same environment it has:
 
 ```sh
 convalesce-emit check                      # or: python -m convalesce_emit check
-java -jar convalesce-emit-core-0.1.3.jar   # on a Spark driver's host
+java -jar convalesce-emit-core-0.2.1.jar   # on a Spark driver's host
 ```
 
 It sends one empty batch with the configured key and says whether the key was
