@@ -38,6 +38,9 @@ class ConvalesceValidationAction(ValidationAction):  # type: ignore[misc]
         data_context: Any = None,
         name: str = "convalesce_emit",
         emitter: Optional[cemit.EmitterLike] = None,
+        platform: Optional[str] = None,
+        dataset_name: Optional[str] = None,
+        platform_instance: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         # Swallowed rather than forwarded: GX 0.x point releases pass extra
@@ -50,6 +53,11 @@ class ConvalesceValidationAction(ValidationAction):  # type: ignore[misc]
         except TypeError:
             super().__init__(data_context=data_context)  # type: ignore[call-arg]
         self._emitter = emitter
+        # Where this checkpoint's batch lives, for one GX cannot say it of:
+        # a dataframe, or a datasource named for something else.
+        self._named = cegxcom.named_dataset(
+            platform, dataset_name, platform_instance
+        )
 
     def _run(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         """
@@ -61,7 +69,7 @@ class ConvalesceValidationAction(ValidationAction):  # type: ignore[misc]
             redacted
         """
         payload = {"args": list(args), "kwargs": kwargs}
-        return cegxcom.forward(payload, self._emitter)
+        return cegxcom.forward(payload, self._emitter, named=self._named)
 
     def set_emitter(self, emitter: Optional[cemit.EmitterLike]) -> None:
         """

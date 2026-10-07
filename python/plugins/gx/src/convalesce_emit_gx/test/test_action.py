@@ -7,10 +7,13 @@ majors; these cover the parts that hold whichever is present.
 Run with `make test`.
 """
 
+import importlib
 import importlib.util
 import json
 import logging
 import os
+import sys
+import types
 import unittest
 import unittest.mock
 from typing import Any, List
@@ -56,35 +59,41 @@ class _Recorder:
 
 class Test_gx_forward1(unittest.TestCase):
     """
-    Test that row values do not leave the process by default.
+    Test that failing sample values are sent unless switched off.
     """
 
     def test1(self) -> None:
         """
-        Test that sample values are redacted before sending.
-
-        This is the test that keeps the handbook honest: a GX result carries
-        real failing rows, and we promise not to send them.
+        Test that sample values are sent when nothing says otherwise.
         """
         recorder = _Recorder()
         with unittest.mock.patch.dict(os.environ, {}, clear=True):
             outcome = cegxcom.forward(_RESULT, recorder)
-        wire = json.dumps(recorder.sent, default=str)
-        self.assertNotIn("alice@x.com", wire)
-        self.assertIn("100", wire)
+        self.assertIn("alice@x.com", json.dumps(recorder.sent, default=str))
         self.assertTrue(outcome["convalesce_emitted"])
-        self.assertTrue(outcome["redacted"])
+        self.assertFalse(outcome["redacted"])
 
     def test2(self) -> None:
         """
-        Test that samples can be sent when that is chosen deliberately.
+        Test that the switch keeps sample values here, under either of its
+        names, and that the counts still cross.
+
+        This is the test that keeps the README honest: with the switch off,
+        no failing row leaves the process.
         """
-        recorder = _Recorder()
-        env = {"CONVALESCE_GX_SEND_SAMPLES": "true"}
-        with unittest.mock.patch.dict(os.environ, env, clear=True):
-            outcome = cegxcom.forward(_RESULT, recorder)
-        self.assertIn("alice@x.com", json.dumps(recorder.sent, default=str))
-        self.assertFalse(outcome["redacted"])
+        for name in (
+            "CONVALESCE_GX_SEND_SAMPLES",
+            "CUSTOMER_CONVALESCE_GX_SEND_SAMPLES",
+        ):
+            recorder = _Recorder()
+            with unittest.mock.patch.dict(
+                os.environ, {name: "false"}, clear=True
+            ):
+                outcome = cegxcom.forward(_RESULT, recorder)
+            wire = json.dumps(recorder.sent, default=str)
+            self.assertNotIn("alice@x.com", wire)
+            self.assertIn("100", wire)
+            self.assertTrue(outcome["redacted"])
 
     def test3(self) -> None:
         """
@@ -141,8 +150,8 @@ class _Frame:
     shape = (4, 2)
 
     def to_dict(self) -> Any:
-        """Return every row, the way pandas does."""
-        return {"email": {"0": "alice@x.com"}}
+        """Return every row, the way pandas does: one no check failed on."""
+        return {"email": {"0": "carol@x.com"}}
 
 
 class _Engine:
@@ -192,7 +201,7 @@ class Test_gx_runtime1(unittest.TestCase):
         self.assertEqual(
             payload["kwargs"]["expectation_suite_identifier"], "orders"
         )
-        self.assertNotIn("alice@x.com", json.dumps(payload))
+        self.assertNotIn("carol@x.com", json.dumps(payload))
 
     def test2(self) -> None:
         """
@@ -209,7 +218,7 @@ class Test_gx_runtime1(unittest.TestCase):
         payload = recorder.sent[0]["payload"]
         self.assertEqual(len(payload["args"]), 1)
         self.assertIn("results", payload["args"][0])
-        self.assertNotIn("alice@x.com", json.dumps(payload))
+        self.assertNotIn("carol@x.com", json.dumps(payload))
 
     def test3(self) -> None:
         """
@@ -702,10 +711,14 @@ def _sent_results(recorder: _Recorder) -> List[Any]:
     return [item["result"] for item in suite["results"]]
 
 
+_SAMPLES_OFF = {"CONVALESCE_GX_SEND_SAMPLES": "false"}
+
+
 class Test_redact_values1(unittest.TestCase):
     """
-    Test that the column values an expectation observed do not leave the
-    process by default, and that aggregates and column names do.
+    Test that, with samples switched off, the column values an expectation
+    observed do not leave the process, and that aggregates and column names
+    do.
     """
 
     def _send(self, env: Any, *results: Any) -> _Recorder:
@@ -719,7 +732,7 @@ class Test_redact_values1(unittest.TestCase):
         Test that distinct values and their counts become counts.
         """
         recorder = self._send(
-            {},
+            _SAMPLES_OFF,
             _expectation(
                 "expect_column_distinct_values_to_be_in_set",
                 {
@@ -778,7 +791,7 @@ class Test_redact_values1(unittest.TestCase):
                 {"observed_value": ["id", "email"]},
             ),
         )
-        recorder = self._send({}, *results)
+        recorder = self._send(_SAMPLES_OFF, *results)
         self.assertEqual(
             [r["observed_value"] for r in _sent_results(recorder)],
             [8.5, "zed", {"quantiles": [0.5], "values": [12]}, ["id", "email"]],
@@ -790,7 +803,7 @@ class Test_redact_values1(unittest.TestCase):
         redacted rather than trusted.
         """
         recorder = self._send(
-            {},
+            _SAMPLES_OFF,
             _expectation("expect_custom_thing", {"observed_value": ["bob"]}),
         )
         self.assertEqual(
@@ -800,10 +813,10 @@ class Test_redact_values1(unittest.TestCase):
 
     def test4(self) -> None:
         """
-        Test that values cross when the operator deliberately sends samples.
+        Test that observed values cross when nothing says otherwise.
         """
         recorder = self._send(
-            {"CONVALESCE_GX_SEND_SAMPLES": "true"},
+            {},
             _expectation(
                 "expect_column_distinct_values_to_equal_set",
                 {"observed_value": ["Pune", "Oslo"]},
@@ -864,6 +877,122 @@ class Test_forward_validation_result1(unittest.TestCase):
         self.assertEqual(
             payload["result_urls"], {"": "https://app.greatexpectations.io/r/1"}
         )
+
+
+# #############################################################################
+# Test_named_dataset1
+# #############################################################################
+
+
+class _StubValidationAction:
+    """
+    Stands in for GX's `ValidationAction` base on either major: 0.x builds
+    it from a data context, 1.x from the model's own fields.
+    """
+
+    def __init__(self, data_context: Any = None, **fields: Any) -> None:
+        del data_context
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+
+def _action_class(module: str) -> Any:
+    """
+    Import one major's action class over a stand-in for its GX base.
+
+    :param module: `action_v0` or `action_v1`
+    :return: its `ConvalesceValidationAction`
+    """
+    actions = types.ModuleType("great_expectations.checkpoint.actions")
+    actions.ValidationAction = _StubValidationAction  # type: ignore[attr-defined]
+    stubs = {
+        "great_expectations": types.ModuleType("great_expectations"),
+        "great_expectations.checkpoint": types.ModuleType(
+            "great_expectations.checkpoint"
+        ),
+        "great_expectations.checkpoint.actions": actions,
+    }
+    name = f"convalesce_emit_gx.{module}"
+    with unittest.mock.patch.dict(sys.modules, stubs):
+        sys.modules.pop(name, None)
+        try:
+            return importlib.import_module(name).ConvalesceValidationAction
+        finally:
+            sys.modules.pop(name, None)
+
+
+class Test_named_dataset1(unittest.TestCase):
+    """
+    Test that what an action is told about its checkpoint's table crosses
+    with the result.
+    """
+
+    _NAMED = {"platform": "postgres", "dataset_name": "my_db.my_schema.orders"}
+
+    def test1(self) -> None:
+        """
+        Test that the fields given cross as written, and the one not given
+        is not sent at all.
+        """
+        recorder = _Recorder()
+        cegxcom.forward(
+            _suite(), recorder, named=cegxcom.named_dataset(**self._NAMED)
+        )
+        payload = recorder.sent[0]["payload"]
+        self.assertEqual({key: payload[key] for key in self._NAMED}, self._NAMED)
+        self.assertNotIn("platform_instance", payload)
+
+    def test2(self) -> None:
+        """
+        Test that a result sent from outside a checkpoint can name its table
+        the same way.
+        """
+        recorder = _Recorder()
+        cegxcom.forward_validation_result(
+            {"results": []}, recorder, platform_instance="acme", **self._NAMED
+        )
+        payload = recorder.sent[0]["payload"]
+        self.assertEqual(payload["dataset_name"], "my_db.my_schema.orders")
+        self.assertEqual(payload["platform_instance"], "acme")
+
+    @unittest.skipIf(
+        importlib.util.find_spec("great_expectations"),
+        "the action classes are built by a real install in test_backward",
+    )
+    def test3(self) -> None:
+        """
+        Test that the 0.x action keeps the fields its checkpoint's action
+        list gives it, rather than swallowing them with the keywords GX
+        passes that it has no use for.
+        """
+        recorder = _Recorder()
+        action = _action_class("action_v0")(
+            data_context=None, emitter=recorder, site_names=[], **self._NAMED
+        )
+        # pylint: disable-next=protected-access
+        action._run({"results": []})
+        payload = recorder.sent[0]["payload"]
+        self.assertEqual(payload["platform"], "postgres")
+        self.assertEqual(payload["dataset_name"], "my_db.my_schema.orders")
+
+    @unittest.skipIf(
+        importlib.util.find_spec("great_expectations"),
+        "the action classes are built by a real install in test_backward",
+    )
+    def test4(self) -> None:
+        """
+        Test that the 1.x action sends the fields set on it, and none when
+        none is set.
+        """
+        recorder = _Recorder()
+        action_class = _action_class("action_v1")
+        for fields, expected in ((self._NAMED, "postgres"), ({}, None)):
+            action = action_class(**fields)
+            action.set_emitter(recorder)
+            action.run(checkpoint_result={"run_results": {}})
+            self.assertEqual(
+                recorder.sent[-1]["payload"].get("platform"), expected
+            )
 
 
 # #############################################################################
