@@ -1440,3 +1440,188 @@ class Test_watch_hooks1(unittest.TestCase):
             sys.modules, {"airflow.providers.common.sql.hooks.sql": None}
         ):
             cealist.watch_hooks()
+
+
+# #############################################################################
+# Test_hook_connections1
+# #############################################################################
+
+
+class _WarehouseConnection:
+    """Stands in for a connection that keeps its database in `extra`."""
+
+    conn_type = "snowflake"
+    host = None
+    port = None
+    schema = None
+    extra_dejson = {
+        "database": "MY_DB",
+        "schema": "MY_SCHEMA",
+        "account": "my_account",
+        "token": "s3cret",
+    }
+
+
+class _PythonTask:
+    """Stands in for a `@task`: it names no connection of its own."""
+
+    def __init__(self) -> None:
+        self.task_id = "load"
+
+
+class _PythonTaskInstance:
+    """Stands in for the task instance of a `@task`."""
+
+    def __init__(self) -> None:
+        self.task_id = "load"
+        self.task = _PythonTask()
+
+
+# The listener's own event names and what it holds between a statement and
+# the event that reports it are read below.
+# pylint: disable=protected-access
+_SUCCESS = "on_task_instance_success"
+_SUCCESS_SPEC = {
+    cealist._RUNNING: (
+        "previous_state",
+        "task_instance",
+        "session",
+    ),
+    _SUCCESS: ("previous_state", "task_instance", "session"),
+}
+_INSERT = "insert into big_orders select id from orders where amount > 45"
+
+
+class Test_hook_connections1(unittest.TestCase):
+    """
+    Test that a statement a hook ran names the connection it ran on.
+    """
+
+    def setUp(self) -> None:
+        self.addCleanup(cealist._HOOK_CONNECTIONS.clear)
+        self.addCleanup(cesqlcap.drain)
+
+    def _run(self, hook: Any, statement: str = _INSERT) -> Dict[str, Any]:
+        """
+        Run one task that sends a statement through a hook.
+
+        :param hook: the hook the task's own code built
+        :param statement: what it runs
+        :return: the payload sent when the task succeeded
+        """
+        recorder = _Recorder()
+        listener = cealist.build_listener_class(_SUCCESS_SPEC)(emitter=recorder)
+        task_instance = _PythonTaskInstance()
+        with (
+            unittest.mock.patch.object(
+                cealist, "watch_sql", side_effect=cesqlcap.start
+            ),
+            unittest.mock.patch.object(
+                cealist, "_get_connection", return_value=_WarehouseConnection()
+            ),
+        ):
+            getattr(listener, cealist._RUNNING)(None, task_instance, None)
+            cesqlcap.record(statement, dialect="snowflake", via="airflow_hook")
+            cealist.note_connection(hook, statement)
+            getattr(listener, _SUCCESS)("running", task_instance, None)
+        payload: Dict[str, Any] = recorder.sent[-1]["payload"]
+        return payload
+
+    def test1(self) -> None:
+        """
+        Test that the statement carries its hook's connection id, and the
+        task that connection's coordinates with nothing secret in them.
+        """
+
+        class Hook:
+            """Stands in for a hook built from a connection id."""
+
+            conn_name_attr = "warehouse_conn_id"
+            warehouse_conn_id = "wh"
+
+        payload = self._run(Hook())
+        (row,) = payload["sql_capture"]["statements"]
+        self.assertEqual(row["conn_id"], "wh")
+        self.assertEqual(
+            payload["task_instance"]["task"]["connections"],
+            {
+                "wh": {
+                    "conn_id": "wh",
+                    "conn_type": "snowflake",
+                    "host": None,
+                    "port": None,
+                    "schema": None,
+                    "extra": {"database": "MY_DB", "schema": "MY_SCHEMA"},
+                }
+            },
+        )
+        self.assertNotIn("s3cret", str(payload))
+        self.assertNotIn("my_account", str(payload))
+
+    def test2(self) -> None:
+        """
+        Test that the id is read from `get_conn_id()` where the hook has
+        it, and from any `*_conn_id` attribute where its class names none.
+        """
+
+        class Asked:
+            """Stands in for a newer hook."""
+
+            def get_conn_id(self) -> str:
+                """Return the id the hook was built from."""
+                return "asked"
+
+        class Plain:
+            """Stands in for a hook whose class names no attribute."""
+
+            def __init__(self) -> None:
+                self.jdbc_conn_id = "plain"
+
+        self.assertEqual(cealist.hook_conn_id(Asked()), "asked")
+        self.assertEqual(cealist.hook_conn_id(Plain()), "plain")
+
+    def test3(self) -> None:
+        """
+        Test that a hook naming no connection, or one that raises when
+        asked, leaves the statement as it was and costs the task nothing.
+        """
+
+        class Raises:
+            """Stands in for a hook whose id cannot be read."""
+
+            def get_conn_id(self) -> str:
+                """Raise, as a hook half built would."""
+                raise RuntimeError("no connection")
+
+        self.assertIsNone(cealist.hook_conn_id(object()))
+        self.assertIsNone(cealist.hook_conn_id(Raises()))
+        payload = self._run(Raises())
+        (row,) = payload["sql_capture"]["statements"]
+        self.assertNotIn("conn_id", row)
+        self.assertNotIn("connections", payload["task_instance"]["task"])
+
+    def test4(self) -> None:
+        """
+        Test that a connection Airflow cannot resolve still names itself on
+        the statement, and that a failure reading it drops only that.
+        """
+
+        class Hook:
+            """Stands in for a hook built from a connection id."""
+
+            conn_name_attr = "conn_id"
+            conn_id = "gone"
+
+        with unittest.mock.patch.object(
+            cealist, "coordinates_of", return_value=None
+        ):
+            payload = self._run(Hook())
+        self.assertEqual(
+            payload["sql_capture"]["statements"][0]["conn_id"], "gone"
+        )
+        self.assertNotIn("connections", payload["task_instance"]["task"])
+        with unittest.mock.patch.object(
+            cealist, "coordinates_of", side_effect=RuntimeError("boom")
+        ):
+            payload = self._run(Hook())
+        self.assertEqual(len(payload["sql_capture"]["statements"]), 1)

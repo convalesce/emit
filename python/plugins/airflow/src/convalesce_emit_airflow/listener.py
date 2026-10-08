@@ -259,6 +259,7 @@ class _Base:
             if event in _ENDED:
                 noted = cesqlcap.drain()
                 if noted:
+                    excluded = excluded + name_connections(noted, shaped)
                     shaped["sql_capture"] = cemit.redact_secrets(noted)[0]
             emitter.emit(
                 tool=TOOL,
@@ -315,6 +316,10 @@ _OWN_TABLES = re.compile(
     re.IGNORECASE,
 )
 _WATCH: Dict[str, Any] = {}
+# Each statement a database hook ran, as the core keeps it, to the id of the
+# connection that hook was built from. Kept here because the core notes a
+# statement and knows nothing of Airflow's connections.
+_HOOK_CONNECTIONS: Dict[str, str] = {}
 # Set on the function this module puts in a hook's place, so it is put there
 # once.
 _NOTING = "convalesce_noting"
@@ -405,6 +410,7 @@ def watch_sql() -> None:
         cesqlcap.ignore(_own_statement)
         cesqlcap.install()
         watch_hooks()
+    _HOOK_CONNECTIONS.clear()
     cesqlcap.start()
 
 
@@ -443,6 +449,7 @@ def watch_hooks() -> None:
             schema=_text(getattr(self, "schema", None)),
             via="airflow_hook",
         )
+        note_connection(self, sql_statement)
         return original(self, cur, sql_statement, *args, **kwargs)
 
     setattr(noted, _NOTING, True)
@@ -452,6 +459,118 @@ def watch_hooks() -> None:
 def _text(value: Any) -> Optional[str]:
     """A value that is text, else nothing."""
     return value if isinstance(value, str) and value else None
+
+
+def hook_conn_id(hook: Any) -> Optional[str]:
+    """
+    The id of the connection a database hook was built from.
+
+    A hook keeps it under the attribute its class names in `conn_name_attr`
+    (`postgres_conn_id`, `snowflake_conn_id`), and the newer ones answer
+    `get_conn_id()` as well.
+
+    :param hook: the hook running a statement
+    :return: the connection id, or None when the hook names none
+    """
+    try:
+        getter = getattr(hook, "get_conn_id", None)
+        found = _text(getter()) if callable(getter) else None
+        if found is None:
+            name = _text(getattr(hook, "conn_name_attr", None))
+            found = _text(getattr(hook, name, None)) if name else None
+        if found is None:
+            found = next(
+                (
+                    value
+                    for name, value in vars(hook).items()
+                    if _is_conn_id(name) and _text(value)
+                ),
+                None,
+            )
+        return found
+    except Exception:  # pylint: disable=broad-exception-caught
+        # A hook class this was never run against; the statement is still
+        # noted, without its connection.
+        return None
+
+
+def note_connection(hook: Any, statement: Any) -> None:
+    """
+    Remember which connection a hook ran a statement on.
+
+    A task written as plain Python names no connection on its operator, so
+    the hook is the only thing that knows where its SQL ran, and with it
+    which database an unqualified table name in that SQL means.
+
+    :param hook: the hook running the statement
+    :param statement: the statement, as the hook was handed it
+    :return: nothing
+    """
+    try:
+        conn_id = hook_conn_id(hook)
+        if conn_id is None or len(_HOOK_CONNECTIONS) >= cesqlcap.MAX_STATEMENTS:
+            return
+        text = statement if isinstance(statement, str) else str(statement)
+        _HOOK_CONNECTIONS.setdefault(text[: cesqlcap.MAX_CHARS], conn_id)
+    except Exception:  # pylint: disable=broad-exception-caught
+        # The task's own statement is about to run; nothing here may stop it.
+        return
+
+
+def name_connections(
+    noted: Dict[str, Any], shaped: Dict[str, Any]
+) -> List[Dict[str, str]]:
+    """
+    Say which connection each noted statement ran on, and where it points.
+
+    Each statement a hook ran gets the `conn_id` of that hook's connection,
+    and the connection's coordinates join the task's `connections`, read
+    and redacted exactly as an operator's own are. A receiver then resolves
+    a statement's unqualified tables in the database of the connection it
+    ran on.
+
+    :param noted: what the core handed over; its statements are named here
+    :param shaped: the payload being sent; its task gains the connections
+    :return: everything redacted from the coordinates added
+    """
+    used: List[str] = []
+    try:
+        for row in noted.get("statements") or []:
+            conn_id = _HOOK_CONNECTIONS.get(row.get("statement"))
+            if conn_id is None:
+                continue
+            row["conn_id"] = conn_id
+            if conn_id not in used:
+                used.append(conn_id)
+        _HOOK_CONNECTIONS.clear()
+        task_instance = shaped.get("task_instance")
+        task = (
+            task_instance.get("task")
+            if isinstance(task_instance, dict)
+            else None
+        )
+        if not isinstance(task, dict):
+            return []
+        known = task.get("connections")
+        known = known if isinstance(known, dict) else {}
+        added: Dict[str, Dict[str, Any]] = {}
+        for conn_id in used:
+            if conn_id in known:
+                continue
+            coordinates = coordinates_of(conn_id)
+            if coordinates is not None:
+                added[conn_id] = coordinates
+        if not added:
+            return []
+        redacted, secrets = cemit.redact_secrets(
+            added, path="task_instance.task.connections"
+        )
+        task["connections"] = {**known, **redacted}
+        return secrets
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # The statements are still worth sending without their connections.
+        _LOG.warning("convalesce: could not read hook connections: %s", exc)
+        return []
 
 
 def shape(
@@ -686,37 +805,53 @@ def connection_coordinates(task: Any) -> Dict[str, Dict[str, Any]]:
     for name, value in data.items():
         if not isinstance(value, str) or not value:
             continue
-        if name != _CONN_ID_SUFFIX and not name.endswith(f"_{_CONN_ID_SUFFIX}"):
+        if not _is_conn_id(name) or value in out:
             continue
-        if value in out:
-            continue
-        try:
-            connection = _get_connection(value)
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            # A connection id that does not resolve -- deleted, or a default
-            # this Airflow never seeded -- is Airflow's business, not a
-            # reason to drop the rest of the event.
-            _LOG.debug(
-                "convalesce: could not read connection %s: %s", value, exc
-            )
-            continue
-        out[value] = {
-            "conn_id": value,
-            "conn_type": getattr(connection, "conn_type", None),
-            "host": getattr(connection, "host", None),
-            "port": getattr(connection, "port", None),
-            "schema": getattr(connection, "schema", None),
-        }
-        try:
-            extra = allowed_extra(connection)
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            # `extra` is parsed as it is read, and one that is not JSON
-            # raises on some Airflow releases.
-            _LOG.debug("convalesce: could not read extra of %s: %s", value, exc)
-            extra = {}
-        if extra:
-            out[value]["extra"] = extra
+        coordinates = coordinates_of(value)
+        if coordinates is not None:
+            out[value] = coordinates
     return out
+
+
+def _is_conn_id(name: Any) -> bool:
+    """Whether an attribute's name says it holds a connection id."""
+    return isinstance(name, str) and (
+        name == _CONN_ID_SUFFIX or name.endswith(f"_{_CONN_ID_SUFFIX}")
+    )
+
+
+def coordinates_of(conn_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Non-secret coordinates of one connection.
+
+    :param conn_id: the connection id to resolve
+    :return: its coordinates, or None when Airflow has no such connection
+    """
+    try:
+        connection = _get_connection(conn_id)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # A connection id that does not resolve -- deleted, or a default
+        # this Airflow never seeded -- is Airflow's business, not a
+        # reason to drop the rest of the event.
+        _LOG.debug("convalesce: could not read connection %s: %s", conn_id, exc)
+        return None
+    found: Dict[str, Any] = {
+        "conn_id": conn_id,
+        "conn_type": getattr(connection, "conn_type", None),
+        "host": getattr(connection, "host", None),
+        "port": getattr(connection, "port", None),
+        "schema": getattr(connection, "schema", None),
+    }
+    try:
+        extra = allowed_extra(connection)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # `extra` is parsed as it is read, and one that is not JSON
+        # raises on some Airflow releases.
+        _LOG.debug("convalesce: could not read extra of %s: %s", conn_id, exc)
+        extra = {}
+    if extra:
+        found["extra"] = extra
+    return found
 
 
 def allowed_extra(connection: Any) -> Dict[str, str]:

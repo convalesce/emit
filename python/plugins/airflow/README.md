@@ -83,6 +83,10 @@ schema, and these names from its `extra` when they are set: `database`,
 which database a table named without one belongs to. Each value passes
 through the same redaction as the rest of the event.
 
+The same is sent for the connection of each database hook a task builds in
+its own code, such as a `PostgresHook` inside a `@task`, and each statement
+that hook ran carries the connection's id as `conn_id`.
+
 ## Configure
 
 `CONVALESCE_INGEST_KEY`, `CONVALESCE_ENDPOINT`, `CONVALESCE_DRY_RUN` and the
