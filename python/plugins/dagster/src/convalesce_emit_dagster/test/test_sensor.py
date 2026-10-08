@@ -1038,6 +1038,59 @@ class Test_internal_tags1(unittest.TestCase):
             ],
         )
 
+    def test_who_launched_it_and_which_agent_ran_it_stay_behind(self) -> None:
+        """
+        Test that the launching user's login, the agent and its process do
+        not cross, nor the agent's environment repeated in the run's origin.
+        """
+        context = _Context(
+            run={
+                "job_name": "nightly",
+                "run_id": "abc",
+                "tags": {
+                    "user": "someone@example.com",
+                    "process/pid": "4242",
+                    "dagster/agent_id": "agent-1",
+                    "dagster/agent_label": "team-agent",
+                    "dagster/code_location": "my_location",
+                },
+                "job_code_origin": {
+                    "repository_origin": {
+                        "container_context": {
+                            "env_vars": [
+                                "WAREHOUSE_PASSWORD=hunter2",
+                                "REGION=eu",
+                            ],
+                            "k8s": {"namespace": "data"},
+                        }
+                    }
+                },
+            }
+        )
+        recorder = _Recorder()
+        cedsens.convalesce_sensor(context, emitter=recorder)
+        sent = recorder.sent[0]
+        run = sent["payload"]["dagster_run"]
+        self.assertEqual(run["tags"], {"dagster/code_location": "my_location"})
+        context_sent = run["job_code_origin"]["repository_origin"][
+            "container_context"
+        ]
+        self.assertEqual(context_sent, {"k8s": {"namespace": "data"}})
+        text = repr(sent["payload"])
+        for kept_back in ("someone@example.com", "hunter2", "agent-1", "4242"):
+            self.assertNotIn(kept_back, text)
+        reasons = {entry["path"]: entry["reason"] for entry in sent["excluded"]}
+        self.assertEqual(
+            reasons["dagster_run.tags.user"], "internal tag not sent"
+        )
+        self.assertEqual(
+            reasons[
+                "dagster_run.job_code_origin.repository_origin"
+                ".container_context.env_vars"
+            ],
+            "environment not sent",
+        )
+
     def test2(self) -> None:
         """
         Test that a run without tags crosses with nothing declared left out.

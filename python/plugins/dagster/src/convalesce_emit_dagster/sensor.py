@@ -196,6 +196,15 @@ _INTERNAL_TAG_PREFIX = ".dagster/"
 INTERNAL_TAGS_ALLOWED = frozenset(
     {".dagster/scheduled_execution_time", ".dagster/repository"}
 )
+# Tags Dagster+ adds that name a person or a machine: the login of whoever
+# launched the run (an email address), the agent that took it and its process.
+PERSONAL_TAGS = frozenset(
+    {"user", "process/pid", "dagster/agent_id", "dagster/agent_label"}
+)
+# Where a run's origin repeats the agent's own environment, variable by
+# variable: anything set there, a customer's secrets included.
+_CONTAINER_CONTEXT = "container_context"
+_ENV_VARS = "env_vars"
 
 
 def emit_dagster_event(
@@ -314,6 +323,7 @@ def _sensor(
     if not cedsteps.arguments_enabled():
         excluded = excluded + _without_run_config(body)
     excluded = excluded + _without_internal_tags(body)
+    excluded = excluded + _without_agent_environment(body, "")
     for name in _EVENT_CARRIERS:
         if isinstance(body, dict) and name in body:
             events, withheld = redact_metadata(body[name], name)
@@ -363,8 +373,13 @@ def _without_internal_tags(body: Any) -> List[Dict[str, str]]:
         name
         for name in tags
         if isinstance(name, str)
-        and name.startswith(_INTERNAL_TAG_PREFIX)
-        and name not in INTERNAL_TAGS_ALLOWED
+        and (
+            name in PERSONAL_TAGS
+            or (
+                name.startswith(_INTERNAL_TAG_PREFIX)
+                and name not in INTERNAL_TAGS_ALLOWED
+            )
+        )
     )
     for name in internal:
         del tags[name]
@@ -372,6 +387,35 @@ def _without_internal_tags(body: Any) -> List[Dict[str, str]]:
         {"path": f"dagster_run.tags.{name}", "reason": "internal tag not sent"}
         for name in internal
     ]
+
+
+def _without_agent_environment(value: Any, path: str) -> List[Dict[str, str]]:
+    """
+    Take the agent's environment out of wherever a run's origin repeats it.
+
+    :param value: any part of the dumped payload, changed in place
+    :param path: where `value` sits, for the record of what was left out
+    :return: what was left out, by path and reason
+    """
+    out: List[Dict[str, str]] = []
+    if isinstance(value, dict):
+        context = value.get(_CONTAINER_CONTEXT)
+        if isinstance(context, dict) and _ENV_VARS in context:
+            del context[_ENV_VARS]
+            out.append(
+                {
+                    "path": f"{path}.{_CONTAINER_CONTEXT}.{_ENV_VARS}".lstrip(
+                        "."
+                    ),
+                    "reason": "environment not sent",
+                }
+            )
+        for key, child in value.items():
+            out += _without_agent_environment(child, f"{path}.{key}".lstrip("."))
+    elif isinstance(value, list):
+        for child in value:
+            out += _without_agent_environment(child, f"{path}[]")
+    return out
 
 
 def redact_metadata(value: Any, path: str) -> Tuple[Any, List[Dict[str, str]]]:

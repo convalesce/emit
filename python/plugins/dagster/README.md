@@ -103,7 +103,9 @@ they are.
 
 A run's tags are sent, yours and Dagster's `dagster/` ones. Of the
 `.dagster/` tags Dagster keeps for itself, the scheduled execution time and
-the repository are sent.
+the repository are sent. The login of whoever launched the run, the agent's
+id and label, the process id, and the agent's environment variables stay
+where they are.
 
 ## Declare what an op reads and writes
 
