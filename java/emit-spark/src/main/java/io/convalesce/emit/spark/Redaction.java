@@ -3,6 +3,7 @@ package io.convalesce.emit.spark;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -17,6 +18,12 @@ import java.util.regex.Pattern;
  * itself matches {@code spark.redaction.regex}, so a JDBC URL with a password in it goes too. It is
  * applied only inside the maps that hold configuration, where Spark applies it, and not to a job's
  * description or a stage's name, which can say "token" without holding one.
+ *
+ * <p>Two things go further than Spark's rule, because a job's own rule knows nothing of them. A
+ * setting named for Convalesce's ingest key ({@code spark.yarn.appMasterEnv.CONVALESCE_INGEST_KEY})
+ * is a secret whatever the job's {@code spark.redaction.regex} says. And a value that is itself a
+ * list of {@code NAME=value} entries, as the parameter AWS Glue hands a job its environment in, has
+ * the value of each secret-named entry masked and the rest kept.
  */
 final class Redaction {
 
@@ -27,6 +34,20 @@ final class Redaction {
   static final String REPLACEMENT = "*********(redacted)";
 
   static final String REGEX_KEY = "spark.redaction.regex";
+
+  /** The names Convalesce's own key is set under, secret under any rule a job configures. */
+  static final String OWN_KEYS_REGEX = "(?i)ingest[._]?key";
+
+  /** What replaces the value of one secret-named entry inside a value that lists several. */
+  static final String ENTRY_MASK = "***";
+
+  private static final Pattern OWN_KEYS = Pattern.compile(OWN_KEYS_REGEX);
+
+  // One `NAME=value` entry inside a value: a name that starts where another could not be running
+  // on, and a value that runs to the next separator. The value is matched as it is written in the
+  // JSON, so it also ends at a backslash or a quote, where an escape starts.
+  private static final Pattern ENTRY =
+      Pattern.compile("(?<![A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_.-]*)=([^,;&\\s\\\\\"]+)");
 
   // The event fields whose value is a configuration map: a job's and a stage's properties, a SQL
   // execution's changed settings, and an environment update's sections.
@@ -200,9 +221,12 @@ final class Redaction {
       }
       String value = json.substring(valueStart, valueEnd);
       out.append(key).append(':');
-      if (pattern.matcher(unquote(key)).find()
-          || (text && pattern.matcher(unquote(value)).find())) {
+      String entries = null;
+      if (secretName(unquote(key)) || (text && pattern.matcher(unquote(value)).find())) {
         out.append('"').append(REPLACEMENT).append('"');
+        changed[0] = true;
+      } else if (text && (entries = maskEntries(value)) != null) {
+        out.append(entries);
         changed[0] = true;
       } else if (!text && value.charAt(0) == '{') {
         // A map inside the map is configuration too, and is held to the same rule.
@@ -228,6 +252,35 @@ final class Redaction {
       i = skipSpace(json, i + 1);
     }
     return -1;
+  }
+
+  /** Whether a setting's or an entry's name says it holds a credential. */
+  private boolean secretName(String name) {
+    return pattern.matcher(name).find() || OWN_KEYS.matcher(name).find();
+  }
+
+  /**
+   * Masks the secret-named entries of a value that lists {@code NAME=value} entries.
+   *
+   * @param value a JSON string, quotes included
+   * @return the string with those entries' values masked, or null when it has none
+   */
+  private String maskEntries(String value) {
+    if (value.indexOf('=') < 0) {
+      return null;
+    }
+    Matcher entry = ENTRY.matcher(value);
+    StringBuffer out = null;
+    while (entry.find()) {
+      if (!secretName(entry.group(1))) {
+        continue;
+      }
+      if (out == null) {
+        out = new StringBuffer(value.length());
+      }
+      entry.appendReplacement(out, Matcher.quoteReplacement(entry.group(1) + "=" + ENTRY_MASK));
+    }
+    return out == null ? null : entry.appendTail(out).toString();
   }
 
   /** The index just past the JSON string starting at {@code start}, or -1 if none starts there. */

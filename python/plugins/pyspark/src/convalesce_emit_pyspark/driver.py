@@ -76,6 +76,12 @@ _MAX_FRAMES = 64
 # How many imports are watched for the script before giving up.
 _MAX_LOOKS = 2000
 _YARN_CONTAINER = re.compile(r"^container_(?:e\d+_)?(\d+)_(\d+)_(\d+)_\d+$")
+# What a notebook kernel's own launcher file is called, by its file name.
+_KERNEL_LAUNCHER = re.compile(
+    r"ipykernel|ipython[-_.\d]*$|ipython.*launcher|kernel[-_]?launcher",
+    re.IGNORECASE,
+)
+_KERNEL_PACKAGES = frozenset({"ipykernel", "ipython"})
 # What Databricks says of the job run a driver is for and of where it runs,
 # by the field each is sent as. A job run's id is a Spark job's local
 # property on a classic cluster; the rest is the cluster's configuration.
@@ -95,6 +101,11 @@ _Context = Tuple[Optional[str], Optional[str]]
 _INSTALLED: Optional["_Hook"] = None
 # The script that called `install()` as the main program, when not `__main__`'s file.
 _CALLER_SCRIPT: Optional[str] = None
+# The file the process itself was started with, read once as the hooks go in.
+# A launcher that runs the job's script as `__main__` (AWS Glue's) swaps
+# `sys.modules["__main__"]` and `sys.argv[0]` for the script's while it runs,
+# so neither says which file is the launcher's by the time it is asked.
+_MAIN_FILE: Optional[str] = None
 _INSTALL_LOCK = threading.Lock()
 
 
@@ -115,14 +126,14 @@ def install(emitter: Optional[cemit.EmitterLike] = None) -> bool:
         when a failure is reported, when not given
     :return: whether the hooks are in place
     """
-    global _INSTALLED, _CALLER_SCRIPT
+    global _INSTALLED, _CALLER_SCRIPT, _MAIN_FILE
     try:
         with _INSTALL_LOCK:
             if _INSTALLED is not None:
                 return True
-            _CALLER_SCRIPT = _caller_script(
-                sys._getframe(1)  # pylint: disable=protected-access
-            )
+            caller = sys._getframe(1)  # pylint: disable=protected-access
+            _MAIN_FILE = _main_file(caller)
+            _CALLER_SCRIPT = _caller_script(caller)
             config = None
             if emitter is None:
                 config = _config()
@@ -143,12 +154,13 @@ def uninstall() -> None:
 
     :return: nothing
     """
-    global _INSTALLED, _CALLER_SCRIPT
+    global _INSTALLED, _CALLER_SCRIPT, _MAIN_FILE
     with _INSTALL_LOCK:
         if _INSTALLED is not None:
             _INSTALLED.detach()
             _INSTALLED = None
         _CALLER_SCRIPT = None
+        _MAIN_FILE = None
 
 
 def _config() -> Optional[cemit.Config]:
@@ -191,6 +203,9 @@ class _Hook:
         self._script_sent = False
         # The application a stopped context was, read as it stopped.
         self._stopped: _Context = (None, None)
+        # Whether this process had a Spark context at any point: its JVM's
+        # listener then reports the application, and this never does.
+        self._had_context = False
         # What Databricks said of the run, kept from when it could be read.
         self._databricks: Dict[str, str] = {}
         self._context_class: Any = None
@@ -292,6 +307,7 @@ class _Hook:
         :param context: the SparkContext about to stop
         :return: nothing
         """
+        self._had_context = True
         try:
             app_id = _read(lambda: context.applicationId)
             if app_id is not None:
@@ -310,10 +326,38 @@ class _Hook:
             return _connect_session()
         live = _spark_context()
         if live[0] is not None:
+            self._had_context = True
             return live
         if self._stopped[0] is not None:
             return self._stopped
-        return _yarn_application(), None
+        application = _yarn_application()
+        if application is None or not self.owns_yarn(application):
+            return application, None
+        # What `spark-submit` itself names an application nobody named.
+        path = _script_path()
+        return application, os.path.basename(path) if path else None
+
+    def owns_yarn(self, app_id: str) -> bool:
+        """
+        Whether a YARN application is this helper's to report from start to
+        end.
+
+        A cluster-mode driver that ends before it starts a Spark session
+        has an application, which YARN made, and no listener: the JVM beside
+        it never built a Spark context. Nothing else will say the
+        application started, and a receiver holds what is said of a run it
+        was never told of.
+
+        :param app_id: the application about to be reported
+        :return: it is the YARN container's own, and this process never had
+            a Spark context
+        """
+        return (
+            app_id == _yarn_application()
+            and not self._had_context
+            and self._stopped[0] is None
+            and not _context_made()
+        )
 
     def databricks(self) -> Dict[str, str]:
         """
@@ -374,8 +418,9 @@ class _Hook:
 
         A shell that runs a script file runs it as its one cell, so the
         script and the run's end are sent as that cell ends. In a notebook
-        there is no file and no last cell to wait for: only a failure is
-        reported, with the run it ends.
+        there is no file and no last cell to wait for: a cell that passes
+        says nothing and ends nothing, and only a failure is reported, with
+        the run it ends.
 
         :param result: IPython's `ExecutionResult` for the cell
         :return: nothing
@@ -396,18 +441,21 @@ class _Hook:
 
     def open(self, context: _Context) -> None:
         """
-        Say a Spark Connect session's run started, once.
+        Say a run no listener reports has started, once.
 
         With Spark Connect the driver's Python has no JVM beside it, and a
         serverless platform takes no listener, so nothing else reports the
-        application. This sends Spark's own start event, as the listener
-        would have, before the first thing said of the run.
+        application. The same holds for a YARN driver that never started a
+        Spark session (`owns_yarn`). This sends Spark's own start event, as
+        the listener would have, before the first thing said of the run.
 
         :param context: the application's id and name
         :return: nothing
         """
         app_id, app_name = context
-        if app_id is None or not _over_connect() or not _is_driver():
+        if app_id is None or not _is_driver():
+            return
+        if not _over_connect() and not self.owns_yarn(app_id):
             return
         with self._lock:
             if self._opened:
@@ -574,13 +622,16 @@ class _Hook:
 
         Only for a driver whose application is known: the script and its
         arguments describe a run, and without the application there is no
-        run to describe.
+        run to describe. A notebook has no script, and its kernel's
+        arguments are not the job's, so there nothing is sent.
 
         :param context: the application's id and name, where known
         :return: nothing
         """
         app_id, app_name = context
         if app_id is None or not _is_driver():
+            return
+        if _in_shell() and _script_path() is None:
             return
         with self._lock:
             if self._script_sent:
@@ -739,6 +790,23 @@ def _spark_context() -> _Context:
     )
 
 
+def _context_made() -> bool:
+    """
+    Whether this process has, or began to build, a Spark context.
+
+    PySpark keeps the gateway to its JVM once a context was asked for, even
+    after the context stops, so a process that only imported PySpark shows
+    neither.
+
+    :return: a context is active, or a gateway to a JVM was opened
+    """
+    context_class = getattr(sys.modules.get(_PYSPARK), "SparkContext", None)
+    return (
+        getattr(context_class, "_active_spark_context", None) is not None
+        or getattr(context_class, "_gateway", None) is not None
+    )
+
+
 def _yarn_application() -> Optional[str]:
     """
     The YARN application this driver is, read from its container's name.
@@ -852,8 +920,10 @@ def _connect_session() -> _Context:
     A Spark Connect session as the application it stands for.
 
     The session's id is the only identity the client holds. Its name is the
-    script's file name, which says what ran, else the session's
-    `spark.app.name` where the server says one.
+    script's file name, which says what ran. A notebook has no script: it
+    is named by the last part of its path where Databricks says it, else
+    by the session's `spark.app.name` where the server says one. It is
+    never named after the kernel's own launcher.
 
     :return: the session's id and a name, or None for both
     """
@@ -864,7 +934,10 @@ def _connect_session() -> _Context:
     if session_id is None:
         return None, None
     path = _script_path()
-    name = os.path.splitext(os.path.basename(path))[0] if path else None
+    if path:
+        return session_id, os.path.splitext(os.path.basename(path))[0]
+    notebook = _setting(session, None, _DATABRICKS["notebook_path"]) or ""
+    name = notebook.rstrip("/").rsplit("/", 1)[-1]
     return session_id, name or _read(lambda: session.conf.get("spark.app.name"))
 
 
@@ -927,6 +1000,79 @@ def _arguments_enabled() -> bool:
     return (cepysenv.read(_ARGUMENTS_ENV) or "").strip().lower() not in _FALSY
 
 
+def _frame_file(frame: Any) -> Optional[str]:
+    """
+    The file whose code a frame runs as the main program.
+
+    :param frame: a frame of the running interpreter
+    :return: its file, or None when it does not run as `__main__` or runs
+        no file that exists
+    """
+    scope = getattr(frame, "f_globals", None) or {}
+    if scope.get("__name__") != "__main__":
+        return None
+    path = scope.get("__file__") or getattr(frame.f_code, "co_filename", None)
+    if not path or not os.path.isfile(str(path)):
+        return None
+    return os.path.abspath(str(path))
+
+
+def _main_file(frame: Any) -> Optional[str]:
+    """
+    The file this process was started with, asked as the hooks go in.
+
+    The outermost code running as `__main__` is the process's own: a
+    launcher (AWS Glue's `runscript.py`) is below the script it runs, and
+    while that script runs `sys.modules["__main__"]` is the script's. When
+    the `.pth` hooks the interpreter nothing runs as `__main__` yet, and
+    `__main__` and `sys.argv[0]` still say what the process was started
+    with. Inside an IPython shell the stack and `sys.argv` are the
+    platform's to arrange, so only `__main__` is asked.
+
+    :param frame: where `install()` was called from
+    :return: that file, or None when the process was started with none
+    """
+    found: Optional[str] = None
+    shell = _in_shell()
+    while frame is not None and not shell:
+        found = _frame_file(frame) or found
+        frame = frame.f_back
+    if found is not None:
+        return found
+    path = getattr(sys.modules.get("__main__"), "__file__", None)
+    if not path and not shell:
+        path = sys.argv[0] if sys.argv else None
+    if not path or not os.path.isfile(str(path)):
+        return None
+    return os.path.abspath(str(path))
+
+
+def _in_shell() -> bool:
+    """
+    Whether an IPython shell runs this driver's code, importing nothing.
+
+    :return: IPython is imported and has a shell
+    """
+    try:
+        module = sys.modules.get(_IPYTHON)
+        return module is not None and module.get_ipython() is not None
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+
+
+def _kernel_launcher(path: str) -> bool:
+    """
+    Whether a file is a notebook kernel's own launcher, by what it is called.
+
+    :param path: a file
+    :return: it is named as IPython's and ipykernel's launchers are
+        (Databricks' is `db_ipykernel_launcher.py`), or is in their package
+    """
+    folder = os.path.basename(os.path.dirname(path)).lower()
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return folder in _KERNEL_PACKAGES or bool(_KERNEL_LAUNCHER.search(stem))
+
+
 def _caller_script(frame: Any) -> Optional[str]:
     """
     The script that called `install()`, when a launcher runs it as the main
@@ -939,24 +1085,23 @@ def _caller_script(frame: Any) -> Optional[str]:
     :param frame: the frame `install()` was called from
     :return: that file, or None when the caller is not such a script
     """
-    scope = getattr(frame, "f_globals", None) or {}
-    if scope.get("__name__") != "__main__":
+    path = _frame_file(frame)
+    if path is None or path == _MAIN_FILE or _kernel_launcher(path):
         return None
-    path = scope.get("__file__") or getattr(frame.f_code, "co_filename", None)
-    if not path or not os.path.isfile(str(path)):
-        return None
-    return os.path.abspath(str(path))
+    return path
 
 
 def _note_script(frame: Any, depth: int = _MAX_FRAMES) -> None:
     """
-    Learn the script from whoever is importing PySpark, when a launcher
+    Learn the script from whoever is importing something, when a launcher
     runs it as the main program and nothing called `install()`.
 
     The `.pth` hooks the interpreter before any script runs, so there is no
-    caller to ask. The first code to import PySpark under the name
-    `__main__`, from a file that is not the process's own main file, is the
-    job's script.
+    caller to ask. The innermost code running under the name `__main__`,
+    from a file that is not the one the process was started with, is the
+    job's script. The file is compared with what was remembered as the
+    hooks went in (`_MAIN_FILE`): while a launcher's script runs,
+    `sys.modules["__main__"]` is the script's own module.
 
     :param frame: where to start looking, innermost first
     :param depth: how many frames outward to look
@@ -965,11 +1110,10 @@ def _note_script(frame: Any, depth: int = _MAX_FRAMES) -> None:
     global _CALLER_SCRIPT
     if _CALLER_SCRIPT is not None:
         return
-    main = getattr(sys.modules.get("__main__"), "__file__", None)
     seen = 0
     while frame is not None and seen < depth:
         found = _caller_script(frame)
-        if found is not None and found != os.path.abspath(str(main or "")):
+        if found is not None:
             _CALLER_SCRIPT = found
             return
         frame, seen = frame.f_back, seen + 1
@@ -982,11 +1126,18 @@ def _note_script_of(exc: Optional[BaseException]) -> None:
     :param exc: the exception being handled as the launcher exits
     :return: nothing
     """
+    global _CALLER_SCRIPT
+    if _CALLER_SCRIPT is not None:
+        return
     tb = getattr(exc, "__traceback__", None)
+    found: Optional[str] = None
     seen = 0
-    while tb is not None and _CALLER_SCRIPT is None and seen < _MAX_FRAMES:
-        _note_script(tb.tb_frame, depth=1)
+    while tb is not None and seen < _MAX_FRAMES:
+        # A traceback runs outermost first, and the script is the innermost
+        # code that runs as `__main__`.
+        found = _caller_script(tb.tb_frame) or found
         tb, seen = tb.tb_next, seen + 1
+    _CALLER_SCRIPT = found
 
 
 def _script_path() -> Optional[str]:
@@ -995,12 +1146,21 @@ def _script_path() -> Optional[str]:
 
     A driver started as `python -m package` is a launcher, such as a
     notebook kernel, and its file is not the job. A script that a launcher
-    ran as the main program, and that called `install()`, is.
+    ran as the main program is. Inside an IPython shell the kernel's own
+    launcher is never the job: there is a script only where the platform
+    put one in `sys.argv[0]`, as Databricks does for a Python file task,
+    and a notebook has none.
 
     :return: the script's path, or None when there is no such file
     """
     if _CALLER_SCRIPT is not None:
         return _CALLER_SCRIPT
+    if _in_shell():
+        path = sys.argv[0] if sys.argv else None
+        if not path or not os.path.isfile(str(path)):
+            return None
+        path = os.path.abspath(str(path))
+        return None if path == _MAIN_FILE or _kernel_launcher(path) else path
     main = sys.modules.get("__main__")
     if getattr(main, "__spec__", None) is not None:
         return None

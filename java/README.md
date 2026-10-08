@@ -32,7 +32,10 @@ Configure it with the same environment variables the Python client uses:
 `CONVALESCE_MAX_BODY_BYTES`, `CONVALESCE_SPOOL_DIR`,
 `CONVALESCE_SPOOL_MAX_BYTES`. `CONVALESCE_FLUSH_INTERVAL` (seconds, default
 `5`) sends a part batch in the background, and the JVM's shutdown sends what
-is left.
+is left. With `CONVALESCE_DRY_RUN=true` each observation is logged as one
+`convalesce dry-run: {...}` line; what is flushed as the JVM shuts down,
+such as the application's end for a driver that failed with its session
+still open, is written straight to stderr, in the same form.
 
 AWS Glue hands a job only the variables whose names start with `CUSTOMER_`,
 so every setting here is also read with that in front. Give them in the job
@@ -126,6 +129,19 @@ A job start carries the job's whole Spark configuration, and OpenLineage copies 
 in `spark.openlineage.capturedProperties`. Both are redacted before anything leaves the driver, by
 Spark's own rule: a value is replaced with `*********(redacted)` when its key or the value itself
 matches `spark.redaction.regex`.
+
+Convalesce's own key is held to more than that rule:
+
+- A setting whose name holds `ingest_key`, `ingest.key` or `ingestkey`, in any case, is redacted
+  whatever `spark.redaction.regex` is set to. That covers
+  `spark.yarn.appMasterEnv.CONVALESCE_INGEST_KEY` and `spark.executorEnv.CONVALESCE_INGEST_KEY`.
+- A value that lists `NAME=value` entries has the value of each entry with such a name, or a name
+  the rule matches, replaced with `***` and the rest kept. On AWS Glue
+  `spark.glue.customer-driver-env-vars` is sent as
+  `CUSTOMER_CONVALESCE_ENDPOINT=...,CUSTOMER_CONVALESCE_INGEST_KEY=***`.
+- The key's exact value is masked (`***`) anywhere else in an observation, and that observation's
+  `excluded` says `{"path": "$", "reason": "ingest key masked"}`. The key travels in the
+  `Authorization` header only. A key under 8 characters is too short to look for.
 
 ## Why it is small
 

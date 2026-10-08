@@ -22,10 +22,14 @@ public final class Observation {
    *
    * <p>Version 2 adds {@code excluded}, naming anything left out of the payload by path and reason.
    * This client's payload is already the tool's own JSON (Spark's {@code JsonProtocol}), not walked
-   * by anything of ours, so it always sends an empty list here -- there is nothing of ours to
-   * declare an exclusion about. Collect keeps reading version 1 unchanged.
+   * by anything of ours, so it sends an empty list here -- there is nothing of ours to declare an
+   * exclusion about -- except when the emitter masked its own ingest key in the payload, which is
+   * declared. Collect keeps reading version 1 unchanged.
    */
   public static final int ENVELOPE_VERSION = 2;
+
+  // The same path and reason the Python client declares.
+  private static final String KEY_MASKED = "[{\"path\":\"$\",\"reason\":\"ingest key masked\"}]";
 
   private final String tool;
   private final String event;
@@ -33,6 +37,7 @@ public final class Observation {
   private final String toolVersion;
   private final String observationId;
   private final String emittedAt;
+  private final boolean keyMasked;
 
   /**
    * Wraps a tool's payload for transport.
@@ -43,6 +48,17 @@ public final class Observation {
    * @param toolVersion the tool's version, where it could be read
    */
   public Observation(String tool, String event, String payloadJson, String toolVersion) {
+    this(tool, event, payloadJson, toolVersion, false);
+  }
+
+  /**
+   * Wraps a payload the emitter has looked through for its own ingest key.
+   *
+   * @param keyMasked whether the key was found in the payload and masked there
+   */
+  Observation(
+      String tool, String event, String payloadJson, String toolVersion, boolean keyMasked) {
+    this.keyMasked = keyMasked;
     this.tool = tool;
     this.event = event;
     this.payloadJson = payloadJson;
@@ -65,7 +81,7 @@ public final class Observation {
     out.append(",\"tool_version\":").append(Json.quote(toolVersion));
     out.append(",\"event\":").append(Json.quote(event));
     out.append(",\"client_version\":").append(Json.quote(Version.VERSION));
-    out.append(",\"excluded\":[]");
+    out.append(",\"excluded\":").append(keyMasked ? KEY_MASKED : "[]");
     // Verbatim: this is the tool's own JSON, and re-encoding it would be the one thing this
     // package exists not to do.
     out.append(",\"payload\":").append(payloadJson == null ? "null" : payloadJson);

@@ -105,7 +105,39 @@ Limits:
 - a `sys.exit(n)` whose `SystemExit` the driver catches and swallows is
   still reported
 - `source` is the script the driver was started with (`spark-submit job.py`),
-  not the modules it imports
+  not the modules it imports. Where a platform's launcher runs the script
+  (AWS Glue's `runscript.py`), `source` is the script and never the launcher
+
+### Notebooks
+
+A notebook reports a failure. The cell that raises sends `driver_failure`,
+and on Spark Connect (Databricks serverless) the run's start before it and
+its end after it. A notebook has no script, so it sends no `driver_script`,
+and a cell that passes sends nothing and ends nothing: a notebook that
+never fails sends nothing.
+
+On Spark Connect the run is named by the last part of the notebook's path
+where the session says it, else by the session's `spark.app.name`. A Python
+file task is named by its script, and sends `driver_script` as it always
+did.
+
+### A driver with no Spark session
+
+A cluster-mode driver on YARN can fail before it starts a Spark session.
+YARN has made the application and no listener is running to report it, so
+the hook reports the whole run: `SparkListenerApplicationStart` (named by
+the script's file name, timed from when the hook went in), `driver_failure`,
+`driver_script`, then `SparkListenerApplicationEnd`, each with `attempt`.
+Once a driver has asked for a Spark context the listener reports the
+application and the hook sends only its own two observations.
+
+### The ingest key
+
+The key is sent in the `Authorization` header only. Its value is masked
+(`***`) anywhere else it turns up, such as a script with the key written
+into it, and the observation's `excluded` says so
+(`{"path": "$", "reason": "ingest key masked"}`). A key under 8 characters
+is too short to look for.
 
 ## Supported
 
@@ -120,6 +152,6 @@ On AWS Glue, give every setting with `CUSTOMER_` in front, in the job
 parameter `--customer-driver-env-vars`:
 `CUSTOMER_CONVALESCE_INGEST_KEY=...,CUSTOMER_CONVALESCE_PYSPARK_DRIVER_HOOK=true`.
 Glue installs `--additional-python-modules` where Python runs the `.pth`
-file, so that last one turns the hook on with no code change. Call
-`install()` from the job's script instead to have `driver_script` carry
-that script.
+file, so that last one turns the hook on with no code change.
+`driver_script` carries the job's script either way, whether the variable
+or a call to `install()` turned the hook on.

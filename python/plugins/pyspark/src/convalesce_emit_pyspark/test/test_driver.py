@@ -320,7 +320,8 @@ class Test_context1(_HookTestCase):
             mock.patch.dict(os.environ, {"CONTAINER_ID": container}),
         ):
             self.fail_main(RuntimeError("no session yet"))
-        payload = self.recorder.sent[0]["payload"]
+        payload = self.recorder.sent[-1]["payload"]
+        self.assertEqual(self.recorder.sent[-1]["event"], "driver_failure")
         self.assertEqual(
             payload["application_id"], "application_1791409434978_0014"
         )
@@ -378,6 +379,76 @@ class Test_context1(_HookTestCase):
             self.install()
             self.fail_main(ValueError("x"))
         self.assertEqual(self.recorder.sent, [])
+
+    def test_a_yarn_driver_with_no_session_is_a_run_this_opens_and_closes(
+        self,
+    ) -> None:
+        """A yarn driver with no session is a run this opens and closes."""
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        script = os.path.join(folder, "nightly.py")
+        pathlib.Path(script).write_text("import pyspark\n", encoding="utf-8")
+        main = types.ModuleType("__main__")
+        setattr(main, "__file__", script)
+        container = "container_1791409434978_0014_02_000001"
+        with (
+            mock.patch.dict(sys.modules, {"pyspark": _pyspark(None)}),
+            mock.patch.dict(sys.modules, {"__main__": main}),
+            mock.patch.object(sys, "argv", [script]),
+            mock.patch.dict(os.environ, {"CONTAINER_ID": container}),
+        ):
+            self.install()
+            hook = cepysdri._INSTALLED  # pylint: disable=protected-access
+            assert hook is not None
+            self.fail_main(RuntimeError("no session yet"))
+            hook.at_exit()
+            hook.at_exit()
+        self.assertEqual(
+            [sent["event"] for sent in self.recorder.sent],
+            [
+                "SparkListenerApplicationStart",
+                "driver_failure",
+                "driver_script",
+                "SparkListenerApplicationEnd",
+            ],
+        )
+        start, failure, described, end = (
+            sent["payload"] for sent in self.recorder.sent
+        )
+        application = "application_1791409434978_0014"
+        self.assertEqual(start["App ID"], application)
+        self.assertEqual(start["App Name"], "nightly.py")
+        self.assertEqual(start["attempt"], 2)
+        self.assertLessEqual(start["Timestamp"], end["Timestamp"])
+        self.assertEqual(failure["application_id"], application)
+        self.assertEqual(failure["application_name"], "nightly.py")
+        self.assertEqual(described["source"]["file"], script)
+        self.assertEqual(end["App ID"], application)
+
+    def test_a_yarn_driver_that_had_a_context_is_the_listeners(self) -> None:
+        """A yarn driver that had a context is the listener's."""
+        container = "container_1791409434978_0014_01_000001"
+        gone = _pyspark(None)
+        # PySpark keeps its gateway to the JVM after the context has gone.
+        setattr(getattr(gone, "SparkContext"), "_gateway", object())
+        for module in (_pyspark(_Context()), gone):
+            with self.subTest(context=module is not gone):
+                self.recorder.sent.clear()
+                cepysdri.uninstall()
+                with (
+                    mock.patch.dict(sys.modules, {"pyspark": module}),
+                    mock.patch.dict(os.environ, {"CONTAINER_ID": container}),
+                ):
+                    self.install()
+                    self.fail_main(RuntimeError("after the session"))
+                    # pylint: disable-next=protected-access
+                    hook = cepysdri._INSTALLED
+                    assert hook is not None
+                    hook.at_exit()
+                events = [sent["event"] for sent in self.recorder.sent]
+                self.assertNotIn("SparkListenerApplicationStart", events)
+                self.assertNotIn("SparkListenerApplicationEnd", events)
+                self.assertIn("driver_failure", events)
 
     def test_credentials_in_argv_are_masked(self) -> None:
         """Credentials in argv are masked."""
@@ -645,6 +716,99 @@ class Test_script1(_HookTestCase):
             events["driver_failure"]["error_detail"]["type"],
             "builtins.LookupError",
         )
+
+    def install_at_start(self) -> None:
+        """
+        Install as the `.pth` does, before anything runs as `__main__`.
+
+        A new thread's stack has no main program on it, as the interpreter's
+        has not while it is still starting.
+        """
+        thread = threading.Thread(target=self.install)
+        thread.start()
+        thread.join()
+
+    def launch(self, body: str) -> str:
+        """
+        Run this test's script the way AWS Glue's launcher runs a job.
+
+        :param body: what the script does, after one import of its own
+        :return: the launcher's file, which is the process's `__main__`
+        """
+        launcher = os.path.join(os.path.dirname(self.script), "runscript.py")
+        pathlib.Path(launcher).write_text(
+            "import runpy\n"
+            "import sys\n"
+            "try:\n"
+            f"    runpy.run_path({self.script!r}, run_name='__main__')\n"
+            "except Exception:\n"
+            "    sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        pathlib.Path(self.script).write_text(
+            "import sys\n"
+            "sys.modules.pop('colorsys', None)\n"
+            "import colorsys\n" + body,
+            encoding="utf-8",
+        )
+        main = sys.modules["__main__"]
+        setattr(main, "__file__", launcher)
+        with mock.patch.object(sys, "argv", [launcher]):
+            self.install_at_start()
+            code = compile(
+                pathlib.Path(launcher).read_text(encoding="utf-8"),
+                launcher,
+                "exec",
+            )
+            exec(code, main.__dict__)  # pylint: disable=exec-used
+        return launcher
+
+    def test_a_script_run_with_runpy_is_the_source_not_its_launcher(
+        self,
+    ) -> None:
+        """A script run with runpy is the source, not its launcher."""
+        launcher = self.launch("answer = 42\n")
+        main_file = cepysdri._MAIN_FILE  # pylint: disable=protected-access
+        self.assertEqual(main_file, launcher)
+        self.at_exit()
+        source = self.recorder.sent[0]["payload"]["source"]
+        self.assertEqual(source["file"], self.script)
+        self.assertIn("answer = 42", source["text"])
+
+    def test_a_script_run_with_runpy_that_fails_is_the_source(self) -> None:
+        """A script run with runpy that fails is the source."""
+        with self.assertRaises(SystemExit):
+            self.launch("raise LookupError('no table')\n")
+        self.at_exit()
+        events = {sent["event"]: sent["payload"] for sent in self.recorder.sent}
+        self.assertEqual(events["driver_script"]["source"]["file"], self.script)
+        self.assertEqual(
+            events["driver_failure"]["error_detail"]["type"],
+            "builtins.LookupError",
+        )
+
+    def test_the_main_file_is_the_outermost_main_program(self) -> None:
+        """The main file is the outermost main program."""
+        launcher = os.path.join(os.path.dirname(self.script), "runscript.py")
+        pathlib.Path(launcher).write_text("# the launcher\n", encoding="utf-8")
+        code = types.SimpleNamespace(co_filename="<frozen runpy>")
+        outer = types.SimpleNamespace(
+            f_globals={"__name__": "__main__", "__file__": launcher},
+            f_code=code,
+            f_back=None,
+        )
+        between = types.SimpleNamespace(
+            f_globals={"__name__": "runpy"}, f_code=code, f_back=outer
+        )
+        inner = types.SimpleNamespace(
+            f_globals={"__name__": "__main__", "__file__": self.script},
+            f_code=code,
+            f_back=between,
+        )
+        # pylint: disable=protected-access
+        self.assertEqual(cepysdri._main_file(inner), launcher)
+        # With nothing running as the main program, `__main__` says.
+        self.assertEqual(cepysdri._main_file(between.f_back.f_back), self.script)
 
     def test_a_module_that_installs_is_not_taken_for_the_script(self) -> None:
         """A module that installs is not taken for the script."""
@@ -1062,9 +1226,32 @@ class Test_shell1(Test_script1):
         self.shell = _Shell()
         ipython = types.ModuleType("IPython")
         setattr(ipython, "get_ipython", lambda: self.shell)
-        patch = mock.patch.dict(sys.modules, {"IPython": ipython})
+        # As Databricks runs a Python file task: the script is `sys.argv[0]`,
+        # and the `__main__` its shell runs it in names no file.
+        patch = mock.patch.dict(
+            sys.modules,
+            {"IPython": ipython, "__main__": types.ModuleType("__main__")},
+        )
         patch.start()
         self.addCleanup(patch.stop)
+
+    def notebook(self) -> str:
+        """
+        Make this a notebook's kernel: its own launcher, and no script.
+
+        :return: the launcher's file
+        """
+        launcher = os.path.join(
+            os.path.dirname(self.script), "db_ipykernel_launcher.py"
+        )
+        pathlib.Path(launcher).write_text("# the kernel\n", encoding="utf-8")
+        setattr(sys.modules["__main__"], "__file__", launcher)
+        patch = mock.patch.object(
+            sys, "argv", [launcher, "-f", "/kernels/connection.json"]
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+        return launcher
 
     def over_connect(self) -> None:
         """Give the driver a Connect session and no context, as serverless does."""
@@ -1117,6 +1304,113 @@ class Test_shell1(Test_script1):
         self.assertEqual(
             self.recorder.sent[3]["payload"]["App ID"], start["App ID"]
         )
+
+    def test_a_launcher_module_has_no_source(self) -> None:
+        """A kernel started as a module, with no script, sends no script."""
+        main = sys.modules["__main__"]
+        setattr(main, "__spec__", types.SimpleNamespace(name="kernel_launcher"))
+        launcher = os.path.join(
+            os.path.dirname(self.script), "ipykernel_launcher.py"
+        )
+        pathlib.Path(launcher).write_text("# the kernel\n", encoding="utf-8")
+        with mock.patch.object(sys, "argv", [launcher]):
+            self.install()
+            self.at_exit()
+        self.assertEqual(self.recorder.sent, [])
+
+    def test_a_script_that_cannot_be_read_has_no_source(self) -> None:
+        """With no file to name, a shell is a notebook and sends no script."""
+        os.remove(self.script)
+        self.install()
+        self.at_exit()
+        self.assertEqual(self.recorder.sent, [])
+
+    def test_the_main_file_is_the_outermost_main_program(self) -> None:
+        """In a shell only `__main__` says what the process was started with."""
+        frame = types.SimpleNamespace(
+            f_globals={"__name__": "__main__", "__file__": self.script},
+            f_code=types.SimpleNamespace(co_filename=self.script),
+            f_back=None,
+        )
+        # pylint: disable=protected-access
+        # Not the script a platform put in `sys.argv[0]` and runs as a cell.
+        self.assertIsNone(cepysdri._main_file(frame))
+        launcher = self.notebook()
+        self.assertEqual(cepysdri._main_file(frame), launcher)
+
+    def test_a_launcher_of_any_name_is_not_the_script(self) -> None:
+        """A launcher of any name is not the script."""
+        launcher = os.path.join(os.path.dirname(self.script), "start_shell.py")
+        pathlib.Path(launcher).write_text("# a kernel\n", encoding="utf-8")
+        setattr(sys.modules["__main__"], "__file__", launcher)
+        with mock.patch.object(sys, "argv", [launcher]):
+            self.install()
+            self.shell.run()
+            self.at_exit()
+        self.assertEqual(self.recorder.sent, [])
+
+    def test_a_notebook_that_passes_sends_nothing(self) -> None:
+        """A notebook that passes sends nothing."""
+        self.notebook()
+        self.over_connect()
+        self.install()
+        self.shell.run()
+        self.shell.run()
+        self.at_exit()
+        self.assertEqual(self.recorder.sent, [])
+
+    def test_a_notebook_cell_that_raises_is_a_run_with_no_script(self) -> None:
+        """A notebook cell that raises is a run with no script."""
+        self.notebook()
+        self.over_connect()
+        self.install()
+        # The cell that installs passes, and ends nothing.
+        self.shell.run()
+        self.shell.run(_raised(LookupError("table orders is not there")))
+        self.shell.run()
+        self.at_exit()
+        self.assertEqual(
+            [sent["event"] for sent in self.recorder.sent],
+            [
+                "SparkListenerApplicationStart",
+                "driver_failure",
+                "SparkListenerApplicationEnd",
+            ],
+        )
+        start, failure, _ = (sent["payload"] for sent in self.recorder.sent)
+        # Named by the session, never after the kernel's launcher.
+        self.assertEqual(start["App Name"], "Databricks Shell")
+        self.assertEqual(failure["application_name"], "Databricks Shell")
+        self.assertEqual(
+            failure["error_detail"]["message"], "table orders is not there"
+        )
+
+    def test_a_notebook_is_named_by_its_path(self) -> None:
+        """A notebook is named by its path."""
+        self.notebook()
+        self.over_connect()
+        path = {"spark.databricks.notebook.path": "/Repos/etl/orders_nightly"}
+        with mock.patch.dict(_ConnectSession.settings, path):
+            self.install()
+            self.shell.run(_raised(LookupError("table orders is not there")))
+        start, failure, _ = (sent["payload"] for sent in self.recorder.sent)
+        self.assertEqual(start["App Name"], "orders_nightly")
+        self.assertEqual(failure["application_name"], "orders_nightly")
+        self.assertEqual(
+            failure["databricks"]["notebook_path"], "/Repos/etl/orders_nightly"
+        )
+
+    def test_a_notebook_beside_a_listener_reports_its_failure_only(
+        self,
+    ) -> None:
+        """A notebook beside a listener reports its failure only."""
+        self.notebook()
+        self.install()
+        self.shell.run()
+        self.shell.run(_raised(LookupError("table orders is not there")))
+        self.at_exit()
+        events = [sent["event"] for sent in self.recorder.sent]
+        self.assertEqual(events, ["driver_failure"])
 
     def test_a_listener_s_application_is_not_opened_again(self) -> None:
         """A listener s application is not opened again."""
