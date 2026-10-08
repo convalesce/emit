@@ -77,15 +77,15 @@ For whichever comes first:
 
 It carries the application's id and name, the exception (type, message,
 traceback, and its cause), `argv` as above, and the Python and PySpark
-versions.
+versions. A notebook sends no `argv`: its command line is the kernel's.
 
 ### Which run of the platform, on both
 
-- `databricks`, on Databricks: the job run's id, the job's id, the notebook's
-  path, the cluster's id, and the workspace's id and URL, each one the
-  session says. A serverless session says the cluster and not the job run.
-  The job run's id puts a failure on the right job run of a cluster that
-  several job runs share.
+- `databricks`, on Databricks: the job run's id, the task run's id, the
+  job's id and name, the notebook's path, the cluster's id, and the
+  workspace's id and URL, each one that is known. The job run's id puts a
+  failure on the right job run of a cluster that several job runs share.
+  See [What is read on Databricks](#what-is-read-on-databricks).
 - `attempt`, in a YARN container: which try of the application the driver
   is, from 1. YARN runs a failed cluster-mode driver again under the same
   application id, and each try reports.
@@ -112,14 +112,54 @@ Limits:
 
 A notebook reports a failure. The cell that raises sends `driver_failure`,
 and on Spark Connect (Databricks serverless) the run's start before it and
-its end after it. A notebook has no script, so it sends no `driver_script`,
-and a cell that passes sends nothing and ends nothing: a notebook that
-never fails sends nothing.
+its end after it, all three with the same `databricks` object. A notebook
+has no script, so it sends no `driver_script` and no `argv`, and a cell
+that passes sends nothing and ends nothing: a notebook that never fails
+sends nothing.
 
-On Spark Connect the run is named by the last part of the notebook's path
-where the session says it, else by the session's `spark.app.name`. A Python
-file task is named by its script, and sends `driver_script` as it always
-did.
+On Spark Connect the run always has a name. It is the first of these that
+is known:
+
+1. the script's file name, without `.py`, for a Python file task, which
+   sends `driver_script` as it always did
+2. the last part of the notebook's path
+3. the Databricks job's name
+4. the session's `spark.app.name`
+5. `notebook` inside a notebook kernel, `pyspark` anywhere else
+
+### What is read on Databricks
+
+Two places are asked, the first one first:
+
+1. The session's configuration, by setting name: `spark.databricks.job.runId`,
+   `spark.databricks.job.id`, `spark.databricks.notebook.path`,
+   `spark.databricks.clusterUsageTags.clusterId`,
+   `spark.databricks.clusterUsageTags.clusterOwnerOrgId` and
+   `spark.databricks.workspaceUrl`. A classic cluster answers all of them.
+   A serverless session answers for the cluster and the workspace's URL.
+2. The run's context, which the `dbutils` of a notebook or a Python file
+   task hands out. It fills in what the configuration did not say. These
+   attributes are read from it by name:
+
+| Attribute | Sent as |
+| --- | --- |
+| `multitaskParentRunId` | `databricks.job_run_id`, the job run |
+| `currentRunId` | `databricks.task_run_id`, the task's run; also `job_run_id` when the context names no job run |
+| `jobId` | `databricks.job_id` |
+| `jobName` | `databricks.job_name` |
+| `notebook_path` | `databricks.notebook_path`, for a notebook task |
+| `clusterId` | `databricks.cluster_id` |
+| `orgId` | `databricks.workspace_id` |
+| `jobTaskType` | not sent; it says whether the task is a notebook |
+
+Databricks runs a failed task again as a new task run of the same job run,
+so the two tries share `job_run_id` and differ in `task_run_id`.
+
+The context also holds the run's own API token, the API's URL and the user
+it runs as. The hook takes the attributes in the table out of the context
+by name and keeps nothing else: no other attribute is stored, logged or
+sent. The context is asked once per driver, the hook imports no Databricks
+module to ask it, and a context that will not answer changes nothing.
 
 ### A driver with no Spark session
 

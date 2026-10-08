@@ -23,8 +23,12 @@ unless `CONVALESCE_SEND_ARGUMENTS` is false, and the text unless
 `CONVALESCE_SEND_SOURCE` is.
 
 Where the platform says which of its runs the driver is, both say so too:
-on Databricks the job run, job, notebook, cluster and workspace
-(`databricks`), and on YARN which try of the application it is (`attempt`).
+on Databricks the job run, the task's run, the job, notebook, cluster and
+workspace (`databricks`), and on YARN which try of the application it is
+(`attempt`). Databricks says them in the session's configuration, and where
+that will not answer (serverless) in the run's context, which the shell's
+`dbutils` hands out: a fixed list of its attributes is read by name
+(`_CONTEXT`), and nothing else of it is kept, logged or sent.
 
 A driver usually stops its session before it exits, and a stopped session
 no longer says which application it was. So `SparkContext.stop` is wrapped
@@ -39,6 +43,7 @@ import convalesce_emit_pyspark.driver as cepysdri
 import atexit
 import functools
 import hashlib
+import json
 import logging
 import os
 import platform
@@ -93,6 +98,25 @@ _DATABRICKS = {
     "workspace_id": "spark.databricks.clusterUsageTags.clusterOwnerOrgId",
     "workspace_url": "spark.databricks.workspaceUrl",
 }
+# What the context of a Databricks run says of the same, by the field each is
+# sent as and the attribute Databricks names it. `currentRunId` is the run of
+# the task, which Databricks numbers again each time it retries the task;
+# `multitaskParentRunId` is the job run the task belongs to.
+_CONTEXT = {
+    "job_run_id": "multitaskParentRunId",
+    "task_run_id": "currentRunId",
+    "job_id": "jobId",
+    "job_name": "jobName",
+    "notebook_path": "notebook_path",
+    "cluster_id": "clusterId",
+    "workspace_id": "orgId",
+}
+_CONTEXT_TASK_TYPE = "jobTaskType"
+_NOTEBOOK_TASK = "notebook"
+# What a session nothing names is called, so a run always has a name.
+_NOTEBOOK_NAME = "notebook"
+_SESSION_NAME = "pyspark"
+_DBUTILS = "dbutils"
 _ARGUMENTS_ENV = "CONVALESCE_SEND_ARGUMENTS"
 _FALSY = frozenset({"0", "false", "no", "off"})
 
@@ -208,6 +232,8 @@ class _Hook:
         self._had_context = False
         # What Databricks said of the run, kept from when it could be read.
         self._databricks: Dict[str, str] = {}
+        # What the run's context said of it, once it has been asked.
+        self._run_context: Optional[Dict[str, str]] = None
         self._context_class: Any = None
         self._original_stop: Any = None
         self._finder: Optional["_Finder"] = None
@@ -323,7 +349,7 @@ class _Hook:
         :return: its id and name, or None for either
         """
         if _over_connect():
-            return _connect_session()
+            return _connect_session(self.databricks())
         live = _spark_context()
         if live[0] is not None:
             self._had_context = True
@@ -365,14 +391,23 @@ class _Hook:
 
         Read while the session can still say, and kept: a stopped context
         answers nothing, and what it said before it stopped still holds.
+        What the session will not say is filled from the run's context,
+        which is asked once.
 
-        :return: the fields of `_DATABRICKS` that are set; none off
-            Databricks
+        :return: the fields of `_DATABRICKS` and `_CONTEXT` that are set;
+            none off Databricks
         """
         try:
             self._databricks.update(_databricks())
         except Exception as err:  # pylint: disable=broad-exception-caught
             _LOG.debug("convalesce: could not read the job run: %s", err)
+        try:
+            if self._run_context is None:
+                self._run_context = _run_context()
+            for field, value in (self._run_context or {}).items():
+                self._databricks.setdefault(field, value)
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            _LOG.debug("convalesce: could not read the run's context: %s", err)
         return dict(self._databricks)
 
     def describe(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -487,10 +522,12 @@ class _Hook:
             self._closed = True
         self._send(
             APPLICATION_END,
-            {
-                "App ID": app_id,
-                "Timestamp": int(time.time() * 1000),
-            },
+            self.describe(
+                {
+                    "App ID": app_id,
+                    "Timestamp": int(time.time() * 1000),
+                }
+            ),
             [],
         )
 
@@ -593,6 +630,10 @@ class _Hook:
         not a Spark application, and one PySpark itself runs as `__main__`
         (an executor's Python worker) is not the driver.
 
+        A notebook's command line is its kernel's (the launcher, and the
+        file the kernel connects through), not anything its author wrote,
+        so a notebook sends no `argv`.
+
         :param exc: what ended the driver
         :param context: the application's id and name, where known
         :return: nothing
@@ -605,15 +646,16 @@ class _Hook:
             self._sent = True
         app_id, app_name = context
         self.open(context)
-        argv, excluded = _argv()
         payload: Dict[str, Any] = {
             "application_id": app_id,
             "application_name": app_name,
             "error_detail": cemit.error_detail(exc),
-            "argv": argv,
             "python_version": platform.python_version(),
             "pyspark_version": _pyspark_version(),
         }
+        excluded: List[Dict[str, str]] = []
+        if not _in_notebook():
+            payload["argv"], excluded = _argv()
         self._send(EVENT, self.describe(payload), excluded)
 
     def report_script(self, context: _Context) -> None:
@@ -631,7 +673,7 @@ class _Hook:
         app_id, app_name = context
         if app_id is None or not _is_driver():
             return
-        if _in_shell() and _script_path() is None:
+        if _in_notebook():
             return
         with self._lock:
             if self._script_sent:
@@ -915,16 +957,20 @@ def _connect() -> Any:
     return getattr(session_class, "_default_session", None)
 
 
-def _connect_session() -> _Context:
+def _connect_session(said: Dict[str, str]) -> _Context:
     """
     A Spark Connect session as the application it stands for.
 
     The session's id is the only identity the client holds. Its name is the
     script's file name, which says what ran. A notebook has no script: it
     is named by the last part of its path where Databricks says it, else
-    by the session's `spark.app.name` where the server says one. It is
-    never named after the kernel's own launcher.
+    by the Databricks job it is a task of, else by the session's
+    `spark.app.name` where the server says one. A session none of those
+    names is called `notebook` inside a shell and `pyspark` outside one: a
+    run with no name is a run a receiver cannot file. It is never named
+    after the kernel's own launcher.
 
+    :param said: what Databricks said of the run (`_Hook.databricks`)
     :return: the session's id and a name, or None for both
     """
     session = _connect()
@@ -936,9 +982,83 @@ def _connect_session() -> _Context:
     path = _script_path()
     if path:
         return session_id, os.path.splitext(os.path.basename(path))[0]
-    notebook = _setting(session, None, _DATABRICKS["notebook_path"]) or ""
-    name = notebook.rstrip("/").rsplit("/", 1)[-1]
-    return session_id, name or _read(lambda: session.conf.get("spark.app.name"))
+    notebook = said.get("notebook_path") or ""
+    name = (
+        notebook.rstrip("/").rsplit("/", 1)[-1]
+        or said.get("job_name")
+        or _read(lambda: session.conf.get("spark.app.name"))
+        or (_NOTEBOOK_NAME if _in_shell() else _SESSION_NAME)
+    )
+    return session_id, name
+
+
+def _dbutils() -> Any:
+    """
+    The `dbutils` Databricks gives the code a shell runs, importing nothing.
+
+    Databricks puts it among the shell's own names for a notebook and for a
+    Python file task alike.
+
+    :return: it, or None where there is no shell or the shell has none
+    """
+    module = sys.modules.get(_IPYTHON)
+    shell = module.get_ipython() if module is not None else None
+    names = getattr(shell, "user_ns", None)
+    return names.get(_DBUTILS) if isinstance(names, dict) else None
+
+
+def _run_context() -> Optional[Dict[str, str]]:
+    """
+    What the context of a Databricks run says of the run, by name.
+
+    The context is what `dbutils` hands a notebook that asks which run it
+    is. As JSON it also carries the run's own credentials for the
+    workspace, so it is never kept, logged or sent: the attributes listed
+    in `_CONTEXT` are taken out of it by name, here, and the rest is let
+    go. A Python file task's `notebook_path` is its script, which the
+    script's own observation already names, so only a notebook's is kept.
+
+    :return: the fields of `_CONTEXT` that are set; nothing where the
+        context would not answer; None where there is no `dbutils` to ask,
+        which may be there the next time
+    """
+    dbutils = _dbutils()
+    if dbutils is None:
+        return None
+    try:
+        context = (
+            dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+        )
+        attributes = _json_object(context.safeToJson()).get("attributes")
+    except Exception:  # pylint: disable=broad-exception-caught
+        return {}
+    if not isinstance(attributes, dict):
+        return {}
+    named = {
+        name: str(attributes[name])
+        for name in (*_CONTEXT.values(), _CONTEXT_TASK_TYPE)
+        if isinstance(attributes.get(name), (str, int))
+        and attributes[name] != ""
+    }
+    found = {
+        field: named[name] for field, name in _CONTEXT.items() if name in named
+    }
+    if "task_run_id" in found:
+        found.setdefault("job_run_id", found["task_run_id"])
+    if named.get(_CONTEXT_TASK_TYPE, _NOTEBOOK_TASK) != _NOTEBOOK_TASK:
+        found.pop("notebook_path", None)
+    return found
+
+
+def _json_object(text: Any) -> Dict[str, Any]:
+    """
+    A JSON object, read from text.
+
+    :param text: the text
+    :return: the object, or an empty one when the text is not one
+    """
+    value = json.loads(str(text))
+    return value if isinstance(value, dict) else {}
 
 
 def _read(getter: Callable[[], Any]) -> Optional[str]:
@@ -1045,6 +1165,15 @@ def _main_file(frame: Any) -> Optional[str]:
     if not path or not os.path.isfile(str(path)):
         return None
     return os.path.abspath(str(path))
+
+
+def _in_notebook() -> bool:
+    """
+    Whether this driver is a notebook: a shell runs it, and runs no script.
+
+    :return: it is
+    """
+    return _in_shell() and _script_path() is None
 
 
 def _in_shell() -> bool:

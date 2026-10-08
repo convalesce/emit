@@ -1,5 +1,7 @@
 package io.convalesce.emit.spark;
 
+import io.convalesce.emit.Exclusion;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -24,6 +26,11 @@ import java.util.regex.Pattern;
  * is a secret whatever the job's {@code spark.redaction.regex} says. And a value that is itself a
  * list of {@code NAME=value} entries, as the parameter AWS Glue hands a job its environment in, has
  * the value of each secret-named entry masked and the rest kept.
+ *
+ * <p>A value replaced whole says so itself. A value with an entry masked inside it reads as if it
+ * were sent as it was, so each is declared, by the map and the setting it is under, for the
+ * observation's {@code excluded}. Such an entry is always one named for the ingest key: a name the
+ * job's rule matches is in the value, which that rule then replaces whole.
  */
 final class Redaction {
 
@@ -113,12 +120,23 @@ final class Redaction {
    * @return the event, with sensitive values replaced
    */
   String apply(String json) {
+    return apply(json, new ArrayList<Exclusion>());
+  }
+
+  /**
+   * Redacts every configuration map in one event, and says where an entry was masked by its name.
+   *
+   * @param json the event as Spark rendered it
+   * @param masked where each setting with an entry masked inside its value is added, once
+   * @return the event, with sensitive values replaced
+   */
+  String apply(String json, List<Exclusion> masked) {
     if (json == null) {
       return null;
     }
     String out = json;
     for (String field : CONFIG_MAPS) {
-      out = redactMaps(out, field, false);
+      out = redactMaps(out, field, false, masked);
     }
     return out;
   }
@@ -134,17 +152,29 @@ final class Redaction {
    * @return the event, with sensitive values replaced
    */
   String applyToRunEvent(String json) {
+    return applyToRunEvent(json, new ArrayList<Exclusion>());
+  }
+
+  /**
+   * Redacts the configuration an OpenLineage run event carries, and says where an entry was masked
+   * by its name.
+   *
+   * @param json the run event as OpenLineage rendered it
+   * @param masked where each setting with an entry masked inside its value is added, once
+   * @return the event, with sensitive values replaced
+   */
+  String applyToRunEvent(String json, List<Exclusion> masked) {
     if (json == null) {
       return null;
     }
     String out = json;
     for (String field : RUN_EVENT_MAPS) {
-      out = redactMaps(out, field, true);
+      out = redactMaps(out, field, true, masked);
     }
     return out;
   }
 
-  private String redactMaps(String json, String field, boolean anyValue) {
+  private String redactMaps(String json, String field, boolean anyValue, List<Exclusion> masked) {
     StringBuilder out = null;
     int copied = 0;
     int from = 0;
@@ -165,7 +195,7 @@ final class Redaction {
       }
       StringBuilder map = new StringBuilder();
       boolean[] changed = new boolean[1];
-      int end = redactMap(json, open, map, changed, anyValue);
+      int end = redactMap(json, open, map, changed, anyValue, unquote(field), masked);
       if (end < 0 || !changed[0]) {
         // Nothing to hide, or not a flat map of strings, which is left as it is rather than
         // guessed at.
@@ -190,10 +220,18 @@ final class Redaction {
    *
    * @param changed set when a value was replaced
    * @param anyValue whether a value may be something other than a string
+   * @param path the map's own name, which a setting's path starts with
+   * @param masked where a setting with an entry masked inside its value is added
    * @return the index just past the object, or -1 when it is not a map this can read
    */
   private int redactMap(
-      String json, int open, StringBuilder out, boolean[] changed, boolean anyValue) {
+      String json,
+      int open,
+      StringBuilder out,
+      boolean[] changed,
+      boolean anyValue,
+      String path,
+      List<Exclusion> masked) {
     out.append('{');
     int i = skipSpace(json, open + 1);
     if (i < json.length() && json.charAt(i) == '}') {
@@ -228,9 +266,11 @@ final class Redaction {
       } else if (text && (entries = maskEntries(value)) != null) {
         out.append(entries);
         changed[0] = true;
+        declare(masked, path + "." + unquote(key));
       } else if (!text && value.charAt(0) == '{') {
         // A map inside the map is configuration too, and is held to the same rule.
-        if (redactMap(json, valueStart, out, changed, true) < 0) {
+        if (redactMap(json, valueStart, out, changed, true, path + "." + unquote(key), masked)
+            < 0) {
           return -1;
         }
       } else {
@@ -252,6 +292,15 @@ final class Redaction {
       i = skipSpace(json, i + 1);
     }
     return -1;
+  }
+
+  private static void declare(List<Exclusion> masked, String path) {
+    for (Exclusion known : masked) {
+      if (known.path().equals(path)) {
+        return;
+      }
+    }
+    masked.add(new Exclusion(path, Exclusion.KEY_MASKED));
   }
 
   /** Whether a setting's or an entry's name says it holds a credential. */

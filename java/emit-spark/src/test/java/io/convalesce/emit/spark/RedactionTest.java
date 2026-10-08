@@ -4,7 +4,9 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
+import io.convalesce.emit.Exclusion;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 import org.apache.spark.scheduler.SparkListenerJobStart;
 import org.apache.spark.scheduler.StageInfo;
@@ -83,6 +85,36 @@ public class RedactionTest {
             + "CUSTOMER_CONVALESCE_INGEST_KEY=***,CUSTOMER_CONVALESCE_DRY_RUN=true\","
             + "\"spark.app.id\":\"x\"}}",
         DEFAULT.apply(json));
+  }
+
+  @Test
+  public void anEntryMaskedInsideAValueIsDeclaredByItsSettingOnce() {
+    // A value replaced whole says so itself; one with an entry masked inside it does not.
+    String json =
+        "{\"Properties\":{\"spark.glue.customer-driver-env-vars\":"
+            + "\"A=1,CUSTOMER_CONVALESCE_INGEST_KEY=abc123,B=2\","
+            + "\"spark.hadoop.fs.s3a.secret.key\":\"hunter2\",\"spark.sql.a\":\"x=y\"},"
+            + "\"Stage Infos\":[{\"Properties\":{\"spark.glue.customer-driver-env-vars\":"
+            + "\"CUSTOMER_CONVALESCE_INGEST_KEY=abc123\"}}]}";
+    List<Exclusion> masked = new ArrayList<Exclusion>();
+    String sent = DEFAULT.apply(json, masked);
+    assertFalse(sent, sent.contains("abc123"));
+    assertEquals(1, masked.size());
+    assertEquals("Properties.spark.glue.customer-driver-env-vars", masked.get(0).path());
+    assertEquals("ingest key masked", masked.get(0).reason());
+  }
+
+  @Test
+  public void anEntryMaskedInARunEventIsDeclaredUnderTheMapsItIsIn() {
+    String json =
+        "{\"run\":{\"facets\":{\"environment-properties\":{\"environment-properties\":{"
+            + "\"mounts\":{\"env\":\"A=1,CONVALESCE_INGEST_KEY=abc123\"}}}}}}";
+    List<Exclusion> masked = new ArrayList<Exclusion>();
+    String sent = DEFAULT.applyToRunEvent(json, masked);
+    assertFalse(sent, sent.contains("abc123"));
+    assertEquals(1, masked.size());
+    // The facet, the map in it, and the map in that.
+    assertEquals("environment-properties.environment-properties.mounts.env", masked.get(0).path());
   }
 
   @Test

@@ -5,6 +5,7 @@ Run with `make test`.
 """
 
 import hashlib
+import json
 import logging
 import os
 import pathlib
@@ -1218,6 +1219,56 @@ class _ConnectSession:
         return cls()
 
 
+class _RunContext:
+    """
+    Stands in for the context `dbutils` hands a Databricks run.
+
+    :param attributes: what it says of the run, over `ATTRIBUTES`
+    """
+
+    TOKEN = "stand-in-run-token-not-a-real-one"
+    API_URL = "https://my-region.cloud.databricks.com"
+    USER = "someone@example.com"
+    # What a serverless notebook task's context carries: the run, and
+    # beside it the run's own credentials and whose they are.
+    ATTRIBUTES = {
+        "api_token": TOKEN,
+        "non_uc_api_token": TOKEN,
+        "api_url": API_URL,
+        "user": USER,
+        "jobOwnerId": "7700000000000001",
+        "clusterId": "1008-003408-abcd1234-v2n",
+        "currentRunId": "3002",
+        "runId": "3002",
+        "multitaskParentRunId": "3001",
+        "jobId": "123",
+        "jobName": "orders nightly",
+        "jobTaskType": "notebook",
+        "notebook_path": "/Repos/etl/orders_nightly",
+        "notebook_id": "5069490148347187",
+        "orgId": "1234567890123456",
+    }
+
+    def __init__(self, **attributes: Any) -> None:
+        self.attributes = {**self.ATTRIBUTES, **attributes}
+        self.asked = 0
+
+    def safeToJson(self) -> str:  # pylint: disable=invalid-name
+        """Everything it holds, as Databricks writes it."""
+        self.asked += 1
+        held = {k: v for k, v in self.attributes.items() if v is not None}
+        return json.dumps({"attributes": held, "extraContext": {"x": "y"}})
+
+    def dbutils(self) -> Any:
+        """The `dbutils` that hands this context out."""
+        notebook = types.SimpleNamespace(getContext=lambda: self)
+        inner = types.SimpleNamespace(notebook=lambda: notebook)
+        entry_point = types.SimpleNamespace(getDbutils=lambda: inner)
+        return types.SimpleNamespace(
+            notebook=types.SimpleNamespace(entry_point=entry_point)
+        )
+
+
 class Test_shell1(Test_script1):
     """A driver a shell runs: nothing is uncaught, and the process lives on."""
 
@@ -1252,6 +1303,20 @@ class Test_shell1(Test_script1):
         patch.start()
         self.addCleanup(patch.stop)
         return launcher
+
+    def serverless(self, **attributes: Any) -> _RunContext:
+        """
+        Make this a Databricks serverless run: a Connect session that will
+        not say the job run, and `dbutils` among the shell's names.
+
+        :param attributes: what the run's context says, over a notebook
+            task's
+        :return: the context
+        """
+        self.over_connect()
+        context = _RunContext(**attributes)
+        setattr(self.shell, "user_ns", {"dbutils": context.dbutils()})
+        return context
 
     def over_connect(self) -> None:
         """Give the driver a Connect session and no context, as serverless does."""
@@ -1298,9 +1363,8 @@ class Test_shell1(Test_script1):
         self.assertEqual(failure["application_id"], _ConnectSession.session_id)
         # Only what the session would say of Databricks, on all three.
         cluster = {"cluster_id": "0921-133320-abcd1234"}
-        for sent in self.recorder.sent[:3]:
+        for sent in self.recorder.sent:
             self.assertEqual(sent["payload"]["databricks"], cluster)
-        self.assertNotIn("databricks", self.recorder.sent[3]["payload"])
         self.assertEqual(
             self.recorder.sent[3]["payload"]["App ID"], start["App ID"]
         )
@@ -1384,6 +1448,151 @@ class Test_shell1(Test_script1):
         self.assertEqual(
             failure["error_detail"]["message"], "table orders is not there"
         )
+        # The kernel's command line is nobody's to read.
+        self.assertNotIn("argv", failure)
+
+    def test_a_serverless_notebook_says_which_run_it_is(self) -> None:
+        """A serverless notebook is named by its path and says its run."""
+        self.notebook()
+        context = self.serverless()
+        self.install()
+        self.shell.run()
+        self.shell.run(_raised(LookupError("table orders is not there")))
+        said = {
+            "job_run_id": "3001",
+            "task_run_id": "3002",
+            "job_id": "123",
+            "job_name": "orders nightly",
+            "notebook_path": "/Repos/etl/orders_nightly",
+            # The session's own word for the cluster stands.
+            "cluster_id": "0921-133320-abcd1234",
+            "workspace_id": "1234567890123456",
+        }
+        start, failure, end = (sent["payload"] for sent in self.recorder.sent)
+        self.assertEqual(start["App Name"], "orders_nightly")
+        self.assertEqual(failure["application_name"], "orders_nightly")
+        for payload in (start, failure, end):
+            self.assertEqual(payload["databricks"], said)
+        self.assertEqual(context.asked, 1)
+
+    def test_nothing_else_of_the_context_is_sent(self) -> None:
+        """The run's credentials, and whose they are, never leave it."""
+        self.notebook()
+        self.serverless()
+        self.install()
+        with self.assertLogs(level="DEBUG") as logs:
+            _LOG.debug("a notebook cell is about to raise")
+            self.shell.run(_raised(LookupError("table orders is not there")))
+        text = json.dumps(self.recorder.sent, default=str) + "\n".join(
+            logs.output
+        )
+        for secret in (
+            _RunContext.TOKEN,
+            _RunContext.API_URL,
+            _RunContext.USER,
+            "7700000000000001",
+            "5069490148347187",
+        ):
+            self.assertNotIn(secret, text)
+        for word in ("token", "api_url", "extraContext"):
+            self.assertNotIn(word, text)
+        allowed = {
+            "job_run_id",
+            "task_run_id",
+            "job_id",
+            "job_name",
+            "notebook_path",
+            "cluster_id",
+            "workspace_id",
+            "workspace_url",
+        }
+        for sent in self.recorder.sent:
+            self.assertLessEqual(set(sent["payload"]["databricks"]), allowed)
+
+    def test_a_serverless_script_is_named_by_its_file(self) -> None:
+        """A Python file task keeps its script's name, and names no notebook."""
+        self.serverless(jobTaskType="python", notebook_path=self.script)
+        self.install()
+        self.shell.run(_raised(LookupError("table orders is not there")))
+        start, failure, script, end = (
+            sent["payload"] for sent in self.recorder.sent
+        )
+        self.assertEqual(start["App Name"], "revenue")
+        self.assertEqual(failure["argv"], [self.script, "shop.orders"])
+        for payload in (start, failure, script, end):
+            self.assertEqual(payload["databricks"]["task_run_id"], "3002")
+            self.assertNotIn("notebook_path", payload["databricks"])
+
+    def test_a_task_with_no_job_run_above_it_is_its_own(self) -> None:
+        """A run that names no job run above it is the job run."""
+        self.notebook()
+        self.serverless(multitaskParentRunId=None)
+        self.install()
+        self.shell.run(_raised(LookupError("table orders is not there")))
+        said = self.recorder.sent[0]["payload"]["databricks"]
+        self.assertEqual(
+            (said["job_run_id"], said["task_run_id"]), ("3002",) * 2
+        )
+
+    def test_a_notebook_with_no_path_is_named_by_its_job(self) -> None:
+        """A notebook with no path is named by its job."""
+        self.notebook()
+        self.serverless(notebook_path=None)
+        self.install()
+        self.shell.run(_raised(LookupError("table orders is not there")))
+        start = self.recorder.sent[0]["payload"]
+        self.assertEqual(start["App Name"], "orders nightly")
+
+    def test_a_session_nothing_names_still_has_a_name(self) -> None:
+        """A session nothing names still has a name."""
+        self.notebook()
+        self.serverless(notebook_path=None, jobName=None)
+        self.install()
+        with mock.patch.dict(_ConnectSession.settings, clear=True):
+            self.shell.run(_raised(LookupError("table orders is not there")))
+            # pylint: disable=protected-access
+            self.assertEqual(cepysdri._connect_session({})[1], "notebook")
+            # Outside a shell, as a driver started with no file is.
+            with (
+                mock.patch.dict(sys.modules, {"IPython": None}),
+                mock.patch.object(cepysdri, "_script_path", return_value=None),
+            ):
+                self.assertEqual(cepysdri._connect_session({})[1], "pyspark")
+        start, failure, _ = (sent["payload"] for sent in self.recorder.sent)
+        self.assertEqual(start["App Name"], "notebook")
+        self.assertEqual(failure["application_name"], "notebook")
+
+    def test_a_context_that_will_not_answer_changes_nothing(self) -> None:
+        """A context that will not answer changes nothing, and is asked once."""
+        self.notebook()
+        self.over_connect()
+        asked: List[int] = []
+
+        def refuse() -> Any:
+            asked.append(1)
+            raise RuntimeError("py4j: method is not whitelisted")
+
+        entry_point = types.SimpleNamespace(getDbutils=refuse)
+        dbutils = types.SimpleNamespace(
+            notebook=types.SimpleNamespace(entry_point=entry_point)
+        )
+        setattr(self.shell, "user_ns", {"dbutils": dbutils})
+        self.install()
+        self.shell.run(_raised(LookupError("table orders is not there")))
+        cluster = {"cluster_id": "0921-133320-abcd1234"}
+        for sent in self.recorder.sent:
+            self.assertEqual(sent["payload"]["databricks"], cluster)
+        self.assertEqual(len(self.recorder.sent), 3)
+        self.assertEqual(len(asked), 1)
+
+    def test_a_context_that_is_not_one_says_nothing(self) -> None:
+        """A context that is not one says nothing."""
+        self.notebook()
+        for answer in ("[]", '{"attributes": []}'):
+            context = self.serverless()
+            setattr(context, "safeToJson", lambda answer=answer: answer)
+            # pylint: disable=protected-access
+            self.assertEqual(cepysdri._run_context(), {})
 
     def test_a_notebook_is_named_by_its_path(self) -> None:
         """A notebook is named by its path."""

@@ -7,11 +7,11 @@ executed, and the observation received over HTTP by a stand-in endpoint.
 
 | Tool | Versions verified |
 | --- | --- |
-| Airflow | 2.5.3, 2.6.3, 2.7.3, 2.8.4, 2.9.3, 2.10.5, 2.11.0, 3.0.3 |
+| Airflow | 2.5.3, 2.6.3, 2.7.3, 2.8.4, 2.9.3, 2.10.5, 2.11.0, 3.0.3, 3.1.0, 3.2.2 |
 | Dagster | 1.7.16, 1.9.13, 1.10.0, 1.13.21, 1.13.24, 1.13.25 |
 | Prefect | 2.20.26, 3.1.15, 3.4.25, 3.8.5 |
 | Great Expectations | 0.17.23, 0.18.22, 1.22.0, 1.23.2 |
-| Spark | 3.3.4, 3.5.3, 4.0.3 |
+| Spark | 3.3.3, 3.4.4, 3.5.3, 4.0.3 |
 | Python | 3.9 (floor) through 3.12 |
 
 One release per tool covers every version in its row:

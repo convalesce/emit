@@ -138,7 +138,9 @@ Convalesce's own key is held to more than that rule:
 - A value that lists `NAME=value` entries has the value of each entry with such a name, or a name
   the rule matches, replaced with `***` and the rest kept. On AWS Glue
   `spark.glue.customer-driver-env-vars` is sent as
-  `CUSTOMER_CONVALESCE_ENDPOINT=...,CUSTOMER_CONVALESCE_INGEST_KEY=***`.
+  `CUSTOMER_CONVALESCE_ENDPOINT=...,CUSTOMER_CONVALESCE_INGEST_KEY=***`. The observation's
+  `excluded` names the setting, as
+  `{"path": "Properties.spark.glue.customer-driver-env-vars", "reason": "ingest key masked"}`.
 - The key's exact value is masked (`***`) anywhere else in an observation, and that observation's
   `excluded` says `{"path": "$", "reason": "ingest key masked"}`. The key travels in the
   `Authorization` header only. A key under 8 characters is too short to look for.

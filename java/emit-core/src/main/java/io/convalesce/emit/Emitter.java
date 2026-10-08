@@ -162,10 +162,25 @@ public final class Emitter {
    * @param toolVersion the tool's version, where it could be read
    */
   public void emit(String tool, String event, String payloadJson, String toolVersion) {
+    emit(tool, event, payloadJson, toolVersion, Collections.<Exclusion>emptyList());
+  }
+
+  /**
+   * Queues one observation whose payload the caller masked something in, which is declared in the
+   * observation's {@code excluded}.
+   *
+   * @param tool which tool produced this
+   * @param event which callback fired
+   * @param payloadJson the tool's own output, already JSON
+   * @param toolVersion the tool's version, where it could be read
+   * @param excluded what was masked in the payload, by path and reason
+   */
+  public void emit(
+      String tool, String event, String payloadJson, String toolVersion, List<Exclusion> excluded) {
     if (!usable || !config.enabled()) {
       return;
     }
-    Observation observation = observation(tool, event, payloadJson, toolVersion);
+    Observation observation = observation(tool, event, payloadJson, toolVersion, excluded);
     byte[] bytes = observation.toJson().getBytes(UTF8);
     int overhead = BODY_OPEN.length() + BODY_CLOSE.length();
     if (!fits(bytes.length)) {
@@ -217,22 +232,24 @@ public final class Emitter {
    * @return whether it is within the receiver's body limit
    */
   public boolean fits(String tool, String event, String payloadJson, String toolVersion) {
-    Observation observation = observation(tool, event, payloadJson, toolVersion);
+    Observation observation =
+        observation(tool, event, payloadJson, toolVersion, Collections.<Exclusion>emptyList());
     return fits(observation.toJson().getBytes(UTF8).length);
   }
 
   /** Wraps a payload, with this emitter's own ingest key masked wherever the payload holds it. */
   private Observation observation(
-      String tool, String event, String payloadJson, String toolVersion) {
+      String tool, String event, String payloadJson, String toolVersion, List<Exclusion> excluded) {
+    List<Exclusion> declared = new ArrayList<Exclusion>(excluded);
     if (key == null || payloadJson == null) {
-      return new Observation(tool, event, payloadJson, toolVersion);
+      return new Observation(tool, event, payloadJson, toolVersion, false, declared);
     }
     boolean found = payloadJson.contains(key) || payloadJson.contains(keyInJson);
     if (!found) {
-      return new Observation(tool, event, payloadJson, toolVersion);
+      return new Observation(tool, event, payloadJson, toolVersion, false, declared);
     }
     String masked = payloadJson.replace(keyInJson, KEY_MASK).replace(key, KEY_MASK);
-    return new Observation(tool, event, masked, toolVersion, true);
+    return new Observation(tool, event, masked, toolVersion, true, declared);
   }
 
   private boolean fits(int observationBytes) {

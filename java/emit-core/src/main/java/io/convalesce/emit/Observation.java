@@ -1,7 +1,9 @@
 package io.convalesce.emit;
 
 import java.text.SimpleDateFormat;
+import java.util.Collections;
 import java.util.Date;
+import java.util.List;
 import java.util.SimpleTimeZone;
 import java.util.UUID;
 
@@ -23,13 +25,14 @@ public final class Observation {
    * <p>Version 2 adds {@code excluded}, naming anything left out of the payload by path and reason.
    * This client's payload is already the tool's own JSON (Spark's {@code JsonProtocol}), not walked
    * by anything of ours, so it sends an empty list here -- there is nothing of ours to declare an
-   * exclusion about -- except when the emitter masked its own ingest key in the payload, which is
-   * declared. Collect keeps reading version 1 unchanged.
+   * exclusion about -- except when the emitter masked its own ingest key in the payload, or the
+   * caller masked something in it and says so, which are declared. Collect keeps reading version 1
+   * unchanged.
    */
   public static final int ENVELOPE_VERSION = 2;
 
   // The same path and reason the Python client declares.
-  private static final String KEY_MASKED = "[{\"path\":\"$\",\"reason\":\"ingest key masked\"}]";
+  private static final Exclusion KEY_MASKED = new Exclusion("$", Exclusion.KEY_MASKED);
 
   private final String tool;
   private final String event;
@@ -38,6 +41,7 @@ public final class Observation {
   private final String observationId;
   private final String emittedAt;
   private final boolean keyMasked;
+  private final List<Exclusion> excluded;
 
   /**
    * Wraps a tool's payload for transport.
@@ -48,17 +52,24 @@ public final class Observation {
    * @param toolVersion the tool's version, where it could be read
    */
   public Observation(String tool, String event, String payloadJson, String toolVersion) {
-    this(tool, event, payloadJson, toolVersion, false);
+    this(tool, event, payloadJson, toolVersion, false, Collections.<Exclusion>emptyList());
   }
 
   /**
    * Wraps a payload the emitter has looked through for its own ingest key.
    *
    * @param keyMasked whether the key was found in the payload and masked there
+   * @param excluded what the caller masked in the payload before handing it over
    */
   Observation(
-      String tool, String event, String payloadJson, String toolVersion, boolean keyMasked) {
+      String tool,
+      String event,
+      String payloadJson,
+      String toolVersion,
+      boolean keyMasked,
+      List<Exclusion> excluded) {
     this.keyMasked = keyMasked;
+    this.excluded = excluded;
     this.tool = tool;
     this.event = event;
     this.payloadJson = payloadJson;
@@ -81,7 +92,16 @@ public final class Observation {
     out.append(",\"tool_version\":").append(Json.quote(toolVersion));
     out.append(",\"event\":").append(Json.quote(event));
     out.append(",\"client_version\":").append(Json.quote(Version.VERSION));
-    out.append(",\"excluded\":").append(keyMasked ? KEY_MASKED : "[]");
+    out.append(",\"excluded\":[");
+    String separator = "";
+    for (Exclusion exclusion : excluded) {
+      out.append(separator).append(exclusion.toJson());
+      separator = ",";
+    }
+    if (keyMasked) {
+      out.append(separator).append(KEY_MASKED.toJson());
+    }
+    out.append(']');
     // Verbatim: this is the tool's own JSON, and re-encoding it would be the one thing this
     // package exists not to do.
     out.append(",\"payload\":").append(payloadJson == null ? "null" : payloadJson);

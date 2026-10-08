@@ -65,6 +65,7 @@ Each plugin adds a few settings of its own. Its README has the detail:
 | `CONVALESCE_AIRFLOW_DAG_DENY` | [Airflow](python/plugins/airflow) | none | a DAG whose id matches is left out, also when it matches the allow list |
 | `CONVALESCE_DAGSTER_URL` | [Dagster](python/plugins/dagster) | none | the address the Dagster UI is opened at, so each job, op, run and step links to its page |
 | `CONVALESCE_DAGSTER_SEND_METADATA` | [Dagster](python/plugins/dagster) | `true` | `false` sends only the metadata entries that describe a table |
+| `CONVALESCE_DAGSTER_SEND_LOCAL_PATHS` | [Dagster](python/plugins/dagster) | `false` | `true` also sends `path` metadata that names a local file |
 | `CONVALESCE_GX_SEND_SAMPLES` | [Great Expectations](python/plugins/gx) | `true` | `false` replaces failing sample values and observed values by their counts |
 | `CONVALESCE_PYSPARK_DRIVER_HOOK` | [PySpark](python/plugins/pyspark) | `false` | `true` turns the driver hook on with no code change |
 
@@ -139,14 +140,14 @@ One package per tool, no per-version build. Verified against real installs:
 
 | Tool | Verified |
 | --- | --- |
-| Airflow | 2.5 - 2.11, 3.0 |
+| Airflow | 2.5 - 2.11, 3.0 - 3.2 |
 | Dagster | 1.7 - 1.13 |
-| Prefect | 2.20, 3.1, 3.8 |
-| Great Expectations | 0.17, 0.18, 1.22 |
-| Spark | 3.3, 3.5, 4.0 |
+| Prefect | 2.20, 3.1, 3.4, 3.8 |
+| Great Expectations | 0.17, 0.18, 1.22, 1.23 |
+| Spark | 3.3, 3.4, 3.5, 4.0 |
 | Python | 3.9+ |
 
-One release per tool covers its whole row: Airflow 2.5 to 3.0 in a single artifact, Spark on
+One release per tool covers its whole row: Airflow 2.5 to 3.2 in a single artifact, Spark on
 Java 8 and 11 clusters, Great Expectations 0.x and 1.x behind one import.
 
 Each of those versions also runs for real in Docker, on its own scheduler, daemon or server,

@@ -299,6 +299,26 @@ public class EmitterTest {
   }
 
   @Test
+  public void whatTheCallerMaskedIsDeclaredBesideTheKeyTheEmitterMasked() {
+    // A setting whose secret-named entry the caller masked by name, so the key is not found in it.
+    String masked = "{\"Properties\":{\"env\":\"A=1,CUSTOMER_CONVALESCE_INGEST_KEY=***\"}}";
+    List<Exclusion> declared =
+        Collections.singletonList(new Exclusion("Properties.env", Exclusion.KEY_MASKED));
+    String key = "key-0123456789";
+    Emitter emitter = new Emitter(Config.of(url, key, 1, 0).withSpoolDir(spoolDir()));
+    emitter.emit("spark", "SparkListenerJobStart", masked, "3.5.0", declared);
+    emitter.emit("spark", "SparkListenerJobStart", "{\"note\":\"" + key + "\"}", "3.5.0", declared);
+    String own = "{\"path\":\"Properties.env\",\"reason\":\"ingest key masked\"}";
+    assertTrue(bodies.get(0), bodies.get(0).contains("\"excluded\":[" + own + "]"));
+    assertTrue(
+        bodies.get(1),
+        bodies
+            .get(1)
+            .contains(
+                "\"excluded\":[" + own + ",{\"path\":\"$\",\"reason\":\"ingest key masked\"}]"));
+  }
+
+  @Test
   public void aPayloadWithoutTheKeyDeclaresNothingAndAShortKeyIsNotLookedFor() {
     String payload = "{\"note\":\"a shortk in ordinary text\"}";
     new Emitter(Config.of(url, "shortk", 1, 0).withSpoolDir(spoolDir()))
