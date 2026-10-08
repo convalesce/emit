@@ -4,7 +4,9 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
+import io.convalesce.emit.Exclusion;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 import org.apache.spark.scheduler.SparkListenerJobStart;
 import org.apache.spark.scheduler.StageInfo;
@@ -46,6 +48,111 @@ public class RedactionTest {
     assertEquals(
         "{\"modifiedConfigs\":{\"spark.url\":\"" + Redaction.REPLACEMENT + "\",\"a\":\"b\"}}",
         DEFAULT.apply(json));
+  }
+
+  @Test
+  public void ourOwnKeyIsASecretWhateverRuleTheJobConfigured() {
+    // A job's own rule replaces Spark's default and knows nothing of our setting's name.
+    String json =
+        "{\"Properties\":{\"spark.yarn.appMasterEnv.CONVALESCE_INGEST_KEY\":\"abc123\","
+            + "\"spark.executorEnv.CUSTOMER_CONVALESCE_INGEST_KEY\":\"abc123\","
+            + "\"spark.convalesce.ingest.key\":\"abc123\",\"spark.convalesce.ingestKey\":\"abc123\","
+            + "\"spark.master\":\"yarn\"}}";
+    for (String regex : new String[] {null, "(?i)passphrase", "("}) {
+      String sent = Redaction.of(regex).apply(json);
+      assertFalse(sent, sent.contains("abc123"));
+      assertTrue(sent, sent.contains("\"spark.master\":\"yarn\""));
+      assertTrue(
+          sent,
+          sent.contains(
+              "\"spark.yarn.appMasterEnv.CONVALESCE_INGEST_KEY\":\""
+                  + Redaction.REPLACEMENT
+                  + "\""));
+    }
+  }
+
+  @Test
+  public void aSecretNamedEntryInsideAValueIsMaskedAndTheRestKept() {
+    // The parameter AWS Glue hands a job its environment in, as every job start carries it.
+    String json =
+        "{\"Properties\":{\"spark.glue.customer-driver-env-vars\":"
+            + "\"CUSTOMER_CONVALESCE_ENDPOINT=https://example.invalid/openapi,"
+            + "CUSTOMER_CONVALESCE_INGEST_KEY=abc123,CUSTOMER_CONVALESCE_DRY_RUN=true\","
+            + "\"spark.app.id\":\"x\"}}";
+    assertEquals(
+        "{\"Properties\":{\"spark.glue.customer-driver-env-vars\":"
+            + "\"CUSTOMER_CONVALESCE_ENDPOINT=https://example.invalid/openapi,"
+            + "CUSTOMER_CONVALESCE_INGEST_KEY=***,CUSTOMER_CONVALESCE_DRY_RUN=true\","
+            + "\"spark.app.id\":\"x\"}}",
+        DEFAULT.apply(json));
+  }
+
+  @Test
+  public void anEntryMaskedInsideAValueIsDeclaredByItsSettingOnce() {
+    // A value replaced whole says so itself; one with an entry masked inside it does not.
+    String json =
+        "{\"Properties\":{\"spark.glue.customer-driver-env-vars\":"
+            + "\"A=1,CUSTOMER_CONVALESCE_INGEST_KEY=abc123,B=2\","
+            + "\"spark.hadoop.fs.s3a.secret.key\":\"hunter2\",\"spark.sql.a\":\"x=y\"},"
+            + "\"Stage Infos\":[{\"Properties\":{\"spark.glue.customer-driver-env-vars\":"
+            + "\"CUSTOMER_CONVALESCE_INGEST_KEY=abc123\"}}]}";
+    List<Exclusion> masked = new ArrayList<Exclusion>();
+    String sent = DEFAULT.apply(json, masked);
+    assertFalse(sent, sent.contains("abc123"));
+    assertEquals(1, masked.size());
+    assertEquals("Properties.spark.glue.customer-driver-env-vars", masked.get(0).path());
+    assertEquals("ingest key masked", masked.get(0).reason());
+  }
+
+  @Test
+  public void anEntryMaskedInARunEventIsDeclaredUnderTheMapsItIsIn() {
+    String json =
+        "{\"run\":{\"facets\":{\"environment-properties\":{\"environment-properties\":{"
+            + "\"mounts\":{\"env\":\"A=1,CONVALESCE_INGEST_KEY=abc123\"}}}}}}";
+    List<Exclusion> masked = new ArrayList<Exclusion>();
+    String sent = DEFAULT.applyToRunEvent(json, masked);
+    assertFalse(sent, sent.contains("abc123"));
+    assertEquals(1, masked.size());
+    // The facet, the map in it, and the map in that.
+    assertEquals("environment-properties.environment-properties.mounts.env", masked.get(0).path());
+  }
+
+  @Test
+  public void anEntryNamedByTheJobsOwnRuleIsMaskedToo() {
+    // Entries apart from one another by a space, a semicolon or an escaped line end.
+    String json =
+        "{\"System Properties\":{\"sun.java.command\":\"submit --conf "
+            + "spark.yarn.appMasterEnv.CONVALESCE_INGEST_KEY=abc123 --conf a=b\","
+            + "\"env\":\"REGION=north;DB_PASSPHRASE=abc123\\nMODE=fast\"}}";
+    Redaction rule = Redaction.of("(?i)passphrase");
+    // The rule's own word in a value takes the whole value, as Spark has it; a name only our rule
+    // knows takes its entry.
+    assertEquals(
+        "{\"System Properties\":{\"sun.java.command\":\"submit --conf "
+            + "spark.yarn.appMasterEnv.CONVALESCE_INGEST_KEY=*** --conf a=b\","
+            + "\"env\":\""
+            + Redaction.REPLACEMENT
+            + "\"}}",
+        rule.apply(json));
+  }
+
+  @Test
+  public void aValueWithNoSecretNamedEntryIsLeftAsItIs() {
+    String json =
+        "{\"Properties\":{\"spark.executor.extraJavaOptions\":\"-Dkey=1 -Dingest=2\","
+            + "\"spark.sql.a\":\"x=y\"}}";
+    assertEquals(json, DEFAULT.apply(json));
+  }
+
+  @Test
+  public void ourOwnKeyIsMaskedInAnOpenLineageRunEventToo() {
+    String json =
+        "{\"run\":{\"facets\":{\"spark_properties\":{\"properties\":{"
+            + "\"spark.yarn.appMasterEnv.CONVALESCE_INGEST_KEY\":\"abc123\","
+            + "\"spark.glue.customer-driver-env-vars\":\"A=1,CUSTOMER_CONVALESCE_INGEST_KEY=abc123\"}}}}}";
+    String sent = Redaction.of("(?i)passphrase").applyToRunEvent(json);
+    assertFalse(sent, sent.contains("abc123"));
+    assertTrue(sent, sent.contains("A=1,CUSTOMER_CONVALESCE_INGEST_KEY=***"));
   }
 
   @Test

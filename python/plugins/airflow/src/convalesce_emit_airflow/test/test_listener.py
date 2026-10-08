@@ -12,6 +12,7 @@ Run with `make test`.
 # pylint: disable=duplicate-code
 
 import logging
+import os
 import sys
 import types
 import unittest
@@ -897,6 +898,233 @@ class Test_connection_coordinates1(unittest.TestCase):
         connections = payload["task_instance"]["task"]["connections"]
         self.assertEqual(connections["warehouse"]["conn_type"], "postgres")
 
+    def test4(self) -> None:
+        """
+        Test that only the listed names of a connection's `extra` cross:
+        where its tables live, never the keys and tokens kept beside them.
+        """
+
+        class Connection:
+            """Stands in for a Snowflake connection, its extra parsed."""
+
+            def __init__(self) -> None:
+                self.conn_type = "snowflake"
+                self.host = None
+                self.port = None
+                self.schema = "MY_SCHEMA"
+                self.extra_dejson = {
+                    "database": "MY_DB",
+                    # As providers before the prefix was dropped stored it.
+                    "extra__snowflake__warehouse": "LOAD_WH",
+                    "role": "",
+                    "catalog": {"not": "a name"},
+                    "account": "my_account",
+                    "private_key_content": "-----BEGIN PRIVATE KEY-----",
+                    "token": "s3cret",
+                }
+
+        class Task:
+            """Stands in for a SQL operator."""
+
+            def __init__(self) -> None:
+                self.conn_id = "warehouse"
+
+        with unittest.mock.patch.object(
+            cealist, "_get_connection", return_value=Connection()
+        ):
+            coords = cealist.connection_coordinates(Task())
+        self.assertEqual(
+            coords["warehouse"]["extra"],
+            {"database": "MY_DB", "warehouse": "LOAD_WH"},
+        )
+        self.assertNotIn("PRIVATE KEY", str(coords))
+        self.assertNotIn("s3cret", str(coords))
+        self.assertNotIn("my_account", str(coords))
+
+    def test5(self) -> None:
+        """
+        Test that an allowed name's value is redacted like any other, and
+        that an `extra` that cannot be read costs the connection nothing
+        else.
+        """
+
+        class Connection:
+            """Stands in for a connection whose database is a whole URL."""
+
+            conn_type = "postgres"
+            host = "warehouse.internal"
+            port = 5432
+            schema = "shop"
+            extra_dejson = {"database": "postgresql://etl:pa55@db:5432/shop"}
+
+        class Unreadable(Connection):
+            """Stands in for a connection whose `extra` is not JSON."""
+
+            @property
+            def extra_dejson(self) -> Any:  # type: ignore[override]
+                """Raise, as parsing a malformed `extra` does."""
+                raise ValueError("not JSON")
+
+        class Task:
+            """Stands in for a SQL operator."""
+
+            def __init__(self) -> None:
+                self.postgres_conn_id = "warehouse"
+                self.task_id = "load"
+
+        class TaskInstance:
+            """Stands in for the task instance Airflow passes."""
+
+            def __init__(self) -> None:
+                self.task_id = "load"
+                self.task = Task()
+
+        with unittest.mock.patch.object(
+            cealist, "_get_connection", return_value=Connection()
+        ):
+            payload, excluded = cealist.shape({"task_instance": TaskInstance()})
+        connection = payload["task_instance"]["task"]["connections"]["warehouse"]
+        self.assertEqual(
+            connection["extra"]["database"], "postgresql://etl:***@db:5432/shop"
+        )
+        self.assertIn(
+            "task_instance.task.connections.warehouse.extra.database",
+            {item["path"] for item in excluded},
+        )
+        with unittest.mock.patch.object(
+            cealist, "_get_connection", return_value=Unreadable()
+        ):
+            coords = cealist.connection_coordinates(Task())
+        self.assertEqual(coords["warehouse"]["schema"], "shop")
+        self.assertNotIn("extra", coords["warehouse"])
+
+
+# #############################################################################
+# Test_dag_reported1
+# #############################################################################
+
+
+class Test_dag_reported1(unittest.TestCase):
+    """
+    Test that a DAG the settings leave out sends nothing at all.
+    """
+
+    @staticmethod
+    def _sent(env: Dict[str, str], dag_id: str) -> List[str]:
+        """
+        The events that cross for one DAG's task, run and asset event.
+
+        :param env: the settings in force
+        :param dag_id: the DAG every argument names
+        :return: the names of the events forwarded
+        """
+        recorder = _Recorder()
+        listener = cealist.build_listener_class(_FAILED_SPEC)(emitter=recorder)
+        about = types.SimpleNamespace(dag_id=dag_id, task_id="t")
+        raised = types.SimpleNamespace(source_dag_id=dag_id, source_task_id="t")
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            listener.send("on_task_instance_failed", task_instance=about)
+            listener.send("on_dag_run_success", dag_run=about)
+            listener.send("on_asset_event_emitted", asset_event=raised)
+        return [sent["event"] for sent in recorder.sent]
+
+    def test1(self) -> None:
+        """
+        Test that a DAG matching a deny pattern is left out, task, run and
+        asset event alike, and every other DAG still crosses.
+        """
+        env = {"CONVALESCE_AIRFLOW_DAG_DENY": "scratch_*, tmp?"}
+        self.assertEqual(self._sent(env, "scratch_orders"), [])
+        self.assertEqual(self._sent(env, "tmp1"), [])
+        self.assertEqual(len(self._sent(env, "orders")), 3)
+        # The whole id is matched, with its case kept.
+        self.assertEqual(len(self._sent(env, "my_scratch_orders")), 3)
+        self.assertEqual(len(self._sent(env, "Scratch_orders")), 3)
+
+    def test2(self) -> None:
+        """
+        Test that with an allow list only the DAGs it names cross, and that
+        deny wins where both match.
+        """
+        env = {
+            "CONVALESCE_AIRFLOW_DAG_ALLOW": "orders_*,billing",
+            "CONVALESCE_AIRFLOW_DAG_DENY": "orders_test",
+        }
+        self.assertEqual(len(self._sent(env, "orders_daily")), 3)
+        self.assertEqual(len(self._sent(env, "billing")), 3)
+        self.assertEqual(self._sent(env, "inventory"), [])
+        self.assertEqual(self._sent(env, "orders_test"), [])
+
+    def test3(self) -> None:
+        """
+        Test that the settings are read under a platform's prefix too, and
+        that unset or empty they leave every DAG reported.
+        """
+        prefixed = {"CUSTOMER_CONVALESCE_AIRFLOW_DAG_DENY": "orders"}
+        self.assertEqual(self._sent(prefixed, "orders"), [])
+        self.assertEqual(len(self._sent({}, "orders")), 3)
+        empty = {"CONVALESCE_AIRFLOW_DAG_ALLOW": " , "}
+        self.assertEqual(len(self._sent(empty, "orders")), 3)
+
+    def test4(self) -> None:
+        """
+        Test that an event about no DAG is not held back by an allow list.
+        """
+        recorder = _Recorder()
+        listener = cealist.build_listener_class(_FAILED_SPEC)(emitter=recorder)
+        env = {"CONVALESCE_AIRFLOW_DAG_ALLOW": "orders"}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            listener.send("on_asset_created", asset=types.SimpleNamespace())
+        self.assertEqual(len(recorder.sent), 1)
+
+
+# #############################################################################
+# Test_next_method1
+# #############################################################################
+
+
+class Test_next_method1(unittest.TestCase):
+    """
+    Test that a task resuming from a deferral says so on every Airflow.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the method Airflow 3 keeps on its private context is sent
+        where Airflow 2 sends it, and that a task not resuming sends none.
+        """
+
+        class TaskInstance:
+            """Stands in for Airflow 3's task instance, which has no field."""
+
+            def __init__(self, next_method: Any) -> None:
+                self.task_id = "wait"
+                self._ti_context_from_server = types.SimpleNamespace(
+                    next_method=next_method
+                )
+
+        payload, _ = cealist.shape(
+            {"task_instance": TaskInstance("execute_complete")}
+        )
+        self.assertEqual(
+            payload["task_instance"]["next_method"], "execute_complete"
+        )
+        payload, _ = cealist.shape({"task_instance": TaskInstance(None)})
+        self.assertNotIn("next_method", payload["task_instance"])
+
+    def test2(self) -> None:
+        """
+        Test that what the task instance says itself, as Airflow 2's does,
+        is left as dumped.
+        """
+        task_instance = types.SimpleNamespace(
+            task_id="wait", next_method="execute_complete"
+        )
+        payload, _ = cealist.shape({"task_instance": task_instance})
+        self.assertEqual(
+            payload["task_instance"]["next_method"], "execute_complete"
+        )
+
 
 # #############################################################################
 # Test_asset_aliases1
@@ -1212,3 +1440,188 @@ class Test_watch_hooks1(unittest.TestCase):
             sys.modules, {"airflow.providers.common.sql.hooks.sql": None}
         ):
             cealist.watch_hooks()
+
+
+# #############################################################################
+# Test_hook_connections1
+# #############################################################################
+
+
+class _WarehouseConnection:
+    """Stands in for a connection that keeps its database in `extra`."""
+
+    conn_type = "snowflake"
+    host = None
+    port = None
+    schema = None
+    extra_dejson = {
+        "database": "MY_DB",
+        "schema": "MY_SCHEMA",
+        "account": "my_account",
+        "token": "s3cret",
+    }
+
+
+class _PythonTask:
+    """Stands in for a `@task`: it names no connection of its own."""
+
+    def __init__(self) -> None:
+        self.task_id = "load"
+
+
+class _PythonTaskInstance:
+    """Stands in for the task instance of a `@task`."""
+
+    def __init__(self) -> None:
+        self.task_id = "load"
+        self.task = _PythonTask()
+
+
+# The listener's own event names and what it holds between a statement and
+# the event that reports it are read below.
+# pylint: disable=protected-access
+_SUCCESS = "on_task_instance_success"
+_SUCCESS_SPEC = {
+    cealist._RUNNING: (
+        "previous_state",
+        "task_instance",
+        "session",
+    ),
+    _SUCCESS: ("previous_state", "task_instance", "session"),
+}
+_INSERT = "insert into big_orders select id from orders where amount > 45"
+
+
+class Test_hook_connections1(unittest.TestCase):
+    """
+    Test that a statement a hook ran names the connection it ran on.
+    """
+
+    def setUp(self) -> None:
+        self.addCleanup(cealist._HOOK_CONNECTIONS.clear)
+        self.addCleanup(cesqlcap.drain)
+
+    def _run(self, hook: Any, statement: str = _INSERT) -> Dict[str, Any]:
+        """
+        Run one task that sends a statement through a hook.
+
+        :param hook: the hook the task's own code built
+        :param statement: what it runs
+        :return: the payload sent when the task succeeded
+        """
+        recorder = _Recorder()
+        listener = cealist.build_listener_class(_SUCCESS_SPEC)(emitter=recorder)
+        task_instance = _PythonTaskInstance()
+        with (
+            unittest.mock.patch.object(
+                cealist, "watch_sql", side_effect=cesqlcap.start
+            ),
+            unittest.mock.patch.object(
+                cealist, "_get_connection", return_value=_WarehouseConnection()
+            ),
+        ):
+            getattr(listener, cealist._RUNNING)(None, task_instance, None)
+            cesqlcap.record(statement, dialect="snowflake", via="airflow_hook")
+            cealist.note_connection(hook, statement)
+            getattr(listener, _SUCCESS)("running", task_instance, None)
+        payload: Dict[str, Any] = recorder.sent[-1]["payload"]
+        return payload
+
+    def test1(self) -> None:
+        """
+        Test that the statement carries its hook's connection id, and the
+        task that connection's coordinates with nothing secret in them.
+        """
+
+        class Hook:
+            """Stands in for a hook built from a connection id."""
+
+            conn_name_attr = "warehouse_conn_id"
+            warehouse_conn_id = "wh"
+
+        payload = self._run(Hook())
+        (row,) = payload["sql_capture"]["statements"]
+        self.assertEqual(row["conn_id"], "wh")
+        self.assertEqual(
+            payload["task_instance"]["task"]["connections"],
+            {
+                "wh": {
+                    "conn_id": "wh",
+                    "conn_type": "snowflake",
+                    "host": None,
+                    "port": None,
+                    "schema": None,
+                    "extra": {"database": "MY_DB", "schema": "MY_SCHEMA"},
+                }
+            },
+        )
+        self.assertNotIn("s3cret", str(payload))
+        self.assertNotIn("my_account", str(payload))
+
+    def test2(self) -> None:
+        """
+        Test that the id is read from `get_conn_id()` where the hook has
+        it, and from any `*_conn_id` attribute where its class names none.
+        """
+
+        class Asked:
+            """Stands in for a newer hook."""
+
+            def get_conn_id(self) -> str:
+                """Return the id the hook was built from."""
+                return "asked"
+
+        class Plain:
+            """Stands in for a hook whose class names no attribute."""
+
+            def __init__(self) -> None:
+                self.jdbc_conn_id = "plain"
+
+        self.assertEqual(cealist.hook_conn_id(Asked()), "asked")
+        self.assertEqual(cealist.hook_conn_id(Plain()), "plain")
+
+    def test3(self) -> None:
+        """
+        Test that a hook naming no connection, or one that raises when
+        asked, leaves the statement as it was and costs the task nothing.
+        """
+
+        class Raises:
+            """Stands in for a hook whose id cannot be read."""
+
+            def get_conn_id(self) -> str:
+                """Raise, as a hook half built would."""
+                raise RuntimeError("no connection")
+
+        self.assertIsNone(cealist.hook_conn_id(object()))
+        self.assertIsNone(cealist.hook_conn_id(Raises()))
+        payload = self._run(Raises())
+        (row,) = payload["sql_capture"]["statements"]
+        self.assertNotIn("conn_id", row)
+        self.assertNotIn("connections", payload["task_instance"]["task"])
+
+    def test4(self) -> None:
+        """
+        Test that a connection Airflow cannot resolve still names itself on
+        the statement, and that a failure reading it drops only that.
+        """
+
+        class Hook:
+            """Stands in for a hook built from a connection id."""
+
+            conn_name_attr = "conn_id"
+            conn_id = "gone"
+
+        with unittest.mock.patch.object(
+            cealist, "coordinates_of", return_value=None
+        ):
+            payload = self._run(Hook())
+        self.assertEqual(
+            payload["sql_capture"]["statements"][0]["conn_id"], "gone"
+        )
+        self.assertNotIn("connections", payload["task_instance"]["task"])
+        with unittest.mock.patch.object(
+            cealist, "coordinates_of", side_effect=RuntimeError("boom")
+        ):
+            payload = self._run(Hook())
+        self.assertEqual(len(payload["sql_capture"]["statements"]), 1)

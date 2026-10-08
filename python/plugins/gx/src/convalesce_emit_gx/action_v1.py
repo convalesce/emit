@@ -38,6 +38,12 @@ class ConvalesceValidationAction(ValidationAction):  # type: ignore[misc]
     type: str = "convalesce_emit"
     name: str = "convalesce_emit"
 
+    # Where this checkpoint's batch lives, for one GX cannot say it of: a
+    # dataframe, or a datasource named for something else.
+    platform: Optional[str] = None
+    dataset_name: Optional[str] = None
+    platform_instance: Optional[str] = None
+
     class Config:
         """Let a non-pydantic emitter be held on the model."""
 
@@ -60,6 +66,9 @@ class ConvalesceValidationAction(ValidationAction):  # type: ignore[misc]
             getattr(self, "_emitter", None),
             datasources=cegxcom.datasources_v1(result),
             result_urls=cegxcom.result_urls_v1(result),
+            named=cegxcom.named_dataset(
+                self.platform, self.dataset_name, self.platform_instance
+            ),
         )
 
     def set_emitter(self, emitter: Optional[cemit.EmitterLike]) -> None:

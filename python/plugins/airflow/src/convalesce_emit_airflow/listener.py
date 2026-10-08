@@ -45,6 +45,10 @@ failures carry `error` alone.
 Credentials are withheld after the dump, the same as for the OpenLineage
 events; see `redact`.
 
+A DAG can be left unreported by name: `CONVALESCE_AIRFLOW_DAG_ALLOW` and
+`CONVALESCE_AIRFLOW_DAG_DENY`, see `dag_reported`. Nothing about such a DAG
+is sent, by this listener or by the OpenLineage transport.
+
 And one field is named rather than walked. A task belongs to a task group,
 and a task group holds its own copy of the whole DAG, so it was 40% of a
 task event and every byte of it appeared elsewhere already. The group's id,
@@ -64,11 +68,11 @@ Import as:
 import convalesce_emit_airflow.listener as cealist
 """
 
+import fnmatch
 import functools
 import importlib
 import inspect
 import logging
-import os
 import re
 from typing import (
     Any,
@@ -86,6 +90,7 @@ from typing import (
 import convalesce_emit as cemit
 import convalesce_emit.source as cesource
 import convalesce_emit.sqlcapture as cesqlcap
+import convalesce_emit_airflow._env as cealenv
 
 _LOG = logging.getLogger(__name__)
 
@@ -93,6 +98,14 @@ TOOL = "airflow"
 
 # The dag the customer schedules to call `run_pending_retries`; see `send`.
 RETRY_DAG_ID = "convalesce_retries"
+
+# Which DAGs are reported, by id: comma-separated shell-style patterns
+# (`*`, `?`, `[abc]`), matched against the whole id with its case kept.
+DAG_ALLOW_ENV = "CONVALESCE_AIRFLOW_DAG_ALLOW"
+DAG_DENY_ENV = "CONVALESCE_AIRFLOW_DAG_DENY"
+# Where a hook's argument names the DAG it is about: on a task instance and
+# a dag run, and on the asset event a task's outlet raised.
+_DAG_ID_FIELDS = ("dag_id", "source_dag_id")
 
 # Where Airflow declares what it will pass. Read as plain modules: asking the
 # listener manager instead builds it, which loads plugins, which imports this
@@ -229,11 +242,10 @@ class _Base:
         :param payload: whatever Airflow handed the hook
         :return: nothing
         """
-        # The dag that asks which retries are approved runs every minute and
-        # is ours, not the customer's: its runs say nothing about theirs.
-        if any(
-            getattr(part, "dag_id", None) == RETRY_DAG_ID
+        if not all(
+            dag_reported(getattr(part, name, None))
             for part in payload.values()
+            for name in _DAG_ID_FIELDS
         ):
             return
         emitter = self.emitter
@@ -247,6 +259,7 @@ class _Base:
             if event in _ENDED:
                 noted = cesqlcap.drain()
                 if noted:
+                    excluded = excluded + name_connections(noted, shaped)
                     shaped["sql_capture"] = cemit.redact_secrets(noted)[0]
             emitter.emit(
                 tool=TOOL,
@@ -303,9 +316,49 @@ _OWN_TABLES = re.compile(
     re.IGNORECASE,
 )
 _WATCH: Dict[str, Any] = {}
+# Each statement a database hook ran, as the core keeps it, to the id of the
+# connection that hook was built from. Kept here because the core notes a
+# statement and knows nothing of Airflow's connections.
+_HOOK_CONNECTIONS: Dict[str, str] = {}
 # Set on the function this module puts in a hook's place, so it is put there
 # once.
 _NOTING = "convalesce_noting"
+
+
+def _patterns(name: str) -> List[str]:
+    """
+    The patterns one of the DAG settings lists.
+
+    :param name: the setting
+    :return: its patterns, none when it is unset or empty
+    """
+    listed = (cealenv.read(name) or "").split(",")
+    return [pattern.strip() for pattern in listed if pattern.strip()]
+
+
+def dag_reported(dag_id: Any) -> bool:
+    """
+    Whether anything about this DAG may be sent.
+
+    The dag that asks which retries are approved runs every minute and is
+    ours, not the customer's: its runs say nothing about theirs. Any other
+    is reported unless `CONVALESCE_AIRFLOW_DAG_DENY` matches its id, or
+    `CONVALESCE_AIRFLOW_DAG_ALLOW` is set and does not. Deny wins over
+    allow. Read on every call, so a setting the scheduler or a worker was
+    given after the plugin loaded still holds.
+
+    :param dag_id: the DAG's id; anything that is not one (an event about
+        no DAG) is reported
+    :return: False for a DAG that is ours or that the settings leave out
+    """
+    if not isinstance(dag_id, str) or not dag_id:
+        return True
+    if dag_id == RETRY_DAG_ID:
+        return False
+    if any(fnmatch.fnmatchcase(dag_id, p) for p in _patterns(DAG_DENY_ENV)):
+        return False
+    allowed = _patterns(DAG_ALLOW_ENV)
+    return not allowed or any(fnmatch.fnmatchcase(dag_id, p) for p in allowed)
 
 
 def send_arguments() -> bool:
@@ -315,9 +368,8 @@ def send_arguments() -> bool:
     :return: False only when `CONVALESCE_SEND_ARGUMENTS` says so
     """
     return (
-        os.environ.get("CONVALESCE_SEND_ARGUMENTS", "").strip().lower()
-        not in _FALSY
-    )
+        cealenv.read("CONVALESCE_SEND_ARGUMENTS") or ""
+    ).strip().lower() not in _FALSY
 
 
 def _own_statement(row: Mapping[str, Any]) -> bool:
@@ -358,6 +410,7 @@ def watch_sql() -> None:
         cesqlcap.ignore(_own_statement)
         cesqlcap.install()
         watch_hooks()
+    _HOOK_CONNECTIONS.clear()
     cesqlcap.start()
 
 
@@ -396,6 +449,7 @@ def watch_hooks() -> None:
             schema=_text(getattr(self, "schema", None)),
             via="airflow_hook",
         )
+        note_connection(self, sql_statement)
         return original(self, cur, sql_statement, *args, **kwargs)
 
     setattr(noted, _NOTING, True)
@@ -405,6 +459,118 @@ def watch_hooks() -> None:
 def _text(value: Any) -> Optional[str]:
     """A value that is text, else nothing."""
     return value if isinstance(value, str) and value else None
+
+
+def hook_conn_id(hook: Any) -> Optional[str]:
+    """
+    The id of the connection a database hook was built from.
+
+    A hook keeps it under the attribute its class names in `conn_name_attr`
+    (`postgres_conn_id`, `snowflake_conn_id`), and the newer ones answer
+    `get_conn_id()` as well.
+
+    :param hook: the hook running a statement
+    :return: the connection id, or None when the hook names none
+    """
+    try:
+        getter = getattr(hook, "get_conn_id", None)
+        found = _text(getter()) if callable(getter) else None
+        if found is None:
+            name = _text(getattr(hook, "conn_name_attr", None))
+            found = _text(getattr(hook, name, None)) if name else None
+        if found is None:
+            found = next(
+                (
+                    value
+                    for name, value in vars(hook).items()
+                    if _is_conn_id(name) and _text(value)
+                ),
+                None,
+            )
+        return found
+    except Exception:  # pylint: disable=broad-exception-caught
+        # A hook class this was never run against; the statement is still
+        # noted, without its connection.
+        return None
+
+
+def note_connection(hook: Any, statement: Any) -> None:
+    """
+    Remember which connection a hook ran a statement on.
+
+    A task written as plain Python names no connection on its operator, so
+    the hook is the only thing that knows where its SQL ran, and with it
+    which database an unqualified table name in that SQL means.
+
+    :param hook: the hook running the statement
+    :param statement: the statement, as the hook was handed it
+    :return: nothing
+    """
+    try:
+        conn_id = hook_conn_id(hook)
+        if conn_id is None or len(_HOOK_CONNECTIONS) >= cesqlcap.MAX_STATEMENTS:
+            return
+        text = statement if isinstance(statement, str) else str(statement)
+        _HOOK_CONNECTIONS.setdefault(text[: cesqlcap.MAX_CHARS], conn_id)
+    except Exception:  # pylint: disable=broad-exception-caught
+        # The task's own statement is about to run; nothing here may stop it.
+        return
+
+
+def name_connections(
+    noted: Dict[str, Any], shaped: Dict[str, Any]
+) -> List[Dict[str, str]]:
+    """
+    Say which connection each noted statement ran on, and where it points.
+
+    Each statement a hook ran gets the `conn_id` of that hook's connection,
+    and the connection's coordinates join the task's `connections`, read
+    and redacted exactly as an operator's own are. A receiver then resolves
+    a statement's unqualified tables in the database of the connection it
+    ran on.
+
+    :param noted: what the core handed over; its statements are named here
+    :param shaped: the payload being sent; its task gains the connections
+    :return: everything redacted from the coordinates added
+    """
+    used: List[str] = []
+    try:
+        for row in noted.get("statements") or []:
+            conn_id = _HOOK_CONNECTIONS.get(row.get("statement"))
+            if conn_id is None:
+                continue
+            row["conn_id"] = conn_id
+            if conn_id not in used:
+                used.append(conn_id)
+        _HOOK_CONNECTIONS.clear()
+        task_instance = shaped.get("task_instance")
+        task = (
+            task_instance.get("task")
+            if isinstance(task_instance, dict)
+            else None
+        )
+        if not isinstance(task, dict):
+            return []
+        known = task.get("connections")
+        known = known if isinstance(known, dict) else {}
+        added: Dict[str, Dict[str, Any]] = {}
+        for conn_id in used:
+            if conn_id in known:
+                continue
+            coordinates = coordinates_of(conn_id)
+            if coordinates is not None:
+                added[conn_id] = coordinates
+        if not added:
+            return []
+        redacted, secrets = cemit.redact_secrets(
+            added, path="task_instance.task.connections"
+        )
+        task["connections"] = {**known, **redacted}
+        return secrets
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # The statements are still worth sending without their connections.
+        _LOG.warning("convalesce: could not read hook connections: %s", exc)
+        return []
 
 
 def shape(
@@ -451,6 +617,14 @@ def shape(
             dumped["dag_run"] = cemit.dump(
                 dag_run, budget=budget, path="task_instance.dag_run"
             )
+    if dumped.get("next_method") is None:
+        try:
+            method = find_next_method(task_instance)
+        except Exception:  # pylint: disable=broad-exception-caught
+            # The same lazy values as the dag run above; not worth the event.
+            method = None
+        if method is not None:
+            dumped["next_method"] = method
     task_dumped = dumped.get("task")
     task = getattr(task_instance, "task", None)
     if task is not None and isinstance(task_dumped, dict):
@@ -498,8 +672,9 @@ def redact(
     `conf`, a pod's `env_vars`, templated SQL. Any of them can hold a
     literal credential. Values under credential-named keys are replaced and
     passwords inside URIs and connection strings masked, the SQL around them
-    kept. A connection's `extra` is never read in the first place (see
-    `connection_coordinates`).
+    kept. Of a connection's `extra` only a fixed list of names is read in
+    the first place (see `connection_coordinates`), and their values pass
+    through here like everything else.
 
     :param out: the payload as shaped
     :param excluded: what the dump already left out
@@ -592,14 +767,33 @@ def context_keys() -> FrozenSet[str]:
 # model, never read for meaning.
 _CONN_ID_SUFFIX = "conn_id"
 
+# What of a connection's `extra` is sent, and nothing else of it ever is:
+# where its tables live and what it runs as. Snowflake keeps its database
+# there, Trino and Databricks their catalog, BigQuery its project, and
+# without them a receiver cannot tell which `orders` a task's SQL means. A
+# fixed list rather than a filter on names, because `extra` is also where
+# the connection types with no password field keep their keys and tokens.
+# The account or host a connection reaches is not on it: it names whose
+# database this is, not which table, and nothing downstream reads it.
+EXTRA_ALLOWED = (
+    "database",
+    "schema",
+    "warehouse",
+    "role",
+    "catalog",
+    "project",
+    "dataset",
+)
+
 
 def connection_coordinates(task: Any) -> Dict[str, Dict[str, Any]]:
     """
     Non-secret coordinates for every connection id the task names.
 
-    `conn_type`, `host`, `port` and `schema` only. Never `password`, never
-    `extra` -- `extra` commonly holds a second copy of the same secrets for
-    the connection types that keep them there instead.
+    `conn_type`, `host`, `port` and `schema`, and of `extra` only the keys
+    in `EXTRA_ALLOWED`. Never `password`, never the rest of `extra` --
+    `extra` commonly holds a second copy of the same secrets for the
+    connection types that keep them there instead.
 
     :param task: the operator instance the hook named
     :return: each resolved connection id to its coordinates
@@ -611,27 +805,75 @@ def connection_coordinates(task: Any) -> Dict[str, Dict[str, Any]]:
     for name, value in data.items():
         if not isinstance(value, str) or not value:
             continue
-        if name != _CONN_ID_SUFFIX and not name.endswith(f"_{_CONN_ID_SUFFIX}"):
+        if not _is_conn_id(name) or value in out:
             continue
-        if value in out:
-            continue
-        try:
-            connection = _get_connection(value)
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            # A connection id that does not resolve -- deleted, or a default
-            # this Airflow never seeded -- is Airflow's business, not a
-            # reason to drop the rest of the event.
-            _LOG.debug(
-                "convalesce: could not read connection %s: %s", value, exc
-            )
-            continue
-        out[value] = {
-            "conn_id": value,
-            "conn_type": getattr(connection, "conn_type", None),
-            "host": getattr(connection, "host", None),
-            "port": getattr(connection, "port", None),
-            "schema": getattr(connection, "schema", None),
-        }
+        coordinates = coordinates_of(value)
+        if coordinates is not None:
+            out[value] = coordinates
+    return out
+
+
+def _is_conn_id(name: Any) -> bool:
+    """Whether an attribute's name says it holds a connection id."""
+    return isinstance(name, str) and (
+        name == _CONN_ID_SUFFIX or name.endswith(f"_{_CONN_ID_SUFFIX}")
+    )
+
+
+def coordinates_of(conn_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Non-secret coordinates of one connection.
+
+    :param conn_id: the connection id to resolve
+    :return: its coordinates, or None when Airflow has no such connection
+    """
+    try:
+        connection = _get_connection(conn_id)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # A connection id that does not resolve -- deleted, or a default
+        # this Airflow never seeded -- is Airflow's business, not a
+        # reason to drop the rest of the event.
+        _LOG.debug("convalesce: could not read connection %s: %s", conn_id, exc)
+        return None
+    found: Dict[str, Any] = {
+        "conn_id": conn_id,
+        "conn_type": getattr(connection, "conn_type", None),
+        "host": getattr(connection, "host", None),
+        "port": getattr(connection, "port", None),
+        "schema": getattr(connection, "schema", None),
+    }
+    try:
+        extra = allowed_extra(connection)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # `extra` is parsed as it is read, and one that is not JSON
+        # raises on some Airflow releases.
+        _LOG.debug("convalesce: could not read extra of %s: %s", conn_id, exc)
+        extra = {}
+    if extra:
+        found["extra"] = extra
+    return found
+
+
+def allowed_extra(connection: Any) -> Dict[str, str]:
+    """
+    The allowed keys of a connection's `extra`, and no other.
+
+    A key is read under its own name and under the prefixed name older
+    providers stored it by, `extra__<conn_type>__<key>`. Only text is kept:
+    anything else there is not a name.
+
+    :param connection: Airflow's own Connection object
+    :return: each allowed key that is set, to its value
+    """
+    extra = getattr(connection, "extra_dejson", None)
+    if not isinstance(extra, dict):
+        return {}
+    prefix = f"extra__{getattr(connection, 'conn_type', None)}__"
+    out: Dict[str, str] = {}
+    for key in EXTRA_ALLOWED:
+        found = extra.get(key) or extra.get(prefix + key)
+        if isinstance(found, str) and found:
+            out[key] = found
     return out
 
 
@@ -818,6 +1060,26 @@ def find_dag_run(task_instance: Any) -> Any:
         dag_run = getattr(value, "dag_run", None)
         if dag_run is not None:
             return dag_run
+    return None
+
+
+def find_next_method(task_instance: Any) -> Optional[str]:
+    """
+    The method a deferred task resumes at, when it is coming back from one.
+
+    Airflow 2 keeps it on the task instance, where the dump finds it.
+    Airflow 3's task instance has no such field: the API server says it on
+    the same private context the dag run is read from in `find_dag_run`.
+    A receiver reads it to tell a task resuming from a task starting, which
+    Airflow reports through the same hook.
+
+    :param task_instance: whatever the hook was handed
+    :return: the method's name, or None for a task that is not resuming
+    """
+    for value in _private_values(task_instance):
+        method = getattr(value, "next_method", None)
+        if isinstance(method, str) and method:
+            return method
     return None
 
 

@@ -1,9 +1,12 @@
 package io.convalesce.emit.spark;
 
 import io.convalesce.emit.Emitter;
+import io.convalesce.emit.Exclusion;
 import io.openlineage.client.OpenLineage;
 import io.openlineage.client.OpenLineageClientUtils;
 import io.openlineage.client.transports.Transport;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.logging.Logger;
 
@@ -57,11 +60,12 @@ public final class ConvalesceTransport extends Transport {
   @Override
   public void emit(OpenLineage.RunEvent event) {
     try {
-      String payload = payload(event);
+      List<Exclusion> masked = new ArrayList<Exclusion>();
+      String payload = payload(event, masked);
       if (!emitter.fits(TOOL, EVENT, payload, sparkVersion)) {
-        payload = withoutLogicalPlan(event, payload);
+        payload = withoutLogicalPlan(event, payload, masked);
       }
-      emitter.emit(TOOL, EVENT, payload, sparkVersion);
+      emitter.emit(TOOL, EVENT, payload, sparkVersion, masked);
       if (ends(event)) {
         // The driver may exit straight after a run ends, and a queued event would go with it.
         emitter.flush();
@@ -92,13 +96,15 @@ public final class ConvalesceTransport extends Transport {
     }
   }
 
-  private String payload(OpenLineage.RunEvent event) {
+  private String payload(OpenLineage.RunEvent event, List<Exclusion> masked) {
     Redaction rule = redaction;
     if (rule == null) {
       rule = Redaction.ofRunningSpark();
       redaction = rule;
     }
-    return "{\"run_event\":" + rule.applyToRunEvent(OpenLineageClientUtils.toJson(event)) + "}";
+    return "{\"run_event\":"
+        + rule.applyToRunEvent(OpenLineageClientUtils.toJson(event), masked)
+        + "}";
   }
 
   /**
@@ -107,7 +113,8 @@ public final class ConvalesceTransport extends Transport {
    * <p>The facet is taken out only while serialising and put back after: another transport in a
    * composite may be handed the same object.
    */
-  private String withoutLogicalPlan(OpenLineage.RunEvent event, String payload) {
+  private String withoutLogicalPlan(
+      OpenLineage.RunEvent event, String payload, List<Exclusion> masked) {
     Map<String, OpenLineage.RunFacet> facets = runFacets(event);
     if (facets == null || !facets.containsKey(LOGICAL_PLAN)) {
       return payload;
@@ -120,7 +127,7 @@ public final class ConvalesceTransport extends Transport {
       return payload;
     }
     try {
-      String smaller = payload(event);
+      String smaller = payload(event, masked);
       LOG.warning(
           "convalesce: an OpenLineage event was "
               + payload.length()

@@ -179,6 +179,80 @@ class Test_transport1(unittest.TestCase):
 
 
 # #############################################################################
+# Test_transport_dag_filter1
+# #############################################################################
+
+
+class Test_transport_dag_filter1(unittest.TestCase):
+    """
+    Test that a DAG the listener leaves unreported sends no lineage either.
+    """
+
+    @staticmethod
+    def _sent(run_event: Dict[str, Any], env: Dict[str, str]) -> int:
+        """
+        How many observations one event becomes under these settings.
+
+        :param run_event: the event the provider built
+        :param env: the settings in force
+        :return: the number forwarded
+        """
+        recorder = _Recorder()
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            cealol.ConvalesceTransport(emitter=recorder).emit(run_event)
+        return len(recorder.sent)
+
+    def test1(self) -> None:
+        """
+        Test that an event is left out by the DAG its job is named for, a
+        task's and a DAG run's alike.
+        """
+        env = {"CONVALESCE_AIRFLOW_DAG_DENY": "orders"}
+        task = _run_event()
+        self.assertEqual(self._sent(task, env), 0)
+        dag_run = _run_event()
+        dag_run["job"]["name"] = "orders"
+        self.assertEqual(self._sent(dag_run, env), 0)
+        other = _run_event()
+        other["job"]["name"] = "billing.load"
+        self.assertEqual(self._sent(other, env), 1)
+        self.assertEqual(self._sent(task, {}), 1)
+
+    def test2(self) -> None:
+        """
+        Test that the provider's own facet names the DAG over the job name:
+        a DAG id may hold a dot, and the name alone would split it there.
+        """
+        env = {"CONVALESCE_AIRFLOW_DAG_DENY": "team.orders"}
+        task = _run_event()
+        task["job"]["name"] = "team.orders.load"
+        self.assertEqual(self._sent(task, env), 1)
+        task["run"]["facets"]["airflow"] = {"dag": {"dag_id": "team.orders"}}
+        self.assertEqual(self._sent(task, env), 0)
+        dag_run = _run_event()
+        dag_run["job"]["name"] = "team.orders"
+        dag_run["run"]["facets"]["airflowDagRun"] = {
+            "dagRun": {"dag_id": "team.orders"}
+        }
+        self.assertEqual(self._sent(dag_run, env), 0)
+
+    def test3(self) -> None:
+        """
+        Test that the dag that asks which retries are approved is left out
+        here as it is by the listener, and that an event naming no job is
+        still forwarded.
+        """
+        ours = _run_event()
+        ours["job"]["name"] = "convalesce_retries.run"
+        self.assertEqual(self._sent(ours, {}), 0)
+        unnamed = _run_event()
+        del unnamed["job"]["name"]
+        env = {"CONVALESCE_AIRFLOW_DAG_ALLOW": "orders"}
+        self.assertEqual(self._sent(unnamed, env), 1)
+        self.assertIsNone(cealol.dag_id_of("not an event"))
+
+
+# #############################################################################
 # Test_enable1
 # #############################################################################
 

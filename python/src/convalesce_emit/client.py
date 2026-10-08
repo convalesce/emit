@@ -20,6 +20,7 @@ import convalesce_emit.client as ceclient
 """
 
 import atexit
+import dataclasses
 import gzip
 import json
 import logging
@@ -64,6 +65,11 @@ _MAX_BACKOFF_SECONDS = 30
 # few bytes a chunk's own `chunk_index`/`chunk_count` add over the shell
 # probe used to size that budget (see `_chunk`).
 _CHUNK_SAFETY_MARGIN = 64
+# A key shorter than this is not looked for in what is sent: a few characters
+# turn up in ordinary text, and masking them would mangle it.
+_MIN_KEY_LENGTH = 8
+_KEY_MASK = "***"
+_KEY_REASON = "ingest key masked"
 
 
 # #############################################################################
@@ -85,6 +91,11 @@ class Emitter:
         self._lock = threading.Lock()
         self._batch: List[ceenvelo.Observation] = []
         self._batch_bytes = 0
+        # The key as it reads inside JSON text, to keep it out of every body.
+        key = str(self.config.ingest_key or "")
+        self._key_json = (
+            json.dumps(key)[1:-1] if len(key) >= _MIN_KEY_LENGTH else ""
+        )
         self._spool = cespool.Spool(
             self.config.spool_directory(), self.config.spool_max_bytes
         )
@@ -135,12 +146,44 @@ class Emitter:
             tool_version=tool_version,
             excluded=excluded,
         )
-        size = len(_encode(observation))
+        encoded = _encode(observation)
+        if self._key_json and self._key_json.encode("ascii") in encoded:
+            observation = self._without_key(observation)
+            encoded = _encode(observation)
+        size = len(encoded)
         if size + _BODY_OVERHEAD > self.config.max_body_bytes:
             for chunk in self._chunk(observation, size):
                 self._enqueue_one(chunk)
             return
         self._enqueue_one(observation)
+
+    def _without_key(
+        self, observation: ceenvelo.Observation
+    ) -> ceenvelo.Observation:
+        """
+        Mask this emitter's own ingest key wherever an observation holds it.
+
+        The key belongs in the `Authorization` header and nowhere else. A
+        tool can still hand it over inside what it reports: a setting that
+        carries the environment, or a script with the key written into it.
+
+        :param observation: an observation whose encoding holds the key
+        :return: it, with the key masked and the masking declared
+        """
+
+        def _masked(value: Any) -> Any:
+            text = json.dumps(value, default=str)
+            if self._key_json not in text:
+                return value
+            return json.loads(text.replace(self._key_json, _KEY_MASK))
+
+        return dataclasses.replace(
+            observation,
+            payload=_masked(observation.payload),
+            tool_version=_masked(observation.tool_version),
+            excluded=_masked(observation.excluded)
+            + [{"path": "$", "reason": _KEY_REASON}],
+        )
 
     def _chunk(
         self, observation: ceenvelo.Observation, whole_size: int
@@ -262,8 +305,10 @@ class Emitter:
         if not batch:
             return
         if self.config.dry_run:
+            level = _dry_run_level()
             for observation in batch:
-                _LOG.info(
+                _LOG.log(
+                    level,
                     "convalesce dry-run: %s",
                     json.dumps(observation.to_dict(), default=str),
                 )
@@ -442,6 +487,31 @@ def post(config: ceconfig.Config, url: str, body: bytes) -> None:
         raise ceerrors.TransportError(
             f"could not reach {url}: {exc.reason}"
         ) from exc
+
+
+def _dry_run_level() -> int:
+    """
+    The level a dry run's observations are logged at, so they are seen.
+
+    Printing them is all a dry run is for, and it is asked for by name, so
+    the level is whichever one gets them printed. Where the host process
+    shows INFO from this logger they go out at INFO, no louder than the
+    rest of what it prints. Where it does not they go out as warnings:
+    with no logging set up, as in a Dagster code server, Python drops INFO
+    and prints WARNING and above to stderr, and under Prefect a handler is
+    there but takes warnings only.
+
+    :return: `logging.INFO` when this logger passes INFO and a handler it
+        reaches takes it, else `logging.WARNING`
+    """
+    if not _LOG.isEnabledFor(logging.INFO):
+        return logging.WARNING
+    logger: Optional[logging.Logger] = _LOG
+    while logger is not None:
+        if any(handler.level <= logging.INFO for handler in logger.handlers):
+            return logging.INFO
+        logger = logger.parent if logger.propagate else None
+    return logging.WARNING
 
 
 def _flush_at_exit(ref: "weakref.ReferenceType[Emitter]") -> None:

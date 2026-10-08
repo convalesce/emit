@@ -8,7 +8,7 @@ columns each job read and wrote.
 Two lines of Spark config:
 
 ```
-spark.jars.packages   io.convalesce:convalesce-emit-spark_2.12:0.2.0
+spark.jars.packages   io.convalesce:convalesce-emit-spark_2.12:0.2.1
 spark.extraListeners  io.convalesce.emit.spark.ConvalesceSparkListener
 ```
 
@@ -16,7 +16,7 @@ Or on the command line:
 
 ```sh
 spark-submit \
-  --packages io.convalesce:convalesce-emit-spark_2.12:0.2.0 \
+  --packages io.convalesce:convalesce-emit-spark_2.12:0.2.1 \
   --conf spark.extraListeners=io.convalesce.emit.spark.ConvalesceSparkListener \
   your_job.py
 ```
@@ -32,7 +32,16 @@ Configure it with the same environment variables the Python client uses:
 `CONVALESCE_MAX_BODY_BYTES`, `CONVALESCE_SPOOL_DIR`,
 `CONVALESCE_SPOOL_MAX_BYTES`. `CONVALESCE_FLUSH_INTERVAL` (seconds, default
 `5`) sends a part batch in the background, and the JVM's shutdown sends what
-is left.
+is left. With `CONVALESCE_DRY_RUN=true` each observation is logged as one
+`convalesce dry-run: {...}` line; what is flushed as the JVM shuts down,
+such as the application's end for a driver that failed with its session
+still open, is written straight to stderr, in the same form.
+
+AWS Glue hands a job only the variables whose names start with `CUSTOMER_`,
+so every setting here is also read with that in front. Give them in the job
+parameter `--customer-driver-env-vars`, separated by commas:
+`CUSTOMER_CONVALESCE_INGEST_KEY=...,CUSTOMER_CONVALESCE_ENDPOINT=...`. A
+setting given under both names is read from its own.
 
 One setting is Spark's own: `CONVALESCE_SPARK_EVENTS`. By default the
 listener forwards what describes a run, which is the application, the jobs
@@ -76,9 +85,14 @@ What the listener sets, on the driver's own configuration and only where the job
 | --- | --- | --- |
 | `spark.openlineage.transport.type` | `convalesce` | sends each event through this jar |
 | `spark.openlineage.columnLineage.datasetLineageEnabled` | `true` | the columns a join, filter or grouping read are reported once for the table |
+| `spark.openlineage.capturedProperties` | `spark.master,spark.app.name,spark.glue.JOB_NAME,spark.glue.JOB_RUN_ID` | on AWS Glue, names the job and the run whatever the script calls its application |
+| `spark.openlineage.facets.custom_environment_variables` | `[AWS_DEFAULT_REGION;GLUE_VERSION;GLUE_COMMAND_CRITERIA;GLUE_PYTHON_VERSION;]` | on AWS Glue only: the region and the Glue version the run used |
 
-Every other `spark.openlineage.*` setting is yours and is kept: `namespace`, `appName`,
-`capturedProperties`, the parent job settings an orchestrator adds.
+Every other `spark.openlineage.*` setting is yours and is kept: `namespace`, `appName`, the parent
+job settings an orchestrator adds.
+
+The driver's log says in one line when a job will send no table or column lineage and why: a
+warning when OpenLineage-Spark is not on the classpath, a note when the job runs its own.
 
 Column lineage follows the plan. A column computed by a Python UDF is traced to the columns passed
 to the UDF. Code that leaves the plan, an RDD `map` or a `collect()` whose rows are written back,
@@ -115,6 +129,21 @@ A job start carries the job's whole Spark configuration, and OpenLineage copies 
 in `spark.openlineage.capturedProperties`. Both are redacted before anything leaves the driver, by
 Spark's own rule: a value is replaced with `*********(redacted)` when its key or the value itself
 matches `spark.redaction.regex`.
+
+Convalesce's own key is held to more than that rule:
+
+- A setting whose name holds `ingest_key`, `ingest.key` or `ingestkey`, in any case, is redacted
+  whatever `spark.redaction.regex` is set to. That covers
+  `spark.yarn.appMasterEnv.CONVALESCE_INGEST_KEY` and `spark.executorEnv.CONVALESCE_INGEST_KEY`.
+- A value that lists `NAME=value` entries has the value of each entry with such a name, or a name
+  the rule matches, replaced with `***` and the rest kept. On AWS Glue
+  `spark.glue.customer-driver-env-vars` is sent as
+  `CUSTOMER_CONVALESCE_ENDPOINT=...,CUSTOMER_CONVALESCE_INGEST_KEY=***`. The observation's
+  `excluded` names the setting, as
+  `{"path": "Properties.spark.glue.customer-driver-env-vars", "reason": "ingest key masked"}`.
+- The key's exact value is masked (`***`) anywhere else in an observation, and that observation's
+  `excluded` says `{"path": "$", "reason": "ingest key masked"}`. The key travels in the
+  `Authorization` header only. A key under 8 characters is too short to look for.
 
 ## Why it is small
 

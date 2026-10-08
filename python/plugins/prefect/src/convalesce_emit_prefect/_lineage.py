@@ -28,11 +28,12 @@ import convalesce_emit_prefect._lineage as celin
 
 import collections
 import importlib
-import logging
 import threading
 from typing import Any, Dict, List, Optional, Sequence, Union
 
-_LOG = logging.getLogger(__name__)
+import convalesce_emit_prefect._mask as cemask
+
+_LOG = cemask.logger(__name__)
 
 DEFAULT_ENV = "PROD"
 
@@ -72,7 +73,8 @@ def lineage(
     with a warning rather than raised: a task must not fail over this.
 
     :param inputs: datasets read, each a urn or `{"platform": str, "name":
-        str, "env": str}`, `env` defaulting to `PROD`
+        str, "env": str}`, `env` defaulting to `PROD`, with
+        `"platform_instance": str` where the platform has more than one
     :param outputs: datasets written, the same way
     :return: nothing
     """
@@ -157,9 +159,10 @@ def normalise(item: Any) -> Optional[Dataset]:
     """
     One declared dataset, as it is sent.
 
-    :param item: a urn, or `{"platform", "name", "env"}`
-    :return: the urn as given, or the mapping with `env` filled in; None
-        for anything else
+    :param item: a urn, or `{"platform", "name", "env"}`, with a
+        `platform_instance` where the platform has more than one
+    :return: the urn as given, or the mapping with `env` filled in and its
+        `platform_instance` kept; None for anything else
     """
     if isinstance(item, str) and item:
         return item
@@ -169,7 +172,11 @@ def normalise(item: Any) -> Optional[Dataset]:
         env = item.get("env") or DEFAULT_ENV
         if isinstance(platform, str) and isinstance(name, str):
             if platform and name and isinstance(env, str):
-                return {"platform": platform, "name": name, "env": env}
+                dataset = {"platform": platform, "name": name, "env": env}
+                instance = item.get("platform_instance")
+                if isinstance(instance, str) and instance:
+                    dataset["platform_instance"] = instance
+                return dataset
     _LOG.warning("convalesce: ignoring lineage dataset %r", item)
     return None
 

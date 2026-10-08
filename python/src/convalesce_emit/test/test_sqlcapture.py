@@ -143,6 +143,66 @@ class Test_record1(_Case):
             self.assertEqual(cesqlcap.install(), [])
 
 
+class Test_where1(_Case):
+    """
+    Test asking a connection which database it is on.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a DuckDB-style connection is asked once, that each
+        statement carries the answer, and that one that cannot be asked is
+        left alone.
+        """
+        asked: List[str] = []
+
+        class Connection:
+            """A stand-in for a connection that answers where it is."""
+
+            def __init__(self, answers: bool) -> None:
+                self.answers = answers
+
+            def execute(self, operation: Any, params: Any = None) -> Any:
+                """Run a statement."""
+                del params
+                asked.append(operation)
+                if "current_database" in operation and not self.answers:
+                    raise RuntimeError("closed")
+                return self
+
+            def fetchone(self) -> Any:
+                """The row the last statement gave."""
+                return ("probe", "main")
+
+        cesqlcap._ANSWERED.clear()
+        self.assertTrue(
+            cesqlcap._wrap_method(Connection, "execute", "duckdb", "duckdb")
+        )
+        connection = Connection(answers=True)
+        connection.execute("insert into shop.orders select 1")
+        connection.execute("insert into shop.orders select 2")
+        self.assertEqual(
+            [text for text in asked if "current_database" in text],
+            [cesqlcap._ASKED["duckdb"]],
+        )
+        silent = Connection(answers=False)
+        silent.execute("insert into shop.refunds select 3")
+        silent.execute("insert into shop.refunds select 4")
+        self.assertEqual(len([t for t in asked if "current_database" in t]), 2)
+        taken = cesqlcap.drain()
+        assert taken is not None
+        where = {
+            one["statement"]: (one["database"], one["schema"])
+            for one in taken["statements"]
+        }
+        self.assertEqual(
+            where["insert into shop.orders select 1"], ("probe", "main")
+        )
+        self.assertEqual(
+            where["insert into shop.refunds select 3"], (None, None)
+        )
+
+
 class Test_wrap_method1(_Case):
     """
     Test wrapping a driver's `execute`.

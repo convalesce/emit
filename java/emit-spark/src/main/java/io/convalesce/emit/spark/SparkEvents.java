@@ -1,5 +1,6 @@
 package io.convalesce.emit.spark;
 
+import io.convalesce.emit.Config;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
@@ -50,7 +51,7 @@ final class SparkEvents {
    * @return what to forward
    */
   static SparkEvents fromEnvironment() {
-    return of(System.getenv(VARIABLE));
+    return of(Config.setting(VARIABLE));
   }
 
   /**

@@ -21,17 +21,24 @@ Import as:
 import convalesce_emit_prefect.hooks as cephooks
 """
 
+import asyncio
+import collections
+import importlib
 import json
-import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+import threading
+import time
+import types
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import convalesce_emit as cemit
 import convalesce_emit_prefect._capture as cecap
+import convalesce_emit_prefect._env as ceprefenv
 import convalesce_emit_prefect._lineage as celin
+import convalesce_emit_prefect._mask as cemask
 
-_LOG = logging.getLogger(__name__)
+_LOG = cemask.logger(__name__)
 
 # Dagster and Prefect both forward a hook payload with the same five-line
 # call to `cemit.send_one`, differing only in their constants. Pulling that
@@ -61,8 +68,26 @@ _TASK_RUN_PAGE_BACKSTOP = 50
 
 # A state's data is what the flow or task returned -- the customer's own
 # data, which never crosses -- or, on a failure, the exception, which crosses
-# as `error_detail` instead. The run objects carry their own copy of it.
-_SKIP = frozenset({"state.data", "flow_run.state.data", "task_run.state.data"})
+# as `error_detail` instead. The run objects carry their own copy of it, and
+# so does the API's record of a run: for a persisted result, where it is
+# stored, which on local storage is a path under somebody's home directory.
+_SKIP = frozenset(
+    {
+        "state.data",
+        "flow_run.state.data",
+        "task_run.state.data",
+        "api_flow_run.state.data",
+    }
+)
+# The same, for a run inside a list of them (`api_task_runs`), which a
+# dotted path cannot name: taken out of the dumped payload, by this reason.
+_EXCLUDED_BY_NAME = "excluded by name"
+
+# Prefect Cloud says who started a run: a user's id and handle. What kind of
+# thing started it (a user, a deployment, an automation) is about the run;
+# who it was is about a person, and stays behind.
+_CREATED_BY = "created_by"
+_CREATED_BY_CARRIERS = ("flow_run", "api_flow_run")
 
 # What a task returned stays out, with one exception: a short scalar, or a
 # short list of them, is how a task that starts a run elsewhere usually hands
@@ -98,6 +123,53 @@ _PARAMETER_SCHEMA = ("flow", "parameters", "properties")
 _PARAMETERS_WITHHELD = "parameter values withheld"
 # Stamped by `cemit.dump` on a mapping something else points at; kept as is.
 _REF_ID = "$id"
+_CREATED_BY_KEPT = frozenset({"type", _REF_ID, "$ref"})
+
+# Where Prefect keeps what it is configured with, whichever of a profile and
+# the environment said so.
+_SETTINGS = "prefect.settings"
+_API_URL_ENV = "PREFECT_API_URL"
+
+# The run's graph. `graph-v2` is served by every supported server and, on
+# Prefect Cloud, answers while the run is still going; the older endpoint
+# there is empty until task runs are listed and then fails until some
+# seconds after the run ends. Each crosses under its own name, since the
+# two are shaped differently, and the older one only where the newer one
+# did not answer.
+GRAPH = "api_flow_run_graph"
+GRAPH_V2 = "api_flow_run_graph_v2"
+TASK_RUNS = "api_task_runs"
+# All of the newer graph that is read. It also carries the run's artifacts,
+# which are customer-authored and never cross.
+_GRAPH_FIELDS = ("start_time", "end_time", "root_node_ids", "states")
+_GRAPH_NODE_FIELDS = (
+    "kind",
+    "id",
+    "label",
+    "state_type",
+    "start_time",
+    "end_time",
+    "parents",
+    "children",
+    "encapsulating",
+)
+_TASK_RUN_NODE = "task-run"
+
+# Prefect 3 reports a task run to the API after the fact, so the API lists a
+# run's task runs a second or three late, and a fast flow's last hook could
+# find none of them. That hook fires once the flow's own work is done, so it
+# alone waits for the list to catch up: until every task run the graph or
+# this process knows of is listed in a state that ended it, re-reading after
+# each of these waits and never past the budget in total.
+_FINAL_STATES = frozenset({"COMPLETED", "FAILED", "CRASHED", "CANCELLED"})
+_COMPLETE_READ_BUDGET_SECONDS = 5.0
+_COMPLETE_READ_WAITS = (0.25, 0.5, 1.0, 1.5, 1.5)
+# The task runs each flow run's task hooks fired for in this process, which
+# is the first the plugin hears of them. Forgotten when the flow run's last
+# hook reads them, and beyond this many flow runs, oldest first.
+_HOOKED_FLOW_RUNS = 256
+_HOOKED_LOCK = threading.Lock()
+_HOOKED: "collections.OrderedDict[str, Set[str]]" = collections.OrderedDict()
 
 # A Prefect Cloud API URL names the account and the workspace in its own
 # path; nothing about a run has to be read to find them.
@@ -105,6 +177,15 @@ _CLOUD_URL_RE = re.compile(
     r"^https://api\.prefect\.cloud/api/accounts/(?P<account>[^/]+)"
     r"/workspaces/(?P<workspace>[^/]+)/?"
 )
+
+# A workspace's name is not in the URL: Prefect Cloud is asked for it, once
+# per process, and the answer or the lack of one is kept. The first event
+# waits this long for it at most; a read still running after that is left
+# to finish on its own and its answer rides on the events that follow.
+_CLOUD_CLIENT = "prefect.client.cloud"
+_WORKSPACE_NAME_TIMEOUT_SECONDS = 3.0
+_WORKSPACE_NAME_LOCK = threading.Lock()
+_WORKSPACE_NAMES: Dict[str, Dict[str, str]] = {}
 
 
 def _emit(  # pylint: disable=too-many-arguments
@@ -139,7 +220,8 @@ def _emit(  # pylint: disable=too-many-arguments
             dumped, withheld = bound_parameters(dumped)
         else:
             dumped, withheld = withhold_parameters(dumped)
-        withheld = list(cut or []) + withheld
+        dumped, private = withhold_private(dumped)
+        withheld = list(cut or []) + withheld + private
         # A run's job variables, its parameters and a task's arguments are
         # whatever launched it typed, and any can hold a literal credential;
         # so can a statement that creates a user or a connection.
@@ -171,7 +253,7 @@ def send_parameters() -> bool:
     :return: what `CONVALESCE_PREFECT_SEND_PARAMETERS` says where it is set
         to a yes or a no; otherwise whether arguments are sent at all
     """
-    raw = os.environ.get(_SEND_PARAMETERS_ENV, "").strip().lower()
+    raw = (ceprefenv.read(_SEND_PARAMETERS_ENV) or "").strip().lower()
     if raw in _TRUTHY:
         return True
     if raw in _FALSY:
@@ -254,6 +336,56 @@ def _type_marker(value: Any) -> str:
 
 
 # #############################################################################
+# Private
+# #############################################################################
+
+
+def withhold_private(body: Any) -> Tuple[Any, List[Dict[str, str]]]:
+    """
+    Take out of a dumped payload what names a person or a place on disk.
+
+    Who started a run keeps only its `type`. A run in a list of runs loses
+    its state's data, as the runs named in `_SKIP` already have.
+
+    :param body: the dumped payload
+    :return: the same payload, and what was taken out, by path and reason
+    """
+    excluded: List[Dict[str, str]] = []
+    if not isinstance(body, dict):
+        return body, excluded
+    for carrier in _CREATED_BY_CARRIERS:
+        holder = body.get(carrier)
+        if not isinstance(holder, dict) or holder.get(_CREATED_BY) is None:
+            continue
+        path = f"{carrier}.{_CREATED_BY}"
+        who = holder[_CREATED_BY]
+        if not isinstance(who, dict):
+            # Dumped as its text, which would name the person all the same.
+            del holder[_CREATED_BY]
+            excluded.append({"path": path, "reason": _EXCLUDED_BY_NAME})
+            continue
+        for name in [each for each in who if each not in _CREATED_BY_KEPT]:
+            del who[name]
+            excluded.append(
+                {"path": f"{path}.{name}", "reason": _EXCLUDED_BY_NAME}
+            )
+    for name, runs in body.items():
+        if not isinstance(runs, list):
+            continue
+        for index, run in enumerate(runs):
+            state = run.get("state") if isinstance(run, dict) else None
+            if isinstance(state, dict) and state.get("data") is not None:
+                del state["data"]
+                excluded.append(
+                    {
+                        "path": f"{name}[{index}].state.data",
+                        "reason": _EXCLUDED_BY_NAME,
+                    }
+                )
+    return body, excluded
+
+
+# #############################################################################
 # Result text
 # #############################################################################
 
@@ -265,7 +397,7 @@ def send_result() -> bool:
 
     :return: whether `CONVALESCE_PREFECT_SEND_RESULT` is not set falsy
     """
-    raw = os.environ.get(_SEND_RESULT_ENV, "")
+    raw = ceprefenv.read(_SEND_RESULT_ENV) or ""
     return raw.strip().lower() not in _FALSY
 
 
@@ -389,7 +521,7 @@ def api_reads_enabled() -> bool:
 
     :return: whether this event should also read the API
     """
-    raw = os.environ.get(_API_READS_ENV, "")
+    raw = ceprefenv.read(_API_READS_ENV) or ""
     return raw.strip().lower() not in _FALSY
 
 
@@ -402,6 +534,9 @@ def api_state(payload: Dict[str, Any]) -> Dict[str, Any]:
     API that is unreachable, or Prefect being entirely absent all mean this
     returns less, never that the event fails to send.
 
+    Only the event a flow run ends with waits on the API, and only for its
+    list of task runs to catch up: see `_read_run`.
+
     :param payload: the hook's own arguments, not yet dumped
     :return: whatever could be read, empty when reads are off, Prefect is
         absent, or nothing resolved
@@ -411,6 +546,9 @@ def api_state(payload: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     workspace = cloud_workspace()
     if workspace:
+        name = cloud_workspace_name(workspace["workspace_id"])
+        if name:
+            workspace["workspace_name"] = name
         out["api_cloud_workspace"] = workspace
     flow_run = payload.get("flow_run")
     flow = payload.get("flow")
@@ -436,12 +574,7 @@ def api_state(payload: Dict[str, Any]) -> Dict[str, Any]:
                 flow_run_record = _call(client, "read_flow_run", flow_run_id)
                 if flow_run_record is not None:
                     out["api_flow_run"] = flow_run_record
-                graph = _read_graph(client, flow_run_id)
-                if graph is not None:
-                    out["api_flow_run_graph"] = graph
-                task_runs = _read_task_runs(client, flow_run_id)
-                if task_runs:
-                    out["api_task_runs"] = task_runs
+                out.update(_read_run(client, flow_run_id, payload))
             deployment_id = _text_id(getattr(flow_run, "deployment_id", None))
             if deployment_id:
                 deployment = _read_deployment(client, deployment_id)
@@ -530,10 +663,215 @@ def _read_deployment(client: Any, deployment_id: str) -> Dict[str, Any]:
     return out
 
 
+def _read_run(
+    client: Any, flow_run_id: str, payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    The run's graph and its task runs, as the API has them now; at the hook
+    that ends the flow run, as the API has them once it has caught up.
+
+    :param client: the sync API client
+    :param flow_run_id: the flow run's id
+    :param payload: the hook's own arguments, which say whether this is the
+        hook that ends the flow run
+    :return: `GRAPH_V2`, or `GRAPH` where the server did not answer for
+        it, and `TASK_RUNS`; each only when it was read
+    """
+    started = time.monotonic()
+    graph = _read_graph_v2(client, flow_run_id)
+    task_runs = _read_task_runs(client, flow_run_id)
+    if _ends_flow_run(payload):
+        known = _take_hooked(flow_run_id) | _tracked_task_runs(flow_run_id)
+        took = time.monotonic() - started
+        for wait in _COMPLETE_READ_WAITS:
+            if not _incomplete(graph, task_runs, known):
+                break
+            # Another round costs its wait and a read like the last one.
+            spent = time.monotonic() - started
+            if spent + wait + took > _COMPLETE_READ_BUDGET_SECONDS:
+                _LOG.debug(
+                    "convalesce: the API still lists flow run %s's task "
+                    "runs incompletely after %.1fs",
+                    flow_run_id,
+                    spent,
+                )
+                break
+            time.sleep(wait)
+            again = time.monotonic()
+            graph = _read_graph_v2(client, flow_run_id) or graph
+            task_runs = _read_task_runs(client, flow_run_id) or task_runs
+            took = time.monotonic() - again
+    out: Dict[str, Any] = {}
+    if graph is not None:
+        out[GRAPH_V2] = graph
+    else:
+        legacy = _read_graph(client, flow_run_id)
+        if legacy is not None:
+            out[GRAPH] = legacy
+    if task_runs:
+        out[TASK_RUNS] = task_runs
+    return out
+
+
+def _ends_flow_run(payload: Dict[str, Any]) -> bool:
+    """
+    Whether an event is the one a flow run ends with: a flow hook's, on a
+    state that is final.
+
+    :param payload: the hook's own arguments
+    :return: False for any task hook and for a flow that is still running
+    """
+    if "task" in payload or "task_run" in payload:
+        return False
+    state = payload.get("state")
+    return _state_type(getattr(state, "type", None)) in _FINAL_STATES
+
+
+def _state_type(value: Any) -> str:
+    """
+    A state's type as plain text, whichever way Prefect gave it.
+
+    :param value: an enum member, its value, or its text
+    :return: `COMPLETED`, `RUNNING` and so on; empty for nothing
+    """
+    if value is None:
+        return ""
+    return str(getattr(value, "value", value)).rsplit(".", 1)[-1].upper()
+
+
+def _field(record: Any, name: str) -> Any:
+    """
+    One field of an API record, typed or raw.
+
+    :param record: a client model, or the mapping a raw read returned
+    :param name: the field
+    :return: its value, or None
+    """
+    if isinstance(record, dict):
+        return record.get(name)
+    return getattr(record, name, None)
+
+
+def _incomplete(graph: Any, task_runs: List[Any], known: Set[str]) -> bool:
+    """
+    Whether the API's list of a finished flow run's task runs is still
+    behind: a task run the graph or this process knows of is not listed, or
+    one that is listed has not ended.
+
+    :param graph: the run's graph, as `_read_graph_v2` returns it, or None
+    :param task_runs: the task runs the API listed
+    :param known: the ids of task runs this process saw run
+    :return: whether reading again could say more
+    """
+    listed: Set[str] = set()
+    for run in task_runs:
+        if _state_type(_field(run, "state_type")) not in _FINAL_STATES:
+            return True
+        listed.add(str(_field(run, "id")))
+    expected = set(known)
+    for node in (graph or {}).get("nodes", []):
+        if node.get("kind") == _TASK_RUN_NODE and node.get("id"):
+            expected.add(str(node["id"]))
+    return bool(expected - listed)
+
+
+def _note_hooked(task_run: Any) -> None:
+    """
+    Remember that a task hook fired for a task run of a flow run.
+
+    :param task_run: the task run the hook was given
+    :return: nothing
+    """
+    flow_run_id = _text_id(getattr(task_run, "flow_run_id", None))
+    run_id = _text_id(getattr(task_run, "id", None))
+    if not flow_run_id or not run_id:
+        return
+    with _HOOKED_LOCK:
+        _HOOKED.setdefault(flow_run_id, set()).add(run_id)
+        _HOOKED.move_to_end(flow_run_id)
+        while len(_HOOKED) > _HOOKED_FLOW_RUNS:
+            _HOOKED.popitem(last=False)
+
+
+def _take_hooked(flow_run_id: str) -> Set[str]:
+    """
+    Hand over, and forget, the task runs whose hooks fired for a flow run.
+
+    :param flow_run_id: the flow run's id
+    :return: their ids; empty when no task of the run is hooked, or its
+        tasks ran in another process
+    """
+    with _HOOKED_LOCK:
+        return _HOOKED.pop(flow_run_id, set())
+
+
+def _tracked_task_runs(flow_run_id: str) -> Set[str]:
+    """
+    The task runs whose results Prefect is tracking for the running flow:
+    what one task returned and another was handed. This names a task run no
+    hook is attached to.
+
+    Read from the flow run context, which is still set while the flow's
+    last hook fires: `run_results` on Prefect 3, `task_run_results` on 2.
+
+    :param flow_run_id: the flow run's id
+    :return: their ids; empty outside that flow run, or without Prefect
+    """
+    found: Set[str] = set()
+    try:
+        context = importlib.import_module(_FLOW_CONTEXT).FlowRunContext.get()
+        running = getattr(getattr(context, "flow_run", None), "id", None)
+        if _text_id(running) != flow_run_id:
+            return found
+        for name in ("run_results", "task_run_results"):
+            results = getattr(context, name, None)
+            if not isinstance(results, dict):
+                continue
+            for entry in results.values():
+                # Prefect 3 keeps the state first in a tuple; 2 keeps it bare.
+                state = entry[0] if isinstance(entry, tuple) and entry else entry
+                details = getattr(state, "state_details", None)
+                run_id = _text_id(getattr(details, "task_run_id", None))
+                if run_id:
+                    found.add(run_id)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: could not read the tracked task runs: %s", exc)
+    return found
+
+
+def _read_graph_v2(client: Any, flow_run_id: str) -> Optional[Dict[str, Any]]:
+    """
+    The run's graph of task runs and subflow runs, each node naming its
+    parents: `graph-v2`, which Prefect 2.20 and every 3.x server serve and
+    no client has a typed method for.
+
+    Only the fields in `_GRAPH_FIELDS` and `_GRAPH_NODE_FIELDS` are kept.
+    The API pairs each node with its id; the node, which carries the id
+    too, is what is kept.
+
+    :param client: the sync API client
+    :param flow_run_id: the flow run's id
+    :return: the graph; None when the server did not answer with one
+    """
+    body = _get(client, f"/flow_runs/{flow_run_id}/graph-v2")
+    if not isinstance(body, dict) or not isinstance(body.get("nodes"), list):
+        return None
+    graph = {name: body[name] for name in _GRAPH_FIELDS if name in body}
+    nodes: List[Dict[str, Any]] = []
+    for entry in body["nodes"]:
+        node = entry[-1] if isinstance(entry, (list, tuple)) and entry else entry
+        if isinstance(node, dict):
+            nodes.append(
+                {name: node[name] for name in _GRAPH_NODE_FIELDS if name in node}
+            )
+    graph["nodes"] = nodes
+    return graph
+
+
 def _read_graph(client: Any, flow_run_id: str) -> Any:
     """
-    The run's task-to-task graph -- the only source of per-node upstream
-    dependencies once a run has finished.
+    The run's task-to-task graph from the older endpoint, each node naming
+    its upstream dependencies. Read only where `graph-v2` did not answer.
 
     Neither supported major exposes a typed method for this endpoint, on
     the sync client or the async one, so it is always the raw path.
@@ -630,7 +968,7 @@ def cloud_workspace() -> Dict[str, str]:
     """
     The Cloud account and workspace this process is configured to talk to.
 
-    Read from `PREFECT_API_URL` itself, which names both in its own path on
+    Read from the API URL itself, which names both in its own path on
     Prefect Cloud (`.../accounts/<id>/workspaces/<id>`) -- nothing about a
     run has to be read to find them, and a self-hosted server's URL simply
     does not match.
@@ -638,14 +976,113 @@ def cloud_workspace() -> Dict[str, str]:
     :return: `account_id` and `workspace_id`, or empty when this process is
         not talking to Prefect Cloud
     """
-    url = os.environ.get("PREFECT_API_URL", "")
-    match = _CLOUD_URL_RE.match(url)
+    match = _CLOUD_URL_RE.match(configured_api_url())
     if not match:
         return {}
     return {
         "account_id": match.group("account"),
         "workspace_id": match.group("workspace"),
     }
+
+
+def configured_api_url() -> str:
+    """
+    The Prefect API URL this process talks to, as Prefect itself resolved it.
+
+    `prefect cloud login` writes the URL to a profile, not to the
+    environment, so the environment alone says nothing there. Prefect's own
+    setting covers both: `PREFECT_API_URL.value()` is the same call on 2.20
+    and on 3.x. Where Prefect cannot be asked, the environment still can.
+
+    :return: the URL, or empty when none is configured
+    """
+    try:
+        setting = importlib.import_module(_SETTINGS).PREFECT_API_URL
+        url = setting.value()
+        if url:
+            return str(url)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: could not read Prefect's settings: %s", exc)
+    return os.environ.get(_API_URL_ENV, "")
+
+
+def cloud_workspace_name(workspace_id: str) -> Optional[str]:
+    """
+    The name of the Cloud workspace this process talks to.
+
+    The URL names a workspace only by id, so Prefect Cloud is asked, once
+    per process. The read runs on a thread of its own: a hook can fire
+    inside a running event loop, where the Cloud client, which is
+    asynchronous on every supported Prefect, cannot be waited on. Only the
+    first call waits, and for `_WORKSPACE_NAME_TIMEOUT_SECONDS` at most, so
+    a flow is never held longer than that, once. A read that failed is not
+    tried again.
+
+    :param workspace_id: the workspace's id, as the API URL names it
+    :return: its name, or None when it is not known, or not known yet
+    """
+    try:
+        with _WORKSPACE_NAME_LOCK:
+            found = _WORKSPACE_NAMES.get(workspace_id)
+            reader = None
+            if found is None:
+                found = _WORKSPACE_NAMES[workspace_id] = {}
+                reader = threading.Thread(
+                    target=_read_workspace_name,
+                    args=(workspace_id, found),
+                    name="convalesce-prefect-workspace",
+                    daemon=True,
+                )
+                reader.start()
+        if reader is not None:
+            reader.join(_WORKSPACE_NAME_TIMEOUT_SECONDS)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # A process that cannot start a thread still sends the event.
+        _LOG.debug("convalesce: could not read the workspace name: %s", exc)
+        return None
+    return found.get("name")
+
+
+def _read_workspace_name(workspace_id: str, found: Dict[str, str]) -> None:
+    """
+    Ask Prefect Cloud for a workspace's name, on the calling thread.
+
+    `get_cloud_client()` and its `read_workspaces()` are the same on Prefect
+    2.20 and 3.x. Anything else -- no Prefect, a Prefect that moved them, no
+    API key, a Cloud that does not answer in time -- leaves the name unknown.
+
+    :param workspace_id: the workspace's id, as the API URL names it
+    :param found: where the name is put, under `name`, when it is read
+    :return: nothing
+    """
+    try:
+        cloud = importlib.import_module(_CLOUD_CLIENT)
+        workspaces = asyncio.run(
+            asyncio.wait_for(
+                _read_workspaces(cloud), _WORKSPACE_NAME_TIMEOUT_SECONDS
+            )
+        )
+        for workspace in workspaces:
+            if str(getattr(workspace, "workspace_id", "")) != workspace_id:
+                continue
+            name = getattr(workspace, "workspace_name", None)
+            if isinstance(name, str) and name:
+                found["name"] = name
+            return
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: could not read the workspace name: %s", exc)
+
+
+async def _read_workspaces(cloud: Any) -> List[Any]:
+    """
+    Every Cloud workspace the configured API key can see.
+
+    :param cloud: Prefect's `prefect.client.cloud` module
+    :return: the workspaces, each with a `workspace_id` and a
+        `workspace_name`
+    """
+    async with cloud.get_cloud_client() as client:
+        return list(await client.read_workspaces())
 
 
 def emit_flow_run(
@@ -691,8 +1128,6 @@ def running_flow() -> Dict[str, Any]:
     :return: the flow and its run, or nothing when neither is at hand
     """
     try:
-        import importlib
-
         context = importlib.import_module(_FLOW_CONTEXT).FlowRunContext.get()
     except Exception:  # pylint: disable=broad-exception-caught
         # No Prefect, or a Prefect that moved its context: the task run
@@ -726,6 +1161,7 @@ def emit_task_run(
     :return: nothing
     """
     payload = {"task": task, "task_run": task_run, "state": state, **kwargs}
+    _note_hooked(task_run)
     declared = celin.take(task_run)
     if declared is not None:
         payload.setdefault("lineage", declared)
@@ -808,15 +1244,41 @@ def _held_exception(data: Any) -> Optional[BaseException]:
         return data
     # Read off the instance's own storage, not through attributes: a result
     # that is not in memory may load it from storage on attribute access.
-    # Pydantic 2 keeps a private attribute such as `_cache` apart.
+    # Pydantic 2 keeps a private attribute such as `_cache` apart; pydantic 1,
+    # which Prefect 2 results are built on, keeps it in a slot of the class.
     fields: Dict[str, Any] = {}
     for store in ("__dict__", "__pydantic_private__"):
         try:
             fields.update(object.__getattribute__(data, store) or {})
-        except (AttributeError, TypeError, ValueError):
+        except Exception:  # pylint: disable=broad-exception-caught
             continue
     for name in ("result", "_cache"):
-        value = fields.get(name)
+        value = fields[name] if name in fields else _slot_value(data, name)
         if isinstance(value, BaseException):
             return value
+    return None
+
+
+def _slot_value(data: Any, name: str) -> Any:
+    """
+    What an instance holds in a slot its class declares, read as storage.
+
+    Only a slot is read: any other class attribute of that name, a property
+    for one, could run code, and a result's code may read from storage.
+
+    :param data: the instance
+    :param name: the slot's name
+    :return: the value, or None when there is no such slot or it is unset
+    """
+    try:
+        for klass in type(data).__mro__:
+            slot = vars(klass).get(name)
+            if slot is None:
+                continue
+            if isinstance(slot, types.MemberDescriptorType):
+                # pylint: disable-next=unnecessary-dunder-call
+                return slot.__get__(data, type(data))
+            return None
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
     return None

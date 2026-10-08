@@ -82,7 +82,6 @@ import convalesce_emit_prefect.retry as ceprefretry
 import base64
 import dataclasses
 import json
-import logging
 import os
 import socket
 import urllib.error
@@ -94,6 +93,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import convalesce_emit as cemit
 import convalesce_emit.retry as ceretry
+import convalesce_emit_prefect._env as ceprefenv
+import convalesce_emit_prefect._mask as cemask
 import convalesce_emit_prefect._version as ceprefectver
 
 # Airflow, Dagster and Prefect each run the same poll/claim/act/report shape
@@ -105,7 +106,7 @@ import convalesce_emit_prefect._version as ceprefectver
 
 TOOL = "prefect"
 
-_LOG = logging.getLogger(__name__)
+_LOG = cemask.logger(__name__)
 
 _API_URL_ENV = "CONVALESCE_PREFECT_RETRY_API_URL"
 _API_KEY_ENV = "CONVALESCE_PREFECT_RETRY_API_KEY"
@@ -181,7 +182,7 @@ def _setting(name: str) -> Optional[str]:
     :param name: the retry setting's own variable
     :return: its value, or None when neither is set
     """
-    own = os.environ.get(name)
+    own = ceprefenv.read(name)
     if own and own.strip():
         return own.strip()
     return _prefect_setting(_AMBIENT[name])

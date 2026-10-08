@@ -1,0 +1,26 @@
+"""
+A setting's value, under either of the names it can be given by.
+
+Import as:
+
+import convalesce_emit_dagster._env as cedagenv
+"""
+
+import os
+from typing import Optional
+
+# What a platform may put in front of a setting's name, as AWS Glue does
+# with the variables it hands a job. Read here rather than through
+# `convalesce_emit.config`, which a `convalesce-emit` older than that
+# reader does not have.
+_PLATFORM_PREFIX = "CUSTOMER_"
+
+
+def read(name: str) -> Optional[str]:
+    """
+    Read one of this plugin's settings, under either of its names.
+
+    :param name: the setting, such as `CONVALESCE_SEND_ARGUMENTS`
+    :return: its value as set, or None when it is set under neither name
+    """
+    return os.environ.get(name, os.environ.get(_PLATFORM_PREFIX + name))

@@ -233,26 +233,16 @@ openlineage_facets:
     AirflowStateRunFacet:
       at: [run_event.run.facets.airflowState]
       excluded: {}
-      uncaptured:
-        tasksDuration: "provider 2.x on Airflow 3 adds it to the DAG COMPLETE/FAIL event; no Airflow 3 OpenLineage capture exists yet"
+      uncaptured: {}
     AirflowDagRunFacet:
       at: [run_event.run.facets.airflowDagRun]
       excluded: {}
-      uncaptured:
-        dag: &dagstart "on the DAG-level START event, which the provider sends and this transport forwards; no capture has one yet"
-        dagRun: *dagstart
-        _producer: *dagstart
-        _schemaURL: *dagstart
+      uncaptured: {}
     AirflowJobFacet:
       at: [run_event.job.facets.airflow]
       excluded:
         _deleted: "the client's facet-deletion marker, None unless a facet is being removed; Serde drops None"
-      uncaptured:
-        taskTree: *dagstart
-        taskGroups: *dagstart
-        tasks: *dagstart
-        _producer: *dagstart
-        _schemaURL: *dagstart
+      uncaptured: {}
     AirflowMappedTaskRunFacet:
       at: [run_event.run.facets.airflow_mappedTask]
       excluded: {}

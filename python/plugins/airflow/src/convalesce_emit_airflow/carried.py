@@ -30,6 +30,8 @@ import pathlib
 import sys
 from typing import List, Optional, Tuple
 
+import convalesce_emit_airflow._env as cealenv
+
 _LOG = logging.getLogger(__name__)
 
 _ROOT = pathlib.Path(__file__).parent / "_vendored"
@@ -164,6 +166,6 @@ def prepare(airflow_version: Optional[str]) -> Optional[str]:
     :return: the line used, or None
     """
     for name in ("CONVALESCE_OPENLINEAGE", "CONVALESCE_ENABLED"):
-        if os.environ.get(name, "").strip().lower() in _OFF:
+        if (cealenv.read(name) or "").strip().lower() in _OFF:
             return None
     return make_importable(airflow_version)

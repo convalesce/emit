@@ -242,3 +242,31 @@ class Test_redact_secrets1(unittest.TestCase):
         out, excluded = ceredact.redact_secrets(payload)
         self.assertEqual(out, payload)
         self.assertEqual(excluded, [])
+
+
+# #############################################################################
+# Test_redact_presigned1
+# #############################################################################
+
+
+class Test_redact_presigned1(unittest.TestCase):
+    """
+    Test that what signs a presigned URL is masked and the rest is kept.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the credential, signature and token of a presigned URL go.
+        """
+        url = (
+            "https://my-bucket.s3.amazonaws.com/libs/a.zip?X-Amz-Algorithm=AWS4"
+            "&X-Amz-Credential=AKIAEXAMPLE%2F20261007&X-Amz-Security-Token=abc"
+            "&X-Amz-Signature=0f0f0f&sig=zzz&design=wide"
+        )
+        redacted, excluded = ceredact.redact_secrets([url], path="argv")
+        text = redacted[0]
+        for secret in ("AKIAEXAMPLE", "abc&", "0f0f0f", "zzz"):
+            self.assertNotIn(secret, text)
+        self.assertIn("my-bucket.s3.amazonaws.com/libs/a.zip", text)
+        self.assertIn("design=wide", text)
+        self.assertTrue(excluded)

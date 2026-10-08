@@ -1,6 +1,9 @@
 package io.convalesce.emit.spark;
 
 import io.convalesce.emit.Emitter;
+import io.convalesce.emit.Exclusion;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.logging.Logger;
 import org.apache.spark.SparkConf;
 import org.apache.spark.scheduler.SparkListener;
@@ -417,8 +420,9 @@ public class ConvalesceSparkListener extends SparkListener {
         return;
       }
       String json = SparkEventJson.toJson(event);
-      json = SparkEventJson.withAppId(redaction.apply(json), remember(json));
-      emitter.emit(TOOL, name, json, sparkVersion);
+      List<Exclusion> masked = new ArrayList<Exclusion>();
+      json = SparkEventJson.withAppId(redaction.apply(json, masked), remember(json));
+      emitter.emit(TOOL, name, json, sparkVersion, masked);
     } catch (Throwable t) {
       // A job must not fail because we could not report on it.
       LOG.warning("convalesce: could not emit an event: " + t.getMessage());

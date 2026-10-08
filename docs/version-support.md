@@ -7,11 +7,11 @@ executed, and the observation received over HTTP by a stand-in endpoint.
 
 | Tool | Versions verified |
 | --- | --- |
-| Airflow | 2.5.3, 2.6.3, 2.7.3, 2.8.4, 2.9.3, 2.10.5, 2.11.0, 3.0.3 |
-| Dagster | 1.7.16, 1.9.13, 1.10.0, 1.13.21 |
-| Prefect | 2.20.26, 3.1.15, 3.8.5 |
-| Great Expectations | 0.17.23, 0.18.22, 1.22.0 |
-| Spark | 3.3.4, 3.5.3, 4.0.3 |
+| Airflow | 2.5.3, 2.6.3, 2.7.3, 2.8.4, 2.9.3, 2.10.5, 2.11.0, 3.0.3, 3.1.0, 3.2.2 |
+| Dagster | 1.7.16, 1.9.13, 1.10.0, 1.13.21, 1.13.24, 1.13.25 |
+| Prefect | 2.20.26, 3.1.15, 3.4.25, 3.8.5 |
+| Great Expectations | 0.17.23, 0.18.22, 1.22.0, 1.23.2 |
+| Spark | 3.3.3, 3.4.4, 3.5.3, 4.0.3 |
 | Python | 3.9 (floor) through 3.12 |
 
 One release per tool covers every version in its row:
@@ -23,14 +23,16 @@ One release per tool covers every version in its row:
 - **Great Expectations 0.x and 1.x behind one import.** `action.py` reads the installed version
   and re-exports the class that major needs, so a checkpoint lists the same path either way.
 
-Two versions could not be exercised, both for reasons inside the tool:
+One version needs a setting to run in Docker on arm64, and one could not be exercised, both for
+reasons inside the tool:
 
-- **Prefect 2.20.26** was verified natively rather than in Docker: `import prefect` alone exits
-  with SIGILL in that release's arm64 wheels, before any of our code runs.
-- **Prefect 3.0.x** cannot be imported at all against current pydantic --
+- **Prefect 2.20.26** runs in Docker on arm64 with `OPENSSL_armcap=0` in the container's
+  environment. Without it `import prefect` alone exits with SIGILL in that release's arm64
+  wheels, before any of our code runs.
+- **Prefect 3.0.x** cannot be imported at all against current pydantic:
   `from prefect import flow` raises `PydanticUndefinedAnnotation` in Prefect's own `main.py`.
-  Anyone on 3.0.x has to pin pydantic regardless of what they emit with. Verified 3.1.15 and
-  3.8.5 instead.
+  Anyone on 3.0.x has to pin pydantic regardless of what they emit with. Verified 3.1.15,
+  3.4.25 and 3.8.5 instead.
 
 Airflow 2.5.3 fires and registers correctly, checked by dispatching through its real listener
 manager; its `airflow dags test` command does not route through listeners, which is why the
@@ -124,6 +126,25 @@ Also confirmed there: Airflow 3.0 fires the task hooks from its task SDK
 subprocess with the plugin discovered through the entry point; the failure
 message reaches the wire from Airflow 2.10 and not before; a Spark driver
 flushes what it batched before exiting.
+
+## Spark platforms
+
+Where a Spark driver runs decides how the listener and
+`convalesce-emit-pyspark` are installed and handed their settings. These were
+run for real, with the published install steps:
+
+| Platform | What ran |
+| --- | --- |
+| AWS Glue 4.0 and 5.0 | the listener with its jars by path and `--user-jars-first true`, the helper through `--additional-python-modules`, and every setting through `--customer-driver-env-vars` under its `CUSTOMER_` name |
+| Databricks serverless compute | the helper alone, reporting the Spark Connect session's run, since serverless compute takes no listener |
+| A YARN cluster | the listener and the helper in client and in cluster deploy mode, the driver's settings carried by `spark.yarn.appMasterEnv.*` in cluster mode |
+
+The Amazon EMR steps are the YARN ones, with the package and the settings in
+the cluster's `spark-defaults` and `spark-env` configurations and the helper
+installed by a bootstrap action. The Databricks classic compute steps (an init
+script that copies the jars, the listener named beside Databricks' own)
+follow Databricks' and OpenLineage's own documentation. Neither platform has
+been run.
 
 ## Why the payload is not read
 

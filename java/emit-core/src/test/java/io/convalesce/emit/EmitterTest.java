@@ -279,6 +279,132 @@ public class EmitterTest {
     assertEquals(1, spooled(Spool.PENDING));
   }
 
+  @Test
+  public void theKeysOwnValueNeverRidesInsideAPayload() {
+    // As a job start carries it on AWS Glue, and as a script with the key written in would.
+    String key = "key-\"quoted\"-0123456789";
+    String payload =
+        "{\"Properties\":{\"spark.glue.customer-driver-env-vars\":\"A=1,INGEST=key-\\\"quoted\\\"-0123456789,B=2\"},"
+            + "\"note\":\"key-0123456789\"}";
+    new Emitter(Config.of(url, key, 1, 0).withSpoolDir(spoolDir()))
+        .emit("spark", "SparkListenerJobStart", payload, "3.5.0");
+    assertEquals("Bearer " + key, auth.get(0));
+    assertFalse(bodies.get(0), bodies.get(0).contains("quoted"));
+    assertTrue(bodies.get(0), bodies.get(0).contains("\"A=1,INGEST=***,B=2\""));
+    // Something like the key is not the key.
+    assertTrue(bodies.get(0), bodies.get(0).contains("\"note\":\"key-0123456789\""));
+    assertTrue(
+        bodies.get(0),
+        bodies.get(0).contains("\"excluded\":[{\"path\":\"$\",\"reason\":\"ingest key masked\"}]"));
+  }
+
+  @Test
+  public void whatTheCallerMaskedIsDeclaredBesideTheKeyTheEmitterMasked() {
+    // A setting whose secret-named entry the caller masked by name, so the key is not found in it.
+    String masked = "{\"Properties\":{\"env\":\"A=1,CUSTOMER_CONVALESCE_INGEST_KEY=***\"}}";
+    List<Exclusion> declared =
+        Collections.singletonList(new Exclusion("Properties.env", Exclusion.KEY_MASKED));
+    String key = "key-0123456789";
+    Emitter emitter = new Emitter(Config.of(url, key, 1, 0).withSpoolDir(spoolDir()));
+    emitter.emit("spark", "SparkListenerJobStart", masked, "3.5.0", declared);
+    emitter.emit("spark", "SparkListenerJobStart", "{\"note\":\"" + key + "\"}", "3.5.0", declared);
+    String own = "{\"path\":\"Properties.env\",\"reason\":\"ingest key masked\"}";
+    assertTrue(bodies.get(0), bodies.get(0).contains("\"excluded\":[" + own + "]"));
+    assertTrue(
+        bodies.get(1),
+        bodies
+            .get(1)
+            .contains(
+                "\"excluded\":[" + own + ",{\"path\":\"$\",\"reason\":\"ingest key masked\"}]"));
+  }
+
+  @Test
+  public void aPayloadWithoutTheKeyDeclaresNothingAndAShortKeyIsNotLookedFor() {
+    String payload = "{\"note\":\"a shortk in ordinary text\"}";
+    new Emitter(Config.of(url, "shortk", 1, 0).withSpoolDir(spoolDir()))
+        .emit("spark", "e", payload, null);
+    emitter(1, 0).emit("spark", "e", payload, null);
+    for (String body : bodies) {
+      assertTrue(body, body.contains(payload));
+      assertTrue(body, body.contains("\"excluded\":[]"));
+    }
+    assertEquals(2, bodies.size());
+  }
+
+  @Test
+  public void aDryRunMasksTheKeyAndIsLoggedWhileTheJvmIsUp() {
+    java.util.Map<String, String> env = new java.util.HashMap<String, String>();
+    env.put("CONVALESCE_INGEST_KEY", "probe-0123456789");
+    env.put("CONVALESCE_DRY_RUN", "true");
+    env.put("CONVALESCE_FLUSH_INTERVAL", "0");
+    env.put("CONVALESCE_SPOOL_DIR", spoolDir());
+    final List<String> logged = new ArrayList<String>();
+    java.util.logging.Handler handler =
+        new java.util.logging.Handler() {
+          @Override
+          public void publish(java.util.logging.LogRecord record) {
+            logged.add(record.getMessage());
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    java.util.logging.Logger log = java.util.logging.Logger.getLogger(Emitter.class.getName());
+    log.addHandler(handler);
+    try {
+      Emitter emitter = new Emitter(Config.fromEnvironment(env));
+      emitter.emit("spark", "e", "{\"env\":\"INGEST=probe-0123456789\"}", null);
+      emitter.flush();
+    } finally {
+      log.removeHandler(handler);
+    }
+    assertFalse(Emitter.shuttingDown());
+    assertEquals(1, logged.size());
+    assertTrue(logged.get(0), logged.get(0).startsWith(Emitter.DRY_RUN_PREFIX));
+    assertTrue(logged.get(0), logged.get(0).contains("INGEST=***"));
+    assertFalse(logged.get(0), logged.get(0).contains("0123456789"));
+    assertEquals(0, bodies.size());
+  }
+
+  @Test
+  public void aDryRunPrintsWhatIsFlushedAsTheJvmShutsDown() throws Exception {
+    // Only a JVM that is shutting down can show it, so one is started and left to end with an
+    // observation still queued, as a driver that fails without stopping its session does.
+    String launcher = System.getProperty("java.home") + "/bin/java";
+    ProcessBuilder builder =
+        new ProcessBuilder(
+            launcher, "-cp", System.getProperty("java.class.path"), QueuedAtExit.class.getName());
+    builder.environment().put("CONVALESCE_INGEST_KEY", "probe-0123456789");
+    builder.environment().put("CONVALESCE_DRY_RUN", "true");
+    builder.environment().put("CONVALESCE_SPOOL_DIR", spoolDir());
+    builder.redirectErrorStream(true);
+    Process process = builder.start();
+    String printed = new String(readBytes(process.getInputStream()), "UTF-8");
+    assertEquals(printed, 0, process.waitFor());
+    assertEquals(printed, 1, countOccurrences(printed, Emitter.DRY_RUN_PREFIX));
+    assertTrue(printed, printed.contains("\"event\":\"SparkListenerApplicationEnd\""));
+    assertTrue(printed, printed.contains("\"last\":true"));
+  }
+
+  /** A driver that ends with its last observation still queued. */
+  public static final class QueuedAtExit {
+    private QueuedAtExit() {}
+
+    /**
+     * Queues one observation and returns, leaving the shutdown hook to flush it.
+     *
+     * @param args unused
+     */
+    public static void main(String[] args) {
+      // Logging that is already gone by the time the hook runs, as a driver's is.
+      java.util.logging.LogManager.getLogManager().reset();
+      new Emitter().emit("spark", "SparkListenerApplicationEnd", "{\"last\":true}", "3.5.3");
+    }
+  }
+
   private static byte[] readBytes(InputStream in) throws java.io.IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     byte[] buffer = new byte[4096];

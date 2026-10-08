@@ -10,6 +10,7 @@ Run with `make test`.
 
 import gzip
 import http.server
+import io
 import json
 import logging
 import os
@@ -90,11 +91,8 @@ class _ServerCase(unittest.TestCase):
         :return: the emitter
         """
         kwargs.setdefault("batch_size", 1)
-        config = ceconfig.Config(
-            endpoint=self._url,
-            ingest_key="secret-key",
-            **kwargs,
-        )
+        kwargs.setdefault("ingest_key", "secret-key")
+        config = ceconfig.Config(endpoint=self._url, **kwargs)
         return ceclient.Emitter(config)
 
     def _sent(self) -> List[Dict[str, Any]]:
@@ -289,6 +287,153 @@ class Test_emitter_modes1(_ServerCase):
         self.assertEqual(_Recorder.received, [])
         self.assertIn("dry-run", "\n".join(logs.output))
         self.assertIn('"x": 1', "\n".join(logs.output))
+
+    def test3(self) -> None:
+        """
+        Test that dry-run is seen where no logging is set up: Python then
+        prints warnings and above to stderr and drops the rest.
+        """
+        emitter = self._emitter(dry_run=True)
+        stream = io.StringIO()
+        last_resort = logging.StreamHandler(stream)
+        last_resort.setLevel(logging.WARNING)
+        # A logger that hands its records to no handler, as in a process
+        # that never configured logging.
+        log = logging.getLogger(ceclient.__name__)
+        with unittest.mock.patch.object(log, "propagate", False):
+            with unittest.mock.patch.object(logging, "lastResort", last_resort):
+                emitter.emit(tool="airflow", event="e", payload={"x": 1})
+        self.assertIn("convalesce dry-run:", stream.getvalue())
+        self.assertIn('"x": 1', stream.getvalue())
+
+    def _dry_run_through(self, logger_level: int, handler_level: int) -> str:
+        """
+        Run one dry-run emit in an application that set up logging.
+
+        :param logger_level: the level this package's logger is held to
+        :param handler_level: the level of the one handler it reaches
+        :return: what the handler printed, each line led by its level
+        """
+        emitter = self._emitter(dry_run=True)
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(handler_level)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        log = logging.getLogger(ceclient.__name__)
+        log.addHandler(handler)
+        log.setLevel(logger_level)
+        try:
+            with unittest.mock.patch.object(log, "propagate", False):
+                emitter.emit(tool="airflow", event="e", payload={"x": 1})
+        finally:
+            log.removeHandler(handler)
+            log.setLevel(logging.NOTSET)
+        return stream.getvalue()
+
+    def test4(self) -> None:
+        """
+        Test that dry-run stays at INFO in an application that shows INFO,
+        so it is no louder there than what the application prints itself.
+        """
+        printed = self._dry_run_through(logging.INFO, logging.NOTSET)
+        self.assertTrue(printed.startswith("INFO convalesce dry-run:"))
+        self.assertIn('"x": 1', printed)
+
+    def test5(self) -> None:
+        """
+        Test that dry-run is seen where a handler exists but takes warnings
+        only, as under Prefect: an INFO record would be dropped there.
+        """
+        printed = self._dry_run_through(logging.INFO, logging.WARNING)
+        self.assertTrue(printed.startswith("WARNING convalesce dry-run:"))
+        self.assertIn('"x": 1', printed)
+
+    def test6(self) -> None:
+        """
+        Test that dry-run is seen where the logger itself is held to
+        warnings, whatever its handler would take.
+        """
+        printed = self._dry_run_through(logging.WARNING, logging.NOTSET)
+        self.assertTrue(printed.startswith("WARNING convalesce dry-run:"))
+
+
+# #############################################################################
+# Test_emitter_ingest_key1
+# #############################################################################
+
+
+class Test_emitter_ingest_key1(_ServerCase):
+    """
+    Test that the ingest key never rides inside an observation.
+    """
+
+    _KEY = 'key-"quoted"-0123456789'
+
+    def test1(self) -> None:
+        """
+        Test that the key is masked wherever a payload holds it, and that
+        the masking is declared.
+        """
+        emitter = self._emitter(ingest_key=self._KEY, batch_size=1)
+        payload = {
+            "settings": {"env": f"REGION=north,INGEST={self._KEY},MODE=fast"},
+            "source": {"text": f'client = connect("{self._KEY}")\n'},
+            "rows": 3,
+        }
+        emitter.emit(tool="spark", event="e", payload=payload)
+        self.assertNotIn(
+            self._KEY.encode(), gzip.decompress(_Recorder.raw_bodies[0])
+        )
+        self.assertNotIn(b"0123456789", gzip.decompress(_Recorder.raw_bodies[0]))
+        sent = _Recorder.received[0]["observations"][0]
+        self.assertEqual(
+            sent["payload"],
+            {
+                "settings": {"env": "REGION=north,INGEST=***,MODE=fast"},
+                "source": {"text": 'client = connect("***")\n'},
+                "rows": 3,
+            },
+        )
+        self.assertEqual(
+            sent["excluded"], [{"path": "$", "reason": "ingest key masked"}]
+        )
+        # The header still carries it: that is where it belongs.
+        self.assertEqual(
+            _Recorder.headers_seen[0]["Authorization"], f"Bearer {self._KEY}"
+        )
+
+    def test2(self) -> None:
+        """
+        Test that a dry run's output has the key masked too.
+        """
+        emitter = self._emitter(ingest_key=self._KEY, dry_run=True)
+        with self.assertLogs("convalesce_emit.client", level="INFO") as logs:
+            emitter.emit(
+                tool="spark",
+                event="e",
+                payload={"env": f"INGEST={self._KEY}"},
+                excluded=[{"path": "argv[1]", "reason": "secret redacted"}],
+            )
+        printed = "\n".join(logs.output)
+        self.assertNotIn("0123456789", printed)
+        self.assertIn("INGEST=***", printed)
+        self.assertIn("argv[1]", printed)
+        self.assertIn("ingest key masked", printed)
+
+    def test3(self) -> None:
+        """
+        Test that a short key is not looked for, and that a payload without
+        the key crosses as it was given.
+        """
+        payload = {"note": "a shortk in ordinary text", "when": "today"}
+        for key in ("shortk", self._KEY):
+            with self.subTest(key=key):
+                _Recorder.received.clear()
+                emitter = self._emitter(ingest_key=key, batch_size=1)
+                emitter.emit(tool="spark", event="e", payload=payload)
+                sent = _Recorder.received[0]["observations"][0]
+                self.assertEqual(sent["payload"], payload)
+                self.assertEqual(sent["excluded"], [])
 
 
 # #############################################################################

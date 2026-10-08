@@ -72,9 +72,11 @@ _MASK = "***"
 _URI_PASSWORD = re.compile(
     r"(?P<head>[A-Za-z][A-Za-z0-9+.\-]*://[^:@/\s]*:)(?P<secret>[^@/\s]+)@"
 )
-# `password=...` in a query string or a JDBC/ODBC connection string.
+# `password=...` in a query string or a JDBC/ODBC connection string, and what
+# signs a presigned URL (`X-Amz-Credential`, `X-Amz-Signature`, `sig`).
 _PARAM_SECRET = re.compile(
-    r"(?P<head>(?:password|passwd|pwd|secret|token|api_?key)=)"
+    r"(?P<head>(?:password|passwd|pwd|secret|token|api_?key|credential"
+    r"|signature|(?<![A-Za-z])sig)=)"
     r"(?P<secret>[^&;\s]+)",
     re.IGNORECASE,
 )

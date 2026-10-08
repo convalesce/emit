@@ -12,10 +12,13 @@ import convalesce_emit_dagster.sensor as cedsens
 """
 
 import logging
+import math
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
+import convalesce_emit_dagster._env as cedagenv
 import convalesce_emit_dagster.steps as cedsteps
 from convalesce_emit_dagster.retry import RETRY_JOB_NAME
 
@@ -88,9 +91,32 @@ EVENT_LOG_TYPE_NAMES = (
 # touched.
 _EVENT_LOG_SAMPLE_KEYS = frozenset({"metadata"})
 
-# Where materialisation events cross: the event log, and each step's stats,
-# which carry the same events again under `materialization_events`.
-_EVENT_CARRIERS = ("event_log", "step_stats")
+# Where an author's metadata crosses: the event log, each step's stats,
+# which carry the same materialisations again under `materialization_events`,
+# and the event that ended the run, whose first step failure carries the
+# metadata of a `Failure` the step raised.
+_EVENT_CARRIERS = ("event_log", "step_stats", "dagster_event")
+
+# Where this deployment's Dagster UI is, for the links to a run and a job.
+# Set where the sensor runs: one receiver hears from many deployments, and
+# only each of them knows its own address.
+_URL_ENV = "CONVALESCE_DAGSTER_URL"
+
+# Whether the numbers an author attached cross under their own names. On
+# unless turned off; off, only `METADATA_ALLOWED` crosses, as before 0.2.1.
+_METADATA_ENV = "CONVALESCE_DAGSTER_SEND_METADATA"
+_FALSY = frozenset({"0", "false", "no", "off"})
+
+# What the redaction marker is written under, which no entry may pass for.
+_MARKER_KEYS = frozenset({"redacted", "count"})
+# How many of an author's own entries cross from one metadata mapping, and
+# how long a name one may have: a mapping with thousands of entries, or a
+# name that is itself a value, is not a measurement.
+MAX_PLAIN_VALUES = 50
+MAX_PLAIN_NAME_CHARS = 128
+
+# The sides of the lineage a sensor's author may declare for an op.
+_LINEAGE_SIDES = ("inputs", "outputs")
 
 # The metadata entries that describe a table rather than hold its rows: the
 # ones Dagster itself writes for a materialisation, and the urns an asset's
@@ -135,13 +161,50 @@ METADATA_ALLOWED = frozenset(
 # free text, like the metadata around them.
 _SCHEMA_COLUMN_FIELDS = ("name", "type", "description", "constraints")
 
-# Dagster Cloud's own build of the deployment: which one, and from which
-# commit. Name-prefixed rather than read off any tool object, the same as
-# the Cloud UI itself documents these. `_CLOUD_ENV_SECRET_MARKERS` is a
-# second guard beyond the documented list, in case a future variable in this
-# namespace ever carries a credential.
-_CLOUD_ENV_PREFIX = "DAGSTER_CLOUD_"
-_CLOUD_ENV_SECRET_MARKERS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
+# Dagster+'s own account of the deployment: which one, and from which
+# commit. A fixed list, because the agent sets more under the same prefix
+# than names a deployment or its code: `DAGSTER_CLOUD_GIT_AUTHOR_NAME`,
+# `DAGSTER_CLOUD_GIT_AUTHOR_EMAIL` and `DAGSTER_CLOUD_GIT_MESSAGE` are a
+# person and their words, and anything a later release adds stays behind
+# until it is listed here.
+CLOUD_ENV_ALLOWED = (
+    "DAGSTER_CLOUD_DEPLOYMENT_NAME",
+    "DAGSTER_CLOUD_IS_BRANCH_DEPLOYMENT",
+    "DAGSTER_CLOUD_LOCATION_NAME",
+    "DAGSTER_CLOUD_GIT_SHA",
+    "DAGSTER_CLOUD_GIT_BRANCH",
+    "DAGSTER_CLOUD_GIT_URL",
+    "DAGSTER_CLOUD_GIT_REPO",
+    "DAGSTER_CLOUD_PULL_REQUEST_ID",
+    "DAGSTER_CLOUD_PULL_REQUEST_STATUS",
+)
+
+# The metadata entry an IO manager writes for where it put a value. In an
+# object store that names a dataset; on a local disk it names the machine
+# and, under a home directory, the person.
+_PATH_KEY = "path"
+_LOCAL_PATHS_ENV = "CONVALESCE_DAGSTER_SEND_LOCAL_PATHS"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_URI_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*)://")
+_LOCAL_SCHEMES = frozenset({"file"})
+
+# Tags Dagster puts on a run for its own machinery and hides in its UI:
+# which host and socket the code server listens on, which worker took the
+# run. The two kept say when a schedule meant the run to start and which
+# repository it belongs to, and name no machine.
+_INTERNAL_TAG_PREFIX = ".dagster/"
+INTERNAL_TAGS_ALLOWED = frozenset(
+    {".dagster/scheduled_execution_time", ".dagster/repository"}
+)
+# Tags Dagster+ adds that name a person or a machine: the login of whoever
+# launched the run (an email address), the agent that took it and its process.
+PERSONAL_TAGS = frozenset(
+    {"user", "process/pid", "dagster/agent_id", "dagster/agent_label"}
+)
+# Where a run's origin repeats the agent's own environment, variable by
+# variable: anything set there, a customer's secrets included.
+_CONTAINER_CONTEXT = "container_context"
+_ENV_VARS = "env_vars"
 
 
 def emit_dagster_event(
@@ -175,6 +238,7 @@ def emit_dagster_event(
 def convalesce_sensor(
     context: Any = None,
     emitter: Optional[cemit.EmitterLike] = None,
+    lineage: Any = None,
     **kwargs: Any,
 ) -> None:
     """
@@ -189,11 +253,15 @@ def convalesce_sensor(
 
     :param context: Dagster's run-status context
     :param emitter: emitter to send through
+    :param lineage: the datasets each op reads and writes, for ops whose
+        code names none: op name to `{"inputs": [...], "outputs": [...]}`,
+        each a dataset urn or the URI of a path, or a function of the
+        context that returns such a mapping
     :param kwargs: whatever else Dagster passes; forwarded untouched
     :return: nothing
     """
     try:
-        _sensor(context, emitter, **kwargs)
+        _sensor(context, emitter, lineage, **kwargs)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         # A sensor that raises fails its tick in the customer's Dagster UI;
         # nothing about reporting on a run is worth that.
@@ -201,7 +269,10 @@ def convalesce_sensor(
 
 
 def _sensor(
-    context: Any, emitter: Optional[cemit.EmitterLike], **kwargs: Any
+    context: Any,
+    emitter: Optional[cemit.EmitterLike],
+    lineage: Any,
+    **kwargs: Any,
 ) -> None:
     parts = unwrap_context(context)
     had_parts = bool(parts)
@@ -230,6 +301,12 @@ def _sensor(
     cloud_env = cloud_environment()
     if cloud_env:
         parts["cloud_environment"] = cloud_env
+    url = dagster_url()
+    if url:
+        parts["dagster_url"] = url
+    declared = declared_lineage(context, lineage)
+    if declared:
+        parts["lineage"] = declared
     payload = (
         {**parts, **kwargs} if had_parts else {"context": context, **kwargs}
     )
@@ -245,6 +322,8 @@ def _sensor(
         }
     if not cedsteps.arguments_enabled():
         excluded = excluded + _without_run_config(body)
+    excluded = excluded + _without_internal_tags(body)
+    excluded = excluded + _without_agent_environment(body, "")
     for name in _EVENT_CARRIERS:
         if isinstance(body, dict) and name in body:
             events, withheld = redact_metadata(body[name], name)
@@ -279,9 +358,70 @@ def _without_run_config(body: Any) -> List[Dict[str, str]]:
     return [{"path": "dagster_run.run_config", "reason": "arguments not sent"}]
 
 
+def _without_internal_tags(body: Any) -> List[Dict[str, str]]:
+    """
+    Take Dagster's own machinery tags off the run.
+
+    :param body: the dumped payload, changed in place
+    :return: what was left out, by path and reason
+    """
+    run = body.get("dagster_run") if isinstance(body, dict) else None
+    tags = run.get("tags") if isinstance(run, dict) else None
+    if not isinstance(tags, dict):
+        return []
+    internal = sorted(
+        name
+        for name in tags
+        if isinstance(name, str)
+        and (
+            name in PERSONAL_TAGS
+            or (
+                name.startswith(_INTERNAL_TAG_PREFIX)
+                and name not in INTERNAL_TAGS_ALLOWED
+            )
+        )
+    )
+    for name in internal:
+        del tags[name]
+    return [
+        {"path": f"dagster_run.tags.{name}", "reason": "internal tag not sent"}
+        for name in internal
+    ]
+
+
+def _without_agent_environment(value: Any, path: str) -> List[Dict[str, str]]:
+    """
+    Take the agent's environment out of wherever a run's origin repeats it.
+
+    :param value: any part of the dumped payload, changed in place
+    :param path: where `value` sits, for the record of what was left out
+    :return: what was left out, by path and reason
+    """
+    out: List[Dict[str, str]] = []
+    if isinstance(value, dict):
+        context = value.get(_CONTAINER_CONTEXT)
+        if isinstance(context, dict) and _ENV_VARS in context:
+            del context[_ENV_VARS]
+            out.append(
+                {
+                    "path": f"{path}.{_CONTAINER_CONTEXT}.{_ENV_VARS}".lstrip(
+                        "."
+                    ),
+                    "reason": "environment not sent",
+                }
+            )
+        for key, child in value.items():
+            out += _without_agent_environment(child, f"{path}.{key}".lstrip("."))
+    elif isinstance(value, list):
+        for child in value:
+            out += _without_agent_environment(child, f"{path}[]")
+    return out
+
+
 def redact_metadata(value: Any, path: str) -> Tuple[Any, List[Dict[str, str]]]:
     """
-    Redact every `metadata` entry but the ones that describe a table.
+    Redact every `metadata` entry but the ones that describe a table and
+    the numbers its author attached.
 
     A `metadata` mapping keeps its allowed entries as they are; the rest are
     counted into the same marker a fully redacted one carries, so a receiver
@@ -324,22 +464,170 @@ def redact_metadata(value: Any, path: str) -> Tuple[Any, List[Dict[str, str]]]:
 
 def _allowed_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
-    One `metadata` mapping, down to the entries that describe a table.
+    One `metadata` mapping, down to the entries that describe a table and
+    the numbers its author attached.
+
+    A number, a flag or a timestamp is a measurement of what ran -- rows
+    rejected, a mean, whether a threshold held -- and crosses under its own
+    name. Text, tables, markdown, JSON, paths and links can each hold the
+    data itself, and stay behind the marker unless their name is allowed.
 
     :param metadata: the dumped mapping, entry name to value
     :return: the allowed entries, plus `redacted` and `count` for the rest
         when there were any
     """
     out: Dict[str, Any] = {}
+    plain = MAX_PLAIN_VALUES if metadata_enabled() else 0
+    local_paths = local_paths_enabled()
     for name, entry in metadata.items():
         if name == "dagster/column_schema":
             out[name] = _schema_only(entry)
+        elif name == _PATH_KEY and not local_paths and _is_local_path(entry):
+            continue
         elif name in METADATA_ALLOWED:
             out[name] = entry
+        elif plain and _is_plain_value(name, entry):
+            out[name] = entry
+            plain -= 1
     withheld = len(metadata) - len(out)
     if withheld:
         out.update({"redacted": True, "count": withheld})
     return out
+
+
+def _is_plain_value(name: Any, entry: Any) -> bool:
+    """
+    Whether one metadata entry is a number, a flag or a timestamp.
+
+    Dagster's `IntMetadataValue`, `FloatMetadataValue`, `BoolMetadataValue`
+    and `TimestampMetadataValue` each dump as `{"value": ...}` and nothing
+    else, and a value an author passed bare crosses bare. A float that is
+    not finite has no JSON form and is not sent.
+
+    :param name: the entry's name
+    :param entry: its dumped value
+    :return: whether it may cross under its own name
+    """
+    if (
+        not isinstance(name, str)
+        or name in _MARKER_KEYS
+        or len(name) > MAX_PLAIN_NAME_CHARS
+    ):
+        return False
+    value = entry
+    if isinstance(entry, dict):
+        if set(entry) != {"value"}:
+            return False
+        value = entry["value"]
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return isinstance(value, (bool, int))
+
+
+def _is_local_path(entry: Any) -> bool:
+    """
+    Whether a `path` entry is a place on a disk rather than in a store.
+
+    Dagster's `PathMetadataValue` dumps as `{"path": ...}`, with the same
+    text again under `fspath`, and a path an author passed bare crosses
+    bare. `s3://bucket/orders` is in a store; `/home/someone/orders` and
+    `file:///home/someone/orders` are on a disk. Anything that is not text
+    is not known to be in a store, and is treated as local.
+
+    :param entry: the dumped metadata value
+    :return: False only when every text in it is the URI of a store
+    """
+    texts = list(entry.values()) if isinstance(entry, dict) else [entry]
+    texts = [text for text in texts if text is not None]
+    if not texts:
+        return True
+    for text in texts:
+        match = _URI_SCHEME.match(text) if isinstance(text, str) else None
+        if match is None or match.group(1).lower() in _LOCAL_SCHEMES:
+            return True
+    return False
+
+
+def local_paths_enabled() -> bool:
+    """
+    Whether a path on a local disk is sent as an IO manager wrote it.
+
+    :return: True only when `CONVALESCE_DAGSTER_SEND_LOCAL_PATHS` turns it on
+    """
+    return (cedagenv.read(_LOCAL_PATHS_ENV) or "").strip().lower() in _TRUTHY
+
+
+def metadata_enabled() -> bool:
+    """
+    Whether the numbers an author attached are sent under their own names.
+
+    :return: False when `CONVALESCE_DAGSTER_SEND_METADATA` turns it off
+    """
+    return (cedagenv.read(_METADATA_ENV) or "").strip().lower() not in _FALSY
+
+
+def dagster_url() -> Optional[str]:
+    """
+    Where this deployment's Dagster UI is, as `CONVALESCE_DAGSTER_URL` says.
+
+    :return: the address without a trailing slash, or None when it is unset
+    """
+    url = (cedagenv.read(_URL_ENV) or "").strip().rstrip("/")
+    return url or None
+
+
+def declared_lineage(
+    context: Any, lineage: Any
+) -> Dict[str, Dict[str, List[str]]]:
+    """
+    The datasets a sensor's author declared each op reads and writes.
+
+    Each is a dataset urn, as an op's `convalesce.inputs` and
+    `convalesce.outputs` metadata take, or the URI of a path, for ops whose
+    code names neither. A function is
+    called with the context, so it can answer for the run at hand; one that
+    raises, or anything that is not this shape, costs the declaration and
+    never the run's report.
+
+    :param context: Dagster's run-status context
+    :param lineage: op name to `{"inputs": [...], "outputs": [...]}` or to
+        an object with those attributes, or a function returning one
+    :return: op name to its sides, each a sorted list of references as
+        text; empty when nothing usable was declared
+    """
+    try:
+        found = lineage(context) if callable(lineage) else lineage
+        out: Dict[str, Dict[str, List[str]]] = {}
+        for op_name, sides in dict(found or {}).items():
+            entry = {
+                side: _references(
+                    sides.get(side)
+                    if isinstance(sides, dict)
+                    else getattr(sides, side, None)
+                )
+                for side in _LINEAGE_SIDES
+            }
+            entry = {side: refs for side, refs in entry.items() if refs}
+            if entry:
+                out[str(op_name)] = entry
+        return out
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.warning("convalesce: could not read the declared lineage: %s", exc)
+        return {}
+
+
+def _references(value: Any) -> List[str]:
+    """
+    One side of a declaration, as text.
+
+    :param value: one reference, or any collection of them
+    :return: each as its `str()`, sorted, so a set crosses the same way
+        every time
+    """
+    if value is None:
+        return []
+    items = [value] if isinstance(value, str) else list(value)
+    return sorted({str(item) for item in items if item})
 
 
 def _schema_only(entry: Any) -> Any:
@@ -557,25 +845,20 @@ def _asset_key_text(key: Any) -> str:
 
 def cloud_environment() -> Dict[str, str]:
     """
-    Dagster Cloud's own deployment and commit info, from its environment.
+    Dagster+'s own deployment and commit info, from its environment.
 
-    Not read off any tool object: Dagster Cloud's agent sets these in the
-    process before user code ever runs, the same way the Cloud UI itself
-    documents them. `_CLOUD_ENV_SECRET_MARKERS` is a second guard beyond the
-    documented, credential-free list, in case a future variable in this
-    namespace ever carries one.
+    Not read off any tool object: the Dagster+ agent sets these in the
+    process before user code ever runs. Only the variables that name the
+    deployment and its code are taken; who wrote the commit and what they
+    said about it stay where they are.
 
-    :return: every `DAGSTER_CLOUD_*` variable found, minus anything whose
-        name suggests a credential
+    :return: each of `CLOUD_ENV_ALLOWED` that is set
     """
-    out: Dict[str, str] = {}
-    for name, value in os.environ.items():
-        if not name.startswith(_CLOUD_ENV_PREFIX):
-            continue
-        if any(marker in name.upper() for marker in _CLOUD_ENV_SECRET_MARKERS):
-            continue
-        out[name] = value
-    return out
+    return {
+        name: os.environ[name]
+        for name in CLOUD_ENV_ALLOWED
+        if os.environ.get(name) is not None
+    }
 
 
 def prune_snapshot(snapshot: Any) -> Any:
