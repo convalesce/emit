@@ -105,11 +105,45 @@ def _raised(exc: BaseException) -> BaseException:
     raise AssertionError("unreachable")
 
 
+# What really started this process: the test runner, by whichever name it
+# was started (`python -m pytest`, or the `pytest` script).
+_RUNNER_FILES = frozenset(
+    os.path.abspath(str(path))
+    for path in (
+        getattr(sys.modules.get("__main__"), "__file__", None),
+        sys.argv[0] if sys.argv else None,
+    )
+    if path
+)
+_real_frame_file = cepysdri._frame_file  # pylint: disable=protected-access
+
+
+def _frame_file_without_the_runner(frame: Any) -> Optional[str]:
+    """
+    As the helper's own, with the test runner's frames standing for the
+    main program the test set up, so a test sees that program and not
+    whichever one runs the tests.
+    """
+    found = _real_frame_file(frame)
+    if found not in _RUNNER_FILES:
+        return found
+    stand_in = getattr(sys.modules.get("__main__"), "__file__", None)
+    if not stand_in or not os.path.isfile(str(stand_in)):
+        return None
+    path = os.path.abspath(str(stand_in))
+    return None if path in _RUNNER_FILES else path
+
+
 class _HookTestCase(unittest.TestCase):
     """Every test runs with its own hooks, a PySpark driver and argv."""
 
     def setUp(self) -> None:
         super().setUp()
+        runner = mock.patch.object(
+            cepysdri, "_frame_file", _frame_file_without_the_runner
+        )
+        runner.start()
+        self.addCleanup(runner.stop)
         self.previous = mock.Mock()
         self.previous_threading = mock.Mock()
         self.recorder = _Recorder()
@@ -119,6 +153,11 @@ class _HookTestCase(unittest.TestCase):
             mock.patch.object(sys, "exit", sys.exit),
             mock.patch.object(sys, "argv", ["/opt/jobs/revenue.py", "broken"]),
             mock.patch.dict(sys.modules, {"pyspark": _pyspark(_Context())}),
+            # A main program of the test's own, with no file: the runner's
+            # differs by how the tests were started.
+            mock.patch.dict(
+                sys.modules, {"__main__": types.ModuleType("__main__")}
+            ),
         ]
         for patch in patches:
             patch.start()
