@@ -1,5 +1,7 @@
 package io.convalesce.emit;
 
+import java.util.Map;
+
 /**
  * Where to send observations, and how hard to try.
  *
@@ -19,6 +21,9 @@ public final class Config {
 
   /** Default endpoint, used when {@code CONVALESCE_ENDPOINT} is unset. */
   public static final String DEFAULT_ENDPOINT = "https://api.convalesce.io";
+
+  /** What a platform may put in front of a setting's name; see {@link #setting(Map, String)}. */
+  public static final String PLATFORM_PREFIX = "CUSTOMER_";
 
   private static final int DEFAULT_TIMEOUT_MS = 10_000;
   private static final int DEFAULT_MAX_RETRIES = 3;
@@ -85,18 +90,54 @@ public final class Config {
    * @return the configuration, which may be unusable; call {@link #validate()} to find out
    */
   public static Config fromEnvironment() {
+    return fromEnvironment(System.getenv());
+  }
+
+  /**
+   * Reads configuration from an environment given, for tests and embedders.
+   *
+   * @param env the variables to read
+   * @return the configuration, which may be unusable; call {@link #validate()} to find out
+   */
+  public static Config fromEnvironment(Map<String, String> env) {
     return new Config(
-        orDefault(readString("CONVALESCE_ENDPOINT"), DEFAULT_ENDPOINT),
-        readString("CONVALESCE_INGEST_KEY"),
-        readInt("CONVALESCE_TIMEOUT", DEFAULT_TIMEOUT_MS / 1000) * 1000,
-        readInt("CONVALESCE_MAX_RETRIES", DEFAULT_MAX_RETRIES),
-        readInt("CONVALESCE_BATCH_SIZE", DEFAULT_BATCH_SIZE),
-        readInt("CONVALESCE_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
-        readBoolean("CONVALESCE_DRY_RUN", false),
-        readBoolean("CONVALESCE_ENABLED", true),
-        orDefault(readString("CONVALESCE_SPOOL_DIR"), DEFAULT_SPOOL_DIR),
-        readLong("CONVALESCE_SPOOL_MAX_BYTES", DEFAULT_SPOOL_MAX_BYTES),
-        readInt("CONVALESCE_FLUSH_INTERVAL", DEFAULT_FLUSH_INTERVAL_MS / 1000) * 1000);
+        orDefault(readString(env, "CONVALESCE_ENDPOINT"), DEFAULT_ENDPOINT),
+        readString(env, "CONVALESCE_INGEST_KEY"),
+        readInt(env, "CONVALESCE_TIMEOUT", DEFAULT_TIMEOUT_MS / 1000) * 1000,
+        readInt(env, "CONVALESCE_MAX_RETRIES", DEFAULT_MAX_RETRIES),
+        readInt(env, "CONVALESCE_BATCH_SIZE", DEFAULT_BATCH_SIZE),
+        readInt(env, "CONVALESCE_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
+        readBoolean(env, "CONVALESCE_DRY_RUN", false),
+        readBoolean(env, "CONVALESCE_ENABLED", true),
+        orDefault(readString(env, "CONVALESCE_SPOOL_DIR"), DEFAULT_SPOOL_DIR),
+        readLong(env, "CONVALESCE_SPOOL_MAX_BYTES", DEFAULT_SPOOL_MAX_BYTES),
+        readInt(env, "CONVALESCE_FLUSH_INTERVAL", DEFAULT_FLUSH_INTERVAL_MS / 1000) * 1000);
+  }
+
+  /**
+   * One setting from the process environment, under either of its names.
+   *
+   * @param name the setting, such as {@code CONVALESCE_ENDPOINT}
+   * @return its value, or null when it is set under neither name
+   */
+  public static String setting(String name) {
+    return setting(System.getenv(), name);
+  }
+
+  /**
+   * One setting, under either of its names.
+   *
+   * <p>A platform that passes a job only the variables it prefixes, as AWS Glue does with {@code
+   * CUSTOMER_}, can still configure it: {@code CUSTOMER_CONVALESCE_ENDPOINT} is read where {@code
+   * CONVALESCE_ENDPOINT} is not set. Every setting is read through here, so none is left out.
+   *
+   * @param env the variables to read
+   * @param name the setting, such as {@code CONVALESCE_ENDPOINT}
+   * @return its value, or null when it is set under neither name
+   */
+  public static String setting(Map<String, String> env, String name) {
+    String value = env.get(name);
+    return value != null ? value : env.get(PLATFORM_PREFIX + name);
   }
 
   /**
@@ -237,8 +278,8 @@ public final class Config {
     return flushIntervalMs;
   }
 
-  private static String readString(String name) {
-    String value = System.getenv(name);
+  private static String readString(Map<String, String> env, String name) {
+    String value = setting(env, name);
     return value == null ? null : value.trim();
   }
 
@@ -246,8 +287,8 @@ public final class Config {
     return value == null || value.isEmpty() ? fallback : value;
   }
 
-  private static boolean readBoolean(String name, boolean fallback) {
-    String raw = readString(name);
+  private static boolean readBoolean(Map<String, String> env, String name, boolean fallback) {
+    String raw = readString(env, name);
     if (raw == null || raw.isEmpty()) {
       return fallback;
     }
@@ -255,8 +296,8 @@ public final class Config {
     return lower.equals("1") || lower.equals("true") || lower.equals("yes") || lower.equals("on");
   }
 
-  private static long readLong(String name, long fallback) {
-    String raw = readString(name);
+  private static long readLong(Map<String, String> env, String name, long fallback) {
+    String raw = readString(env, name);
     if (raw == null || raw.isEmpty()) {
       return fallback;
     }
@@ -267,8 +308,8 @@ public final class Config {
     }
   }
 
-  private static int readInt(String name, int fallback) {
-    String raw = readString(name);
+  private static int readInt(Map<String, String> env, String name, int fallback) {
+    String raw = readString(env, name);
     if (raw == null || raw.isEmpty()) {
       return fallback;
     }

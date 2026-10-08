@@ -3,6 +3,7 @@
     "validation_result": [
       "args",
       "database",
+      "dataset_name",
       "datasources",
       "datasources.shop",
       "datasources.shop.database",
@@ -28,7 +29,10 @@
       "kwargs.checkpoint_result",
       "kwargs.checkpoint_result.checkpoint_config",
       "kwargs.checkpoint_result.checkpoint_config.actions",
+      "kwargs.checkpoint_result.checkpoint_config.actions[].dataset_name",
       "kwargs.checkpoint_result.checkpoint_config.actions[].name",
+      "kwargs.checkpoint_result.checkpoint_config.actions[].platform",
+      "kwargs.checkpoint_result.checkpoint_config.actions[].platform_instance",
       "kwargs.checkpoint_result.checkpoint_config.actions[].site_names",
       "kwargs.checkpoint_result.checkpoint_config.actions[].type",
       "kwargs.checkpoint_result.checkpoint_config.id",
@@ -633,6 +637,7 @@
       "kwargs.checkpoint_result.run_results.{key}.meta.batch_spec",
       "kwargs.checkpoint_result.run_results.{key}.meta.batch_spec.batch_identifiers",
       "kwargs.checkpoint_result.run_results.{key}.meta.batch_spec.data_asset_name",
+      "kwargs.checkpoint_result.run_results.{key}.meta.batch_spec.partitioner_method",
       "kwargs.checkpoint_result.run_results.{key}.meta.batch_spec.path",
       "kwargs.checkpoint_result.run_results.{key}.meta.batch_spec.query",
       "kwargs.checkpoint_result.run_results.{key}.meta.batch_spec.query_truncated",
@@ -752,6 +757,7 @@
       "kwargs.validation_result_suite.meta.batch_spec.reader_method",
       "kwargs.validation_result_suite.meta.batch_spec.reader_options",
       "kwargs.validation_result_suite.meta.batch_spec.schema_name",
+      "kwargs.validation_result_suite.meta.batch_spec.splitter_method",
       "kwargs.validation_result_suite.meta.batch_spec.table_name",
       "kwargs.validation_result_suite.meta.batch_spec.temp_table_schema_name",
       "kwargs.validation_result_suite.meta.batch_spec.type",
@@ -845,7 +851,9 @@
       "kwargs.validation_result_suite_identifier.expectation_suite_identifier.expectation_suite_name",
       "kwargs.validation_result_suite_identifier.run_id",
       "kwargs.validation_result_suite_identifier.run_id.run_name",
-      "kwargs.validation_result_suite_identifier.run_id.run_time"
+      "kwargs.validation_result_suite_identifier.run_id.run_time",
+      "platform",
+      "platform_instance"
     ]
   },
   "tool": "great_expectations"

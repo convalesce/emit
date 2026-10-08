@@ -58,7 +58,6 @@ import base64
 import dataclasses
 import json
 import logging
-import os
 import socket
 import urllib.error
 import urllib.parse
@@ -67,6 +66,7 @@ from typing import Any, List, Optional, Tuple
 
 import convalesce_emit as cemit
 import convalesce_emit.retry as ceretry
+import convalesce_emit_airflow._env as cealenv
 import convalesce_emit_airflow._version as ceairflowver
 
 _LOG = logging.getLogger(__name__)
@@ -127,7 +127,7 @@ def _named_connection() -> Optional[str]:
     :return: the id, or None when neither variable is set
     """
     for name in (_RETRY_CONNECTION_ENV, _RETRY_CONNECTION_ENV_OLD):
-        value = os.environ.get(name)
+        value = cealenv.read(name)
         if value and value.strip():
             return value.strip()
     return None

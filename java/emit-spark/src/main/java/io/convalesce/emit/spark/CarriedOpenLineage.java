@@ -1,9 +1,11 @@
 package io.convalesce.emit.spark;
 
+import io.convalesce.emit.Config;
 import java.io.File;
 import java.lang.ref.WeakReference;
 import java.util.Locale;
 import java.util.Map;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.spark.SparkConf;
 import org.apache.spark.SparkEnv;
@@ -38,6 +40,21 @@ final class CarriedOpenLineage {
   // Off by default in OpenLineage, which then reports the columns a filter, join or grouping read
   // as inputs of every output column. On, they are reported once for the dataset.
   static final String DATASET_LINEAGE = "spark.openlineage.columnLineage.datasetLineageEnabled";
+  // OpenLineage copies only spark.master and spark.app.name unless told otherwise. The two Glue
+  // settings name the job and the run even when the script gives its application another name.
+  // The two Databricks settings name the workspace and the cluster, which every event of a run
+  // then says and not only the one built from a Spark job's start. Off either platform its
+  // settings are absent and nothing is copied for them.
+  static final String CAPTURED_PROPERTIES = "spark.openlineage.capturedProperties";
+  static final String CAPTURED =
+      "spark.master,spark.app.name,spark.glue.JOB_NAME,spark.glue.JOB_RUN_ID,"
+          + "spark.databricks.workspaceUrl,spark.databricks.clusterUsageTags.clusterId";
+  // The variables AWS's own OpenLineage setup for Glue asks for, in OpenLineage's list syntax.
+  static final String ENVIRONMENT_VARIABLES =
+      "spark.openlineage.facets.custom_environment_variables";
+  static final String GLUE_VARIABLES =
+      "[AWS_DEFAULT_REGION;GLUE_VERSION;GLUE_COMMAND_CRITERIA;GLUE_PYTHON_VERSION;]";
+  static final String GLUE_VERSION_KEY = "spark.glue.GLUE_VERSION";
 
   private static final String EXTRA_LISTENERS = "spark.extraListeners";
   private static final String TRANSPORT_PREFIX = "spark.openlineage.transport.";
@@ -45,6 +62,8 @@ final class CarriedOpenLineage {
   // The configuration OpenLineage was last started for, so two of our listeners on one context
   // start it once. Weak, because a driver can stop one context and build another.
   private static volatile WeakReference<SparkConf> started = new WeakReference<SparkConf>(null);
+  // The configuration a job was last told there is no lineage for, so it is told once.
+  private static volatile WeakReference<SparkConf> told = new WeakReference<SparkConf>(null);
 
   private CarriedOpenLineage() {}
 
@@ -75,21 +94,45 @@ final class CarriedOpenLineage {
       // What OpenLineage reads is the driver's own configuration. Spark hands a listener named in
       // spark.extraListeners that very object, but an embedder may hand over a copy.
       SparkConf live = liveConf(conf);
-      String reason = skipReason(live, env);
-      if (reason == null && started.get() == live) {
-        reason = "already started";
+      if (started.get() == live) {
+        LOG.fine("convalesce: not starting OpenLineage: already started");
+        return null;
       }
-      Class<?> found = reason == null ? find(listenerClass) : null;
-      if (reason == null && found == null) {
-        reason = "openlineage-spark is not on the classpath";
+      String off = switchedOff(env);
+      if (off != null) {
+        LOG.fine("convalesce: not starting OpenLineage: " + off);
+        return null;
       }
-      if (reason != null) {
-        LOG.fine("convalesce: not starting OpenLineage: " + reason);
+      String configured = configuredByJob(live, env);
+      if (configured != null) {
+        tellOnce(
+            live,
+            Level.INFO,
+            "convalesce: OpenLineage is the job's own (set by "
+                + configured
+                + "), so its table and column lineage goes where the job sends it and not to"
+                + " Convalesce; add the convalesce transport to send it here too");
+        return null;
+      }
+      Class<?> found = find(listenerClass);
+      if (found == null) {
+        tellOnce(
+            live,
+            Level.WARNING,
+            "convalesce: no table or column lineage for this job: openlineage-spark is not on"
+                + " the classpath. Use the convalesce-emit-spark_2.12 or _2.13 package, or add"
+                + " the openlineage-spark jar beside this one");
         return null;
       }
       live.set(TRANSPORT_TYPE, ConvalesceTransportBuilder.TYPE);
       if (!live.contains(DATASET_LINEAGE)) {
         live.set(DATASET_LINEAGE, "true");
+      }
+      if (!live.contains(CAPTURED_PROPERTIES)) {
+        live.set(CAPTURED_PROPERTIES, CAPTURED);
+      }
+      if (onGlue(live, env) && !live.contains(ENVIRONMENT_VARIABLES)) {
+        live.set(ENVIRONMENT_VARIABLES, GLUE_VARIABLES);
       }
       Object listener = found.getConstructor(SparkConf.class).newInstance(live);
       started = new WeakReference<SparkConf>(live);
@@ -102,22 +145,28 @@ final class CarriedOpenLineage {
     }
   }
 
-  /**
-   * Why OpenLineage must not be started here, if it must not.
-   *
-   * @param conf the driver's configuration
-   * @param env the process environment
-   * @return the reason, or null when it should be started
-   */
-  static String skipReason(SparkConf conf, Map<String, String> env) {
-    if (isFalse(env.get(OPT_OUT))) {
+  private static String switchedOff(Map<String, String> env) {
+    if (isFalse(Config.setting(env, OPT_OUT))) {
       return OPT_OUT + "=false";
     }
-    if (isFalse(env.get("CONVALESCE_ENABLED"))) {
+    if (isFalse(Config.setting(env, "CONVALESCE_ENABLED"))) {
       return "CONVALESCE_ENABLED=false";
     }
-    String configured = configuredByJob(conf, env);
-    return configured == null ? null : "already configured by " + configured;
+    return null;
+  }
+
+  static boolean onGlue(SparkConf conf, Map<String, String> env) {
+    return conf.contains(GLUE_VERSION_KEY) || !blank(env.get("GLUE_VERSION"));
+  }
+
+  // Visible at the default level: a job whose lineage is missing should not need debug logging to
+  // learn why. Once, because a driver may build this listener more than once.
+  private static void tellOnce(SparkConf conf, Level level, String message) {
+    if (told.get() == conf) {
+      return;
+    }
+    told = new WeakReference<SparkConf>(conf);
+    LOG.log(level, message);
   }
 
   /**

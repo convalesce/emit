@@ -27,13 +27,13 @@ import convalesce_emit_dagster.steps as cedsteps
 import importlib
 import json
 import logging
-import os
 import sys
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional
 
 import convalesce_emit as cemit
 import convalesce_emit.source as cesource
 import convalesce_emit.sqlcapture as cesqlcap
+import convalesce_emit_dagster._env as cedagenv
 
 _LOG = logging.getLogger(__name__)
 
@@ -93,7 +93,7 @@ def arguments_enabled() -> bool:
 
     :return: False only when the setting says so
     """
-    return os.environ.get(_ARGUMENTS_ENV, "").strip().lower() not in _FALSY
+    return (cedagenv.read(_ARGUMENTS_ENV) or "").strip().lower() not in _FALSY
 
 
 # #############################################################################

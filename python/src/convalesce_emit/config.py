@@ -26,7 +26,7 @@ import dataclasses
 import logging
 import os
 import tempfile
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import convalesce_emit.errors as ceerrors
 
@@ -173,6 +173,32 @@ class Config:
             )
 
 
+# What a platform may put in front of a setting's name. AWS Glue hands a
+# job only the variables whose names start with this, so a setting is read
+# under it wherever its own name is not set.
+PLATFORM_PREFIX = "CUSTOMER_"
+
+
+def read_setting(
+    name: str, environ: Optional[Mapping[str, str]] = None
+) -> Optional[str]:
+    """
+    Read one setting, under either of its names.
+
+    Every `CONVALESCE_*` variable this package reads goes through here, so
+    none is left without its prefixed name.
+
+    :param name: the setting, such as `CONVALESCE_ENDPOINT`
+    :param environ: the variables to read; the process's own when not given
+    :return: its value as set, or None when it is set under neither name
+    """
+    env = os.environ if environ is None else environ
+    value = env.get(name)
+    if value is None:
+        value = env.get(PLATFORM_PREFIX + name)
+    return value
+
+
 def _read_str(name: str) -> Optional[str]:
     """
     Read a string variable, trimmed.
@@ -180,7 +206,7 @@ def _read_str(name: str) -> Optional[str]:
     :param name: environment variable to read
     :return: its value, or None when unset
     """
-    value = os.environ.get(name)
+    value = read_setting(name)
     return value.strip() if value is not None else None
 
 
@@ -192,7 +218,7 @@ def _read_bool(name: str, default: bool) -> bool:
     :param default: value when unset
     :return: whether the variable reads as true
     """
-    raw = os.environ.get(name)
+    raw = read_setting(name)
     if raw is None:
         return default
     return raw.strip().lower() in _TRUTHY
@@ -207,7 +233,7 @@ def _read_num(name: str, default: float) -> float:
     :return: the number
     :raises ConfigError: if the value is not a number
     """
-    raw = os.environ.get(name)
+    raw = read_setting(name)
     if raw is None:
         return default
     try:

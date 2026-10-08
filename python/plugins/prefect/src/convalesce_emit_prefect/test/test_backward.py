@@ -91,6 +91,11 @@ _MODELS: Dict[str, Tuple[str, Tuple[str, ...]]] = {
         ("task_run.empirical_policy", "api_task_runs[].empirical_policy"),
     ),
     "Flow": ("prefect.client.schemas.objects", ("api_flow",)),
+    "Graph": ("prefect.server.schemas.graph", ("api_flow_run_graph_v2",)),
+    "Node": (
+        "prefect.server.schemas.graph",
+        ("api_flow_run_graph_v2.nodes[]",),
+    ),
     "Deployment": ("prefect.client.schemas.objects", ("api_deployment",)),
     "WorkPool": ("prefect.client.schemas.objects", ()),
     "Asset": ("prefect.assets", ("task.assets[]", "task.asset_deps[]")),
@@ -433,6 +438,178 @@ class Test_live_run1(unittest.TestCase):
             self.assertEqual(
                 payload["flow_run"]["parameters"], {"customer": "<str>"}
             )
+
+
+@unittest.skipUnless(_HAS_PREFECT, _SKIP_REASON)
+class Test_live_run2(unittest.TestCase):
+    """
+    Test what a real run sends for a failed task, a cache hit and a mapped
+    task: three places Prefect 2 and Prefect 3 differ.
+    """
+
+    sent: List[Dict[str, Any]] = []
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.sent = _live_edge_runs()
+
+    def _task_events(self, name: str) -> List[Dict[str, Any]]:
+        """
+        The task events of one task, in the order they were sent.
+
+        :param name: the task's name
+        :return: their payloads
+        """
+        return [
+            item["payload"]
+            for item in self.sent
+            if item["event"] == "task_run"
+            and item["payload"]["task"]["name"] == name
+        ]
+
+    def test1(self) -> None:
+        """
+        Test that a failed task's own event carries the exception and
+        where it was raised, as the failed flow's does. Prefect 2 keeps the
+        exception in a result's cache and Prefect 3 in a result record.
+        """
+        (failed,) = self._task_events("fail_step")
+        detail = failed["error_detail"]
+        self.assertEqual(detail["type"], "builtins.ValueError")
+        self.assertEqual(detail["message"], "failed on purpose")
+        self.assertIn("fail_step", detail["traceback"])
+        self.assertEqual(detail["cause"]["type"], "builtins.KeyError")
+        flows = [
+            item["payload"]
+            for item in self.sent
+            if item["event"] == "flow_run"
+            and item["payload"]["flow"]["name"] == "failing"
+            and "error_detail" in item["payload"]
+        ]
+        self.assertEqual(flows[-1]["error_detail"]["type"], detail["type"])
+
+    def test2(self) -> None:
+        """
+        Test that a cache hit is sent. Prefect 3 fires the task's hook for
+        it; Prefect 2 fires none, so the run is only in the API's record of
+        the flow run, on the flow's last event, with what a receiver needs
+        to write a run from it.
+        """
+        hooked = [
+            payload
+            for payload in self._task_events("cached_step")
+            if payload["state"]["name"] == "Cached"
+        ]
+        ended = [
+            item["payload"]
+            for item in self.sent
+            if item["event"] == "flow_run"
+            and item["payload"]["flow"]["name"] == "caching"
+            and item["payload"]["state"]["type"] == "COMPLETED"
+        ]
+        self.assertEqual(len(ended), 2)
+        listed = [
+            run
+            for run in ended[-1].get("api_task_runs") or []
+            if run["state_name"] == "Cached"
+        ]
+        self.assertTrue(hooked or listed, "the cache hit was not sent")
+        for run in listed:
+            self.assertEqual(run["state_type"], "COMPLETED")
+            self.assertTrue(run["id"])
+            self.assertTrue(run["name"].startswith("cached_step"))
+            self.assertTrue(run["task_key"].startswith("cached_step"))
+            self.assertTrue(run["state"]["timestamp"])
+        if not hooked:
+            # No hook, so no event of its own: the record is all there is.
+            self.assertEqual(len(listed), 1)
+            self.assertIsNone(listed[0]["start_time"])
+
+    def test3(self) -> None:
+        """
+        Test that the results of a mapped task are the values the task
+        after it was called with, and that no argument says where an object
+        lives in memory. Prefect 3 hands that task the futures themselves.
+        """
+        (total,) = self._task_events("total")
+        self.assertEqual(total["arguments"], {"values": [1, 4, 9]})
+        for item in self.sent:
+            arguments = json.dumps(item["payload"].get("arguments"))
+            self.assertNotRegex(arguments, r" at 0x[0-9a-fA-F]+")
+
+
+def _live_edge_runs() -> List[Dict[str, Any]]:
+    """
+    Run, against a throwaway server, a flow whose task fails, a flow whose
+    task is cached the second time it runs, and a flow that maps a task.
+
+    :return: the observations the hooks sent
+    """
+    prefect = importlib.import_module("prefect")
+    utilities = importlib.import_module("prefect.testing.utilities")
+    sent: List[Dict[str, Any]] = []
+
+    def _record(**kwargs: Any) -> None:
+        sent.append(kwargs)
+
+    hooks = {
+        "on_completion": [cephooks.emit_task_run],
+        "on_failure": [cephooks.emit_task_run],
+    }
+    flow_hooks = {
+        "on_running": [cephooks.emit_flow_run],
+        "on_completion": [cephooks.emit_flow_run],
+        "on_failure": [cephooks.emit_flow_run],
+    }
+
+    @prefect.task(**hooks)
+    def fail_step(key: str) -> None:
+        try:
+            raise KeyError(key)
+        except KeyError as cause:
+            raise ValueError("failed on purpose") from cause
+
+    @prefect.flow(**flow_hooks)
+    def failing() -> None:
+        fail_step("id")
+
+    def _same_key(*_: Any) -> str:
+        return f"same-key-{os.getpid()}"
+
+    @prefect.task(cache_key_fn=_same_key, persist_result=True, **hooks)
+    def cached_step(seed: int) -> int:
+        return seed + 10
+
+    @prefect.flow(**flow_hooks)
+    def caching() -> int:
+        value: int = cached_step(1)
+        return value
+
+    @prefect.task(**hooks)
+    def square(number: int) -> int:
+        return number * number
+
+    @prefect.task(**hooks)
+    def total(values: List[int]) -> int:
+        return sum(values)
+
+    @prefect.flow(**flow_hooks)
+    def mapping() -> int:
+        value: int = total(square.map([1, 2, 3]))
+        return value
+
+    with (
+        utilities.prefect_test_harness(),
+        mock.patch("convalesce_emit.send_one", side_effect=_record),
+    ):
+        try:
+            failing()
+        except ValueError:
+            pass
+        caching()
+        caching()
+        mapping()
+    return sent
 
 
 def _live_run(env: Dict[str, str]) -> Tuple[List[Dict[str, Any]], Set[str]]:

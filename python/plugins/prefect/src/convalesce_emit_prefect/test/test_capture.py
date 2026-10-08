@@ -4,6 +4,7 @@ Tests for what a flow or task ran: source, arguments and SQL.
 Run with `make test`.
 """
 
+import concurrent.futures
 import contextvars
 import os
 import sys
@@ -13,6 +14,7 @@ import unittest
 from typing import Any, Dict, List, Optional
 from unittest import mock
 
+import convalesce_emit as cemit
 import convalesce_emit.sqlcapture as cesqlcap
 import convalesce_emit_prefect._capture as cecap
 
@@ -309,6 +311,263 @@ class Test_shape1(unittest.TestCase):
         with mock.patch.object(cecap, "_ARGUMENT_NODES", 20):
             _, excluded = cecap.shape({"tree": _Node(6)})
         self.assertIn("node backstop", [entry["reason"] for entry in excluded])
+
+
+# #############################################################################
+# Test_shape2
+# #############################################################################
+
+
+class ResultRecord:
+    """Stands in for Prefect 3's `ResultRecord`: the value is in memory."""
+
+    __module__ = "prefect._internal.result_records"
+
+    def __init__(self, result: Any) -> None:
+        self.result = result
+
+
+class ResultRecordMetadata:
+    """Stands in for where Prefect 3 stored a result it no longer holds."""
+
+    __module__ = "prefect.results"
+
+    def __init__(self) -> None:
+        self.storage_key = "s3://bucket/key"
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(f"read {name} from storage")
+
+
+class _FutureState:
+    """Stands in for the state a task run ended in."""
+
+    def __init__(self, completed: bool, data: Any) -> None:
+        self._completed = completed
+        self.data = data
+
+    def is_completed(self) -> bool:
+        """Whether the task completed."""
+        return self._completed
+
+    def result(self) -> Any:
+        """What would load the value, which must never be asked for."""
+        raise AssertionError("the result was loaded")
+
+
+class PrefectFuture:
+    """Stands in for Prefect 3's future of a task run."""
+
+    __module__ = "prefect.futures"
+
+    def __init__(
+        self,
+        task_run_id: Optional[str],
+        final_state: Any = None,
+        wrapped: Any = None,
+    ) -> None:
+        self._task_run_id = task_run_id
+        self._final_state = final_state
+        self._wrapped_future = wrapped
+
+    def result(self) -> Any:
+        """What would wait for the task, which must never be asked for."""
+        raise AssertionError("the future was waited on")
+
+    def wait(self) -> None:
+        """As `result`."""
+        raise AssertionError("the future was waited on")
+
+
+class PrefectFutureList(List[Any]):
+    """Stands in for the list `task.map()` returns on Prefect 3."""
+
+    __module__ = "prefect.futures"
+
+
+def _done(value: Any) -> "concurrent.futures.Future[Any]":
+    """
+    A concurrent future that finished with a value.
+
+    :param value: what it finished with
+    :return: the future
+    """
+    future: "concurrent.futures.Future[Any]" = concurrent.futures.Future()
+    future.set_result(value)
+    return future
+
+
+class Test_shape2(unittest.TestCase):
+    """
+    Test that a future among the arguments crosses as the value its task
+    returned, and never as where it lives in memory.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the futures of a mapped task, as Prefect 3 hands them to
+        the task after it, are the values the mapped task returned: from
+        the future's final state, or from the future it wraps.
+        """
+        values = PrefectFutureList(
+            [
+                PrefectFuture("t-1", _FutureState(True, ResultRecord(1))),
+                PrefectFuture(
+                    "t-2", wrapped=_done(_FutureState(True, ResultRecord(4)))
+                ),
+                PrefectFuture("t-3", _FutureState(True, 9)),
+            ]
+        )
+        shaped, excluded = cecap.shape({"values": values})
+        self.assertEqual(shaped, {"values": [1, 4, 9]})
+        self.assertEqual(excluded, [])
+
+    def test2(self) -> None:
+        """
+        Test that a future that has not finished, failed, was cancelled,
+        or whose value is in storage is a reference to its task run, and
+        is never waited on or loaded.
+        """
+        running: "concurrent.futures.Future[Any]" = concurrent.futures.Future()
+        cancelled: "concurrent.futures.Future[Any]" = concurrent.futures.Future()
+        cancelled.cancel()
+        raised: "concurrent.futures.Future[Any]" = concurrent.futures.Future()
+        raised.set_exception(ValueError("bad row"))
+        futures = [
+            PrefectFuture("t-1"),
+            PrefectFuture("t-2", wrapped=running),
+            PrefectFuture("t-3", wrapped=cancelled),
+            PrefectFuture("t-4", wrapped=raised),
+            PrefectFuture(
+                "t-5", _FutureState(False, ResultRecord(ValueError()))
+            ),
+            PrefectFuture("t-6", _FutureState(True, ResultRecordMetadata())),
+            PrefectFuture("t-7", _FutureState(True, None)),
+            PrefectFuture(
+                "t-8", _FutureState(True, ResultRecord.__new__(ResultRecord))
+            ),
+        ]
+        shaped, _ = cecap.shape({"values": futures, "one": futures[0]})
+        self.assertEqual(
+            shaped["values"],
+            [{"task_run_id": f"t-{n}"} for n in range(1, 9)],
+        )
+        self.assertNotIn("s3://bucket/key", str(shaped))
+        self.assertEqual(shaped["one"], {"task_run_id": "t-1"})
+
+    def test3(self) -> None:
+        """
+        Test that the value a future stands for is cut and masked as any
+        other argument is.
+        """
+        rows = PrefectFuture(
+            "t-1", _FutureState(True, ResultRecord(list(range(5000))))
+        )
+        login = PrefectFuture(
+            "t-2", _FutureState(True, ResultRecord({"password": "hunter2"}))
+        )
+        shaped, excluded = cecap.shape({"rows": rows, "login": login})
+        self.assertEqual(shaped["rows"], list(range(cecap.MAX_ITEMS)))
+        self.assertEqual(
+            excluded[0],
+            {
+                "path": "arguments.rows",
+                "reason": "argument cut: first 50 of 5000",
+            },
+        )
+        # A plain mapping by now, which is what the payload's masking reads.
+        masked, secrets = cemit.redact_secrets({"arguments": shaped})
+        self.assertNotIn("hunter2", str(masked))
+        self.assertEqual(secrets[0]["path"], "arguments.login.password")
+
+    def test4(self) -> None:
+        """
+        Test that a concurrent future passed bare is what it finished
+        with, and its type's name when it has not finished.
+        """
+        running: "concurrent.futures.Future[Any]" = concurrent.futures.Future()
+        shaped, _ = cecap.shape(
+            {
+                "done": _done([1, 2]),
+                "state": _done(_FutureState(True, ResultRecord("a"))),
+                "running": running,
+            }
+        )
+        self.assertEqual(
+            shaped, {"done": [1, 2], "state": "a", "running": "<Future>"}
+        )
+
+    def test5(self) -> None:
+        """
+        Test that a future naming no task run, and one that cannot be
+        read, is its type's name.
+        """
+
+        class Broken(PrefectFuture):
+            """A future whose state raises when asked anything."""
+
+            __module__ = "prefect.futures"
+
+        class Raises:
+            """A state that cannot say how it ended."""
+
+            def is_completed(self) -> bool:
+                """Raise, as a state from a closed client might."""
+                raise RuntimeError("closed")
+
+        class Slotted(PrefectFuture):
+            """A future that keeps nothing of its own."""
+
+            __module__ = "prefect.futures"
+            __slots__ = ()
+
+            # pylint: disable-next=super-init-not-called
+            def __init__(self) -> None:
+                pass
+
+            def __getattribute__(self, name: str) -> Any:
+                raise RuntimeError(name)
+
+        shaped, _ = cecap.shape(
+            {
+                "unnamed": PrefectFuture(None),
+                "broken": Broken("t-1", Raises()),
+            }
+        )
+        self.assertEqual(
+            shaped, {"unnamed": "<PrefectFuture>", "broken": "<Broken>"}
+        )
+        self.assertEqual(cecap.bound(Slotted(), "arguments.x", []), "<Slotted>")
+
+    def test6(self) -> None:
+        """
+        Test that no argument says where an object lives in memory: the
+        text is cut to the type's name, wherever in the arguments it is.
+        """
+
+        class Client:
+            """An object with the default repr and nothing to walk."""
+
+            __slots__ = ()
+
+        shaped, _ = cecap.shape(
+            {
+                "client": Client(),
+                "nested": {"hooks": [len, Client()]},
+                "text": "ran <Future at 0x7f3a state=finished returned State>",
+                "hook": "<function flow.<locals>.<lambda> at 0x7f3a>",
+                "method": "<bound method A.run of <a.A object at 0x7f3a>>",
+                "plain": "at 0x10 nothing here",
+            }
+        )
+        self.assertRegex(shaped["client"], r"^<\S*\.Client>$")
+        self.assertRegex(shaped["nested"]["hooks"][1], r"^<\S*\.Client>$")
+        self.assertEqual(shaped["text"], "ran <Future>")
+        self.assertEqual(shaped["hook"], "<function>")
+        self.assertEqual(shaped["method"], "<bound method A.run of <a.A>>")
+        self.assertEqual(shaped["plain"], "at 0x10 nothing here")
+        self.assertNotRegex(str(shaped), r" at 0x[0-9a-f]+[ >]")
+        self.assertEqual(cecap.shape("<Lock at 0x1f>"), ("<Lock>", []))
 
 
 # #############################################################################

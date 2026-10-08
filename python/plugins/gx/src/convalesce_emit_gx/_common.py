@@ -16,7 +16,6 @@ _LOG = logging.getLogger(__name__)
 
 TOOL = "great_expectations"
 
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
 
 # A query asset's query is code, so it follows the setting every plugin
@@ -42,14 +41,61 @@ _QUERY_CUT = "query cut"
 _SKIP_ARGS = frozenset({"data_asset"})
 
 
+# What a platform may put in front of a setting's name, as AWS Glue does
+# with the variables it hands a job. Read here for the same reason.
+_PLATFORM_PREFIX = "CUSTOMER_"
+
+
+def read_setting(name: str) -> Optional[str]:
+    """
+    Read one of this plugin's settings, under either of its names.
+
+    :param name: the setting, such as `CONVALESCE_SEND_SOURCE`
+    :return: its value as set, or None when it is set under neither name
+    """
+    return os.environ.get(name, os.environ.get(_PLATFORM_PREFIX + name))
+
+
 def send_samples() -> bool:
     """
-    Whether the operator has opted into sending row values.
+    Whether failing sample values and observed column values may be sent.
 
-    :return: True when `CONVALESCE_GX_SEND_SAMPLES` is set truthy
+    They are what says *which* rows broke a check, so they cross unless the
+    operator switches them off.
+
+    :return: False only when `CONVALESCE_GX_SEND_SAMPLES` says so
     """
-    raw = os.environ.get("CONVALESCE_GX_SEND_SAMPLES", "")
-    return raw.strip().lower() in _TRUTHY
+    raw = read_setting("CONVALESCE_GX_SEND_SAMPLES") or ""
+    return raw.strip().lower() not in _FALSY
+
+
+def named_dataset(
+    platform: Optional[str] = None,
+    dataset_name: Optional[str] = None,
+    platform_instance: Optional[str] = None,
+) -> Dict[str, str]:
+    """
+    What an action was told about where its checkpoint's batch lives.
+
+    A dataframe has no table behind it that GX knows of, and a datasource
+    may be named for anything, so the action can be told the platform, the
+    table and the platform instance outright. They cross as written, and a
+    receiver files this validation's results under them before anything it
+    worked out itself.
+
+    :param platform: the platform, as the catalogue names it (`postgres`)
+    :param dataset_name: the table, as the catalogue names it
+        (`my_db.my_schema.orders`)
+    :param platform_instance: the instance of the platform, where the
+        catalogue tells several apart
+    :return: those that were given, by name
+    """
+    named = {
+        "platform": platform,
+        "dataset_name": dataset_name,
+        "platform_instance": platform_instance,
+    }
+    return {name: str(value) for name, value in named.items() if value}
 
 
 def send_query() -> bool:
@@ -58,7 +104,7 @@ def send_query() -> bool:
 
     :return: False only when `CONVALESCE_SEND_SOURCE` says so
     """
-    raw = os.environ.get(_SEND_SOURCE_ENV, "")
+    raw = read_setting(_SEND_SOURCE_ENV) or ""
     return raw.strip().lower() not in _FALSY
 
 
@@ -710,6 +756,9 @@ def forward_validation_result(
     result: Any,
     emitter: Optional[cemit.EmitterLike] = None,
     validator: Any = None,
+    platform: Optional[str] = None,
+    dataset_name: Optional[str] = None,
+    platform_instance: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Forward one validation result that ran outside a checkpoint.
@@ -725,6 +774,9 @@ def forward_validation_result(
     :param validator: on 0.x, the validator that produced it: its engine
         names the platform, as a checkpoint's runtime does, and is then left
         behind. 1.x looks its datasources up on the running context instead
+    :param platform: the platform the batch lives on, to name it outright
+    :param dataset_name: the table the batch is, to name it outright
+    :param platform_instance: the instance of the platform it lives on
     :return: whether the observation was emitted, and whether it was redacted
     """
     urls: Dict[str, str] = {}
@@ -741,6 +793,7 @@ def forward_validation_result(
         emitter,
         datasources=datasources_v1(None, results=[result]),
         result_urls=urls,
+        named=named_dataset(platform, dataset_name, platform_instance),
     )
 
 
@@ -749,19 +802,19 @@ def forward(
     emitter: Optional[cemit.EmitterLike] = None,
     datasources: Optional[Dict[str, Dict[str, Any]]] = None,
     result_urls: Optional[Dict[str, str]] = None,
+    named: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
-    Redact and send one validation result.
+    Send one validation result.
 
-    Redaction is on unless deliberately turned off: a GX result carries
-    sample failing values, which are real rows from the customer's table,
-    and the handbook promises we read "table shapes, run outcomes, row
-    counts, lineage. Not the rows themselves." The same goes for the values
-    a distinct-values expectation observed; see `redact_values`.
+    A GX result carries the failing values it sampled, and a distinct-values
+    expectation the values it observed. They are sent, because they are what
+    says which rows broke the check, unless `CONVALESCE_GX_SEND_SAMPLES` is
+    set false: then each is replaced by its count; see `redact_values`.
 
-    The Great Expectations runtime is left behind for the same reason and
-    one more: a validator owns the frame it validated, and no receiver reads
-    a word of the data context hanging off it.
+    The Great Expectations runtime is left behind whatever that setting: a
+    validator owns the whole frame it validated, and no receiver reads a
+    word of the data context hanging off it.
 
     :param payload: whatever GX handed the action
     :param emitter: emitter to send through; built from the environment when
@@ -770,6 +823,8 @@ def forward(
         action could name them
     :param result_urls: each validation result's GX Cloud page, by
         identifier
+    :param named: the platform, table and platform instance the action was
+        told, as `named_dataset` returns them
     :return: whether the observation was emitted, and whether it was redacted
     """
     redact = not send_samples()
@@ -781,6 +836,8 @@ def forward(
             platform["datasources"] = datasources
         if result_urls:
             platform["result_urls"] = result_urls
+        if named:
+            platform.update(named)
         budget = cemit.new_budget()
         body = cemit.dump(shape(payload), budget=budget)
         if platform and isinstance(body, dict):

@@ -31,11 +31,12 @@ import importlib
 import importlib.abc
 import importlib.util
 import logging
-import os
 import re
 import sys
 import threading
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import convalesce_emit.config as ceconfig
 
 _LOG = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ def enabled() -> bool:
 
     :return: False only when the setting says so
     """
-    return os.environ.get(_ENV, "").strip().lower() not in _FALSY
+    return (ceconfig.read_setting(_ENV) or "").strip().lower() not in _FALSY
 
 
 def ignore(predicate: Callable[[Dict[str, Any]], bool]) -> None:
@@ -310,6 +311,44 @@ def _hook_sqlalchemy() -> bool:
     return True
 
 
+# Drivers whose connection does not say which database it is on, and the one
+# query that does. DuckDB names a file database by the file's stem.
+_ASKED = {"duckdb": "select current_database(), current_schema()"}
+# What each such connection answered, by its id: asked once, kept small.
+_ANSWERED: Dict[int, Tuple[Optional[str], Optional[str]]] = {}
+_MAX_ANSWERED = 64
+
+
+def _where(connection: Any, execute: Any) -> Tuple[Optional[str], Optional[str]]:
+    """
+    The database and schema a connection is on, asked of it once.
+
+    The question runs on the step's own connection just before its first
+    statement, which replaces the answer as the connection's result. A
+    connection that cannot be asked is not asked again.
+
+    :param connection: the driver's connection
+    :param execute: its own, unwrapped `execute`
+    :return: the database and the schema, or None for either
+    """
+    key = id(connection)
+    if key in _ANSWERED:
+        return _ANSWERED[key]
+    found: Tuple[Optional[str], Optional[str]] = (None, None)
+    try:
+        row = execute(connection, _ASKED["duckdb"]).fetchone()
+        found = (
+            str(row[0]) if row and row[0] else None,
+            str(row[1]) if row and row[1] else None,
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    if len(_ANSWERED) >= _MAX_ANSWERED:
+        _ANSWERED.clear()
+    _ANSWERED[key] = found
+    return found
+
+
 def _wrap_method(owner: Any, name: str, dialect: str, via: str) -> bool:
     """
     Replace one `execute`-like method on a Python-level class with one
@@ -320,7 +359,12 @@ def _wrap_method(owner: Any, name: str, dialect: str, via: str) -> bool:
         return False
 
     def noted(self: Any, operation: Any, *args: Any, **kwargs: Any) -> Any:
-        record(operation, dialect=dialect, via=via)
+        database, schema = (
+            _where(self, original) if dialect in _ASKED else (None, None)
+        )
+        record(
+            operation, dialect=dialect, database=database, schema=schema, via=via
+        )
         return original(self, operation, *args, **kwargs)
 
     setattr(noted, _MARK, True)

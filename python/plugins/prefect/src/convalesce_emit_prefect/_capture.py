@@ -24,10 +24,10 @@ Import as:
 import convalesce_emit_prefect._capture as cecap
 """
 
+import concurrent.futures
 import itertools
 import json
-import logging
-import os
+import re
 import sys
 import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,8 +35,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import convalesce_emit as cemit
 import convalesce_emit.source as cesource
 import convalesce_emit.sqlcapture as cesqlcap
+import convalesce_emit_prefect._env as ceprefenv
+import convalesce_emit_prefect._mask as cemask
 
-_LOG = logging.getLogger(__name__)
+_LOG = cemask.logger(__name__)
 
 # Where Prefect keeps the running task and flow. Read from the modules
 # already loaded, never imported: where it is not loaded, nothing is running.
@@ -62,6 +64,27 @@ _ARGUMENT_NODES = 2_000
 ARGUMENTS = "arguments"
 _CUT = "argument cut"
 _TOO_LARGE = "argument too large"
+
+# Prefect 3 hands a task the futures of a mapped task as they are, in a list
+# of its own type, and resolves them only for the call. Both are told by
+# name, since Prefect is never imported here.
+_PREFECT = "prefect."
+_FUTURE = "PrefectFuture"
+_FUTURE_LIST = "PrefectFutureList"
+# What holds a result in memory, as a completed state's data. Anything else
+# of Prefect's own there says where a result is stored, not what it is.
+_RESULT_RECORD = "ResultRecord"
+# What a future is sent as when the value is not there to send.
+TASK_RUN_ID = "task_run_id"
+# A default repr names where the object lives in memory, which says nothing
+# and differs every run: `<Future at 0x7f... state=finished>`.
+# A name may hold brackets of its own, as `f.<locals>.g` and `<lambda>` do.
+_ADDRESS = " at 0x"
+_ADDRESSED = re.compile(
+    r"<((?:[^\s<>]|<\w+>)+)(?=\s)(?:[^<>]|<\w+>)*? at 0x[0-9a-fA-F]+"
+    r"(?:[^<>]|<\w+>)*>"
+)
+_NOT_HELD = object()
 
 Excluded = List[Dict[str, str]]
 
@@ -107,7 +130,7 @@ def send_arguments() -> bool:
 
     :return: False only when `CONVALESCE_SEND_ARGUMENTS` says so
     """
-    raw = os.environ.get(_SEND_ARGUMENTS_ENV, "")
+    raw = ceprefenv.read(_SEND_ARGUMENTS_ENV) or ""
     return raw.strip().lower() not in _FALSY
 
 
@@ -116,9 +139,10 @@ def arguments_of(task_run: Any) -> Optional[Dict[str, Any]]:
     What the running task was called with, by parameter name.
 
     A task run records which upstream runs fed it, never the values. Those
-    are on the run context Prefect keeps while the task and its hooks run,
-    already resolved: an argument that was another task's future is the
-    value that task returned.
+    are on the run context Prefect keeps while the task and its hooks run.
+    An argument that was another task's future is there as the value that
+    task returned; the futures of a mapped task are there as futures, on
+    Prefect 3, and `shape` replaces each finished one by its value.
 
     :param task_run: the task run the hook was given
     :return: the arguments, not yet shaped; None when sending is off, or
@@ -156,7 +180,7 @@ def shape(values: Any, path: str = ARGUMENTS) -> Tuple[Any, Excluded]:
     budget.nodes = _ARGUMENT_NODES
     dumped = cemit.dump(bound(values, path, excluded), budget=budget, path=path)
     excluded.extend(budget.excluded)
-    dumped = bound(dumped, path, excluded)
+    dumped = _without_addresses(bound(dumped, path, excluded))
     if not isinstance(dumped, dict):
         return dumped, excluded
     for name, value in list(dumped.items()):
@@ -174,8 +198,10 @@ def bound(value: Any, path: str, excluded: Excluded, depth: int = 0) -> Any:
     """
     Cut a plain value down: long text, long lists, deep nesting.
 
-    Only plain containers are walked. Anything else is left as it is, for
-    the core serialiser to dump or to name.
+    Only plain containers are walked, and Prefect's list of futures, which
+    is one. A future that has finished is the value its task returned, cut
+    like any other. Anything else is left as it is, for the core serialiser
+    to dump or to name.
 
     :param value: the value
     :param path: where it sits in the payload
@@ -183,7 +209,9 @@ def bound(value: Any, path: str, excluded: Excluded, depth: int = 0) -> Any:
     :param depth: how far below the arguments this is
     :return: the value, cut where it was large
     """
-    if type(value) not in (dict, list, tuple, set, frozenset):
+    value = _settled(value)
+    plain = type(value) in (dict, list, tuple, set, frozenset)
+    if not plain and not _is_prefect(value, _FUTURE_LIST, list):
         return _bound_leaf(value, path, excluded)
     if depth >= MAX_DEPTH:
         excluded.append({"path": path, "reason": _CUT})
@@ -222,6 +250,141 @@ def _bound_leaf(value: Any, path: str, excluded: Excluded) -> Any:
     if isinstance(value, (bytes, bytearray)):
         excluded.append({"path": path, "reason": _CUT})
         return f"<{type(value).__name__}: {len(value)} bytes>"
+    return value
+
+
+def _settled(value: Any) -> Any:
+    """
+    A future as what it stands for, read from memory and never waited on.
+
+    :param value: an argument, or a value inside one
+    :return: for a future that finished, the value its task returned; for
+        one that has not, failed, or whose value is in storage, a reference
+        to its task run; any other value as it is
+    """
+    try:
+        if _is_prefect(value, _FUTURE, object):
+            held = _future_value(value)
+            if held is not _NOT_HELD:
+                return held
+            run_id = _own(value).get("_task_run_id")
+            if run_id is not None:
+                return {TASK_RUN_ID: str(run_id)}
+            return f"<{type(value).__name__}>"
+        if isinstance(value, concurrent.futures.Future):
+            held = _state_value(_finished(value))
+            return f"<{type(value).__name__}>" if held is _NOT_HELD else held
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.debug("convalesce: could not read a future: %s", exc)
+        return f"<{type(value).__name__}>"
+    return value
+
+
+def _is_prefect(value: Any, name: str, base: type) -> bool:
+    """
+    Whether a value is of one of Prefect's own classes, told by name.
+
+    :param value: the value
+    :param name: the class's name
+    :param base: a class the value must be an instance of
+    :return: True when a class of that name, from Prefect, is among the
+        value's own
+    """
+    if not isinstance(value, base):
+        return False
+    return any(
+        klass.__name__ == name
+        and str(getattr(klass, "__module__", "")).startswith(_PREFECT)
+        for klass in type(value).__mro__
+    )
+
+
+def _own(value: Any) -> Dict[str, Any]:
+    """
+    What an instance stores itself, read with none of its own code run.
+
+    :param value: the instance
+    :return: its `__dict__`; empty when it keeps none
+    """
+    try:
+        fields = object.__getattribute__(value, "__dict__")
+    except Exception:  # pylint: disable=broad-exception-caught
+        return {}
+    return fields if isinstance(fields, dict) else {}
+
+
+def _future_value(future: Any) -> Any:
+    """
+    What a Prefect future's task returned, when the future already has it.
+
+    :param future: a Prefect future
+    :return: the value, or `_NOT_HELD`
+    """
+    fields = _own(future)
+    state = fields.get("_final_state")
+    if state is None:
+        state = _finished(fields.get("_wrapped_future"))
+    return _state_value(state)
+
+
+def _finished(future: Any) -> Any:
+    """
+    What a concurrent future ended with, when it has ended.
+
+    :param future: the future a Prefect future wraps, or one passed bare
+    :return: its result; `_NOT_HELD` when it is still running, was
+        cancelled, raised, or is no future
+    """
+    if not isinstance(future, concurrent.futures.Future):
+        return _NOT_HELD
+    # None of these waits once the future is done, and done is final.
+    if not future.done() or future.cancelled():
+        return _NOT_HELD
+    if future.exception() is not None:
+        return _NOT_HELD
+    return future.result()
+
+
+def _state_value(state: Any) -> Any:
+    """
+    The value a completed state holds in memory.
+
+    `state.result()` is not called: where results are persisted it reads
+    them back from storage, which is the customer's, and may be remote.
+
+    :param state: a Prefect state, or what a bare future ended with
+    :return: the value; `_NOT_HELD` for a state that did not complete or
+        whose value is not in memory
+    """
+    if state is _NOT_HELD:
+        return _NOT_HELD
+    completed = getattr(type(state), "is_completed", None)
+    if not callable(completed):
+        # Not a state: a bare future's own result.
+        return state
+    data = _own(state).get("data") if completed(state) else None
+    if _is_prefect(data, _RESULT_RECORD, object):
+        return _own(data).get("result", _NOT_HELD)
+    if data is None or str(type(data).__module__).startswith(_PREFECT):
+        return _NOT_HELD
+    return data
+
+
+def _without_addresses(value: Any) -> Any:
+    """
+    Name by its type any value whose text says where it lives in memory.
+
+    :param value: dumped arguments
+    :return: the same, each `<Type ... at 0x...>` in a text as `<Type>`
+    """
+    if isinstance(value, str):
+        if _ADDRESS not in value:
+            return value
+        return _ADDRESSED.sub(r"<\1>", value)
+    if isinstance(value, dict):
+        return {key: _without_addresses(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_without_addresses(item) for item in value]
     return value
 
 

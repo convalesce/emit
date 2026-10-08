@@ -29,6 +29,8 @@ import re
 import unittest
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+import convalesce_emit as cemit
+import convalesce_emit_airflow.carried as cealcar
 import convalesce_emit_airflow.listener as cealist
 
 _LOG = logging.getLogger(__name__)
@@ -66,6 +68,11 @@ def _importable(name: str) -> bool:
 
 _HAS_AIRFLOW = _importable("airflow")
 _SKIP_REASON = "needs a real Airflow install"
+if _HAS_AIRFLOW:
+    # As the plugin does on load: where no OpenLineage provider is installed
+    # the carried copy for this Airflow is the one whose facets are sent, so
+    # it is the one checked.
+    cealcar.make_importable(cemit.version_of("airflow"))
 
 
 # #############################################################################

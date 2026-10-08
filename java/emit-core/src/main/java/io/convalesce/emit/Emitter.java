@@ -34,6 +34,10 @@ import java.util.logging.Logger;
  * observation cannot take the others with it, and whatever is still refused is kept on disk. A part
  * batch is flushed in the background every few seconds and when the JVM shuts down, so a driver
  * that dies between events loses nothing it had already queued.
+ *
+ * <p>The ingest key goes in the {@code Authorization} header and nowhere else. A tool can still
+ * hand it over inside what it reports, as a setting that carries the driver's environment does, so
+ * the key's exact value is masked in every payload before it is queued.
  */
 public final class Emitter {
 
@@ -60,6 +64,15 @@ public final class Emitter {
   // Caps the backoff so a long outage cannot park a driver thread for minutes.
   private static final long MAX_BACKOFF_MS = 30_000L;
 
+  // A key shorter than this is not looked for in a payload: a few characters turn up in ordinary
+  // text, and masking them would mangle it.
+  static final int MIN_KEY_LENGTH = 8;
+  static final String KEY_MASK = "***";
+  static final String DRY_RUN_PREFIX = "convalesce dry-run: ";
+
+  // Never registered: asking the runtime to remove it is how a JVM says it is shutting down.
+  private static final Thread SHUTDOWN_PROBE = new Thread("convalesce-emit-shutdown-probe");
+
   private final Config config;
   private final Random random = new Random();
   private final List<Observation> batch = new ArrayList<Observation>();
@@ -68,6 +81,9 @@ public final class Emitter {
   private final Object lock = new Object();
   private final boolean usable;
   private final Spool spool;
+  // The key as written, and as it reads inside a JSON string; null when too short to look for.
+  private final String key;
+  private final String keyInJson;
 
   /**
    * Builds an emitter.
@@ -82,6 +98,11 @@ public final class Emitter {
       LOG.warning("convalesce: not emitting: " + problem);
     }
     this.spool = new Spool(config.spoolDir(), config.spoolMaxBytes());
+    String configured = config.ingestKey();
+    boolean lookFor = configured != null && configured.length() >= MIN_KEY_LENGTH;
+    this.key = lookFor ? configured : null;
+    String quoted = lookFor ? Json.quote(configured) : null;
+    this.keyInJson = lookFor ? quoted.substring(1, quoted.length() - 1) : null;
     if (usable && config.enabled()) {
       startBackgroundFlush();
     }
@@ -141,10 +162,25 @@ public final class Emitter {
    * @param toolVersion the tool's version, where it could be read
    */
   public void emit(String tool, String event, String payloadJson, String toolVersion) {
+    emit(tool, event, payloadJson, toolVersion, Collections.<Exclusion>emptyList());
+  }
+
+  /**
+   * Queues one observation whose payload the caller masked something in, which is declared in the
+   * observation's {@code excluded}.
+   *
+   * @param tool which tool produced this
+   * @param event which callback fired
+   * @param payloadJson the tool's own output, already JSON
+   * @param toolVersion the tool's version, where it could be read
+   * @param excluded what was masked in the payload, by path and reason
+   */
+  public void emit(
+      String tool, String event, String payloadJson, String toolVersion, List<Exclusion> excluded) {
     if (!usable || !config.enabled()) {
       return;
     }
-    Observation observation = new Observation(tool, event, payloadJson, toolVersion);
+    Observation observation = observation(tool, event, payloadJson, toolVersion, excluded);
     byte[] bytes = observation.toJson().getBytes(UTF8);
     int overhead = BODY_OPEN.length() + BODY_CLOSE.length();
     if (!fits(bytes.length)) {
@@ -196,8 +232,24 @@ public final class Emitter {
    * @return whether it is within the receiver's body limit
    */
   public boolean fits(String tool, String event, String payloadJson, String toolVersion) {
-    Observation observation = new Observation(tool, event, payloadJson, toolVersion);
+    Observation observation =
+        observation(tool, event, payloadJson, toolVersion, Collections.<Exclusion>emptyList());
     return fits(observation.toJson().getBytes(UTF8).length);
+  }
+
+  /** Wraps a payload, with this emitter's own ingest key masked wherever the payload holds it. */
+  private Observation observation(
+      String tool, String event, String payloadJson, String toolVersion, List<Exclusion> excluded) {
+    List<Exclusion> declared = new ArrayList<Exclusion>(excluded);
+    if (key == null || payloadJson == null) {
+      return new Observation(tool, event, payloadJson, toolVersion, false, declared);
+    }
+    boolean found = payloadJson.contains(key) || payloadJson.contains(keyInJson);
+    if (!found) {
+      return new Observation(tool, event, payloadJson, toolVersion, false, declared);
+    }
+    String masked = payloadJson.replace(keyInJson, KEY_MASK).replace(key, KEY_MASK);
+    return new Observation(tool, event, masked, toolVersion, true, declared);
   }
 
   private boolean fits(int observationBytes) {
@@ -221,8 +273,20 @@ public final class Emitter {
 
   private void send(List<byte[]> sending) {
     if (config.dryRun()) {
+      // A driver that fails without stopping its session sends the application's end, and the
+      // last part batch, as the JVM shuts down. Logging shuts down beside it and drops what it is
+      // handed, so there a dry run writes straight to stderr.
+      boolean direct = shuttingDown();
       for (byte[] observation : sending) {
-        LOG.info("convalesce dry-run: " + new String(observation, UTF8));
+        String line = DRY_RUN_PREFIX + new String(observation, UTF8);
+        if (direct) {
+          System.err.println(line);
+        } else {
+          LOG.info(line);
+        }
+      }
+      if (direct) {
+        System.err.flush();
       }
       return;
     }
@@ -244,6 +308,19 @@ public final class Emitter {
       return;
     }
     drain();
+  }
+
+  /** Whether the JVM has begun to shut down, which it says by refusing a change to its hooks. */
+  static boolean shuttingDown() {
+    try {
+      Runtime.getRuntime().removeShutdownHook(SHUTDOWN_PROBE);
+      return false;
+    } catch (IllegalStateException e) {
+      return true;
+    } catch (RuntimeException e) {
+      // A security manager that will not be asked: assume the usual case.
+      return false;
+    }
   }
 
   private void refused(List<byte[]> sending, byte[] body, TransportException e) {

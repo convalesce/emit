@@ -64,7 +64,6 @@ import convalesce_emit_dagster.retry as cedagretry
 import dataclasses
 import json
 import logging
-import os
 import socket
 import urllib.error
 import urllib.parse
@@ -73,6 +72,7 @@ from typing import Any, Dict, Optional
 
 import convalesce_emit as cemit
 import convalesce_emit.retry as ceretry
+import convalesce_emit_dagster._env as cedagenv
 import convalesce_emit_dagster._version as cedagsterver
 
 TOOL = "dagster"
@@ -162,8 +162,8 @@ def _read_target() -> Optional[_RetryTarget]:
     :return: the target to call, or None when the host is unset, or it
         is a Dagster+ host and no token is
     """
-    host = os.environ.get(_HOST_ENV)
-    token = os.environ.get(_TOKEN_ENV)
+    host = cedagenv.read(_HOST_ENV)
+    token = cedagenv.read(_TOKEN_ENV)
     if not host or not host.strip():
         _LOG.warning(
             "convalesce: %s is not set; not executing dagster retries",

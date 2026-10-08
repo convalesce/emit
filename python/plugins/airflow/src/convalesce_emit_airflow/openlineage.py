@@ -52,6 +52,7 @@ import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import convalesce_emit as cemit
+import convalesce_emit_airflow._env as cealenv
 import convalesce_emit_airflow.carried as cealcar
 import convalesce_emit_airflow.listener as cealist
 
@@ -169,6 +170,9 @@ class ConvalesceTransport(Transport):  # type: ignore[misc]
         process it forks and ends with `os._exit`, so nothing still queued
         would survive the task.
 
+        Nothing is sent for a DAG the listener leaves unreported; see
+        `cealist.dag_reported`.
+
         :param event: the event the provider built, a `RunEvent` usually
         :return: nothing
         """
@@ -177,6 +181,8 @@ class ConvalesceTransport(Transport):  # type: ignore[misc]
             return
         try:
             payload, excluded = shape(event)
+            if not cealist.dag_reported(dag_id_of(payload["run_event"])):
+                return
             emitter.emit(
                 tool="airflow",
                 event=EVENT,
@@ -203,6 +209,41 @@ def shape(event: Any) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
     dumped = cemit.dump(to_dict(event), budget=budget, path="run_event")
     redacted, secrets = cemit.redact_secrets(dumped, path="run_event")
     return {"run_event": redacted}, budget.excluded + secrets
+
+
+def dag_id_of(run_event: Any) -> Optional[str]:
+    """
+    The DAG a provider's event is about.
+
+    Read the way the receiver reads it, so the DAG an event is left out for
+    is the DAG it would have been filed under: the provider's `airflow`
+    (task) and `airflowDagRun` (DAG run) run facets name it exactly, and
+    without them the job name does, `<dag_id>` or `<dag_id>.<task_id>`,
+    split at its first dot.
+
+    :param run_event: the event as JSON-shaped data
+    :return: the DAG's id, or None for an event that names no job
+    """
+    if not isinstance(run_event, dict):
+        return None
+    facets = _mapping(_mapping(run_event.get("run")).get("facets"))
+    for facet in (
+        _mapping(facets.get("airflow")),
+        _mapping(facets.get("airflowDagRun")),
+    ):
+        for holder in ("dag", "dagRun"):
+            dag_id = _mapping(facet.get(holder)).get("dag_id")
+            if isinstance(dag_id, str) and dag_id:
+                return dag_id
+    name = _mapping(run_event.get("job")).get("name")
+    if isinstance(name, str) and name:
+        return name.partition(".")[0]
+    return None
+
+
+def _mapping(value: Any) -> Dict[str, Any]:
+    """A value that is a mapping, else an empty one."""
+    return value if isinstance(value, dict) else {}
 
 
 def to_dict(event: Any) -> Any:
@@ -370,7 +411,7 @@ def _flag(env: Mapping[str, str], name: str) -> Optional[bool]:
     :return: False when it is set to a false value, True when set to
         anything else, None when unset
     """
-    raw = env.get(name)
+    raw = cealenv.read(name, env)
     if raw is None:
         return None
     return raw.strip().lower() not in _FALSY

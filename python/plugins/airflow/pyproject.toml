@@ -12,7 +12,7 @@ authors = [{ name = "Convalesce" }]
 # carried instead (see `carried.py`). What that copy needs and cannot carry
 # is the SQL parser: compiled, and with no requirements of its own.
 requires-python = ">=3.9"
-dependencies = ["convalesce-emit>=0.2.0,<1", "openlineage-sql>=1.4"]
+dependencies = ["convalesce-emit>=0.2.1,<1", "openlineage-sql>=1.4"]
 
 [project.entry-points."airflow.plugins"]
 convalesce_emit = "convalesce_emit_airflow.plugin:ConvalescePlugin"

@@ -18,8 +18,9 @@ import convalesce_emit.source as cesource
 
 import hashlib
 import inspect
-import os
 from typing import Any, Dict, Optional
+
+import convalesce_emit.config as ceconfig
 
 _ENV = "CONVALESCE_SEND_SOURCE"
 _FALSY = frozenset({"0", "false", "no", "off"})
@@ -35,7 +36,7 @@ def enabled() -> bool:
 
     :return: False only when the setting says so
     """
-    return os.environ.get(_ENV, "").strip().lower() not in _FALSY
+    return (ceconfig.read_setting(_ENV) or "").strip().lower() not in _FALSY
 
 
 def _unwrapped(fn: Any) -> Any:
