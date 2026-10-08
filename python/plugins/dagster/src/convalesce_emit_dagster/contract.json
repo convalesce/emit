@@ -224,7 +224,6 @@
       "dagster_run.status",
       "dagster_run.step_keys_to_execute",
       "dagster_run.tags",
-      "dagster_run.tags..dagster/grpc_info",
       "dagster_run.tags..dagster/scheduled_execution_time",
       "dagster_run.tags.dagster/backfill",
       "dagster_run.tags.dagster/code_location",

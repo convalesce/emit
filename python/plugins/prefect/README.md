@@ -136,7 +136,9 @@ that ran it:
   was deployed, which is not always what the repository holds.
 - **Arguments.** A flow run's parameter values, and the values each task was
   called with, as `arguments`: an argument that was another task's result is
-  the value that task returned. Values are kept small. A list or mapping
+  the value that task returned, and so is each result of a mapped task. A
+  result that is not in memory yet is sent as its task run's id. Values are
+  kept small. A list or mapping
   keeps its first 50 items, text its first 2,000 characters, a data frame or
   array is named by its type and shape and never read, and every cut is
   listed in the event's `excluded`. Anything named like a credential is

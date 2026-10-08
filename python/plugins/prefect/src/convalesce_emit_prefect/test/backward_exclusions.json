@@ -15,6 +15,9 @@
     "Node": {
       "artifacts": "Left out of the run graph that is read, as api_flow_run_graph_v2: an artifact's key and body are customer-authored, as under events."
     },
+    "State": {
+      "data": "What the flow or task returned, which is the customer's own data, or for a persisted result where it is stored, which on local storage is a path under a home directory. Left out of every state that is sent. What is useful in it crosses under its own name: a failure's exception as error_detail, a short scalar result as result_text, and a finished upstream's value as the argument it became."
+    },
     "WorkPool": {
       "*": "Never read: the flow run names its pool (work_pool_id, work_pool_name). The pool's base job template is infrastructure configuration and can carry credentials."
     }

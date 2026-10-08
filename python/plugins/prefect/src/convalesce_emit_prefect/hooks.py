@@ -29,6 +29,7 @@ import os
 import re
 import threading
 import time
+import types
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import convalesce_emit as cemit
@@ -1243,15 +1244,41 @@ def _held_exception(data: Any) -> Optional[BaseException]:
         return data
     # Read off the instance's own storage, not through attributes: a result
     # that is not in memory may load it from storage on attribute access.
-    # Pydantic 2 keeps a private attribute such as `_cache` apart.
+    # Pydantic 2 keeps a private attribute such as `_cache` apart; pydantic 1,
+    # which Prefect 2 results are built on, keeps it in a slot of the class.
     fields: Dict[str, Any] = {}
     for store in ("__dict__", "__pydantic_private__"):
         try:
             fields.update(object.__getattribute__(data, store) or {})
-        except (AttributeError, TypeError, ValueError):
+        except Exception:  # pylint: disable=broad-exception-caught
             continue
     for name in ("result", "_cache"):
-        value = fields.get(name)
+        value = fields[name] if name in fields else _slot_value(data, name)
         if isinstance(value, BaseException):
             return value
+    return None
+
+
+def _slot_value(data: Any, name: str) -> Any:
+    """
+    What an instance holds in a slot its class declares, read as storage.
+
+    Only a slot is read: any other class attribute of that name, a property
+    for one, could run code, and a result's code may read from storage.
+
+    :param data: the instance
+    :param name: the slot's name
+    :return: the value, or None when there is no such slot or it is unset
+    """
+    try:
+        for klass in type(data).__mro__:
+            slot = vars(klass).get(name)
+            if slot is None:
+                continue
+            if isinstance(slot, types.MemberDescriptorType):
+                # pylint: disable-next=unnecessary-dunder-call
+                return slot.__get__(data, type(data))
+            return None
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
     return None

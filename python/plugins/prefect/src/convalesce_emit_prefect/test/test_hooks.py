@@ -772,6 +772,29 @@ class _ResultRecord:
         self.result = result
 
 
+class _PydanticV1Result:
+    """
+    Stands in for Prefect 2.20's `UnpersistedResult`, a pydantic 1 model.
+
+    Its fields are its `__dict__`; the private `_cache`, which holds what
+    the task returned or raised, is a slot of the class.
+    """
+
+    __slots__ = ("__dict__", "_cache")
+
+    def __init__(self, value: Any) -> None:
+        object.__setattr__(
+            self,
+            "__dict__",
+            {
+                "type": "unpersisted",
+                "artifact_type": None,
+                "artifact_description": None,
+            },
+        )
+        object.__setattr__(self, "_cache", value)
+
+
 class _PersistedResult:
     """A result that would read from storage if asked for its value."""
 
@@ -870,6 +893,60 @@ class Test_error_detail1(unittest.TestCase):
             {"path": "state.data", "reason": "excluded by name"},
             sent["excluded"],
         )
+
+    def test6(self) -> None:
+        """
+        Test that the exception a Prefect 2.20 result holds is found: the
+        result is a pydantic 1 model, whose `_cache` is a slot of the class,
+        in neither its `__dict__` nor a `__pydantic_private__`.
+        """
+        data = _PydanticV1Result(_raised())
+        self.assertNotIn("_cache", data.__dict__)
+        with self.assertRaises(AttributeError):
+            object.__getattribute__(data, "__pydantic_private__")
+        recorder = _Recorder()
+        with mock.patch.dict(sys.modules, {"prefect.context": None}):
+            cephooks.emit_task_run(
+                task="T",
+                task_run=_TaskRun(),
+                state=_State(True, data),
+                emitter=recorder,
+            )
+        detail = recorder.sent[0]["payload"]["error_detail"]
+        self.assertEqual(detail["type"], "builtins.ValueError")
+        self.assertIn("_raised", detail["traceback"])
+        self.assertEqual(detail["cause"]["type"], "builtins.KeyError")
+
+    def test7(self) -> None:
+        """
+        Test that only storage is read, and nothing raises: a slot never
+        set holds nothing, a property of the same name is not called, and
+        an object whose own storage cannot be read holds nothing.
+        """
+
+        class Unset(_PydanticV1Result):
+            """A result whose cache was never filled."""
+
+            def __init__(self) -> None:  # pylint: disable=super-init-not-called
+                object.__setattr__(self, "__dict__", {"type": "unpersisted"})
+
+        class Loads:
+            """A result that reads storage when asked for its cache."""
+
+            @property
+            def _cache(self) -> Any:
+                raise AssertionError("read the cache from storage")
+
+        class Closed:
+            """An object that refuses every read of itself."""
+
+            __slots__ = ()
+
+            def __getattribute__(self, name: str) -> Any:
+                raise RuntimeError(name)
+
+        for data in (Unset(), Loads(), Closed(), 7):
+            self.assertIsNone(cephooks.error_detail(_State(True, data)))
 
 
 # #############################################################################
