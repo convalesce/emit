@@ -353,7 +353,7 @@ def _candidate(**coords: str) -> ceretry.RetryCandidate:
     """One dagster-tool candidate, coordinates as given."""
     return ceretry.RetryCandidate(
         remedy_id="r1",
-        incident_urn="urn:li:incident:1",
+        incident_urn="urn:cvl:incident:1",
         tool="dagster",
         coordinates=coords,
         created_at_millis=1,
@@ -513,7 +513,7 @@ class Test_run_pending_retries1(unittest.TestCase):
         """Test that a tool-mismatched candidate is never considered."""
         candidate = ceretry.RetryCandidate(
             remedy_id="r2",
-            incident_urn="urn:li:incident:2",
+            incident_urn="urn:cvl:incident:2",
             tool="airflow",
             coordinates={"dag_id": "x"},
             created_at_millis=1,

@@ -22,11 +22,12 @@ import java.util.logging.Logger;
  * <p>Reflection rather than a compile-time branch keeps json4s off the compile classpath entirely,
  * so one dependency-free jar covers Spark 3.0 through 4.x.
  *
- * <p>The two string helpers at the bottom are the one place this class touches an event's content,
- * and they touch only the application id: Spark puts it on the application-start event and in a
- * job's properties and nowhere else, so every other event had nothing to say which driver it came
- * from. Reading and inserting one field by text keeps this class free of a JSON parser, which is
- * the whole point of the jar having no dependencies.
+ * <p>The two string helpers below are the one place this class touches an event's content, and they
+ * touch only the application id: Spark puts it on the application-start event and in a job's
+ * properties and nowhere else, so every other event had nothing to say which driver it came from.
+ * Reading and inserting one field by text keeps this class free of a JSON parser, which is the
+ * whole point of the jar having no dependencies. A third adds a field of this library's own, which
+ * is how an application's end carries the driver's settings when they are asked for.
  */
 final class SparkEventJson {
 
@@ -130,6 +131,27 @@ final class SparkEventJson {
     String field = APP_ID_FIELD + ":" + quote(appId);
     boolean empty = json.substring(start + 1).trim().startsWith("}");
     return json.substring(0, start + 1) + field + (empty ? "" : ",") + json.substring(start + 1);
+  }
+
+  /**
+   * Adds one field of this library's own to an event, as the object's last.
+   *
+   * @param json the event as Spark rendered it
+   * @param name the field's name
+   * @param value the field's value, already JSON; null when there is nothing to add
+   * @return the event with the field, or as it was when it is not an object or there is no value
+   */
+  static String withField(String json, String name, String value) {
+    if (json == null || value == null) {
+      return json;
+    }
+    int end = json.lastIndexOf('}');
+    if (end < 0 || !json.trim().startsWith("{")) {
+      return json;
+    }
+    String before = json.substring(0, end);
+    boolean empty = before.trim().equals("{");
+    return before + (empty ? "" : ",") + quote(name) + ":" + value + json.substring(end);
   }
 
   /**

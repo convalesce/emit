@@ -287,9 +287,13 @@ def _sensor(
     if job_name == RETRY_JOB_NAME:
         return
     target = emitter or cemit.Emitter()
+    left_out: List[Dict[str, str]] = []
     if run is not None:
         parts.update(reach_instance(context, run))
         steps = cedsteps.describe(context, run, parts.get("step_stats"))
+        # What a step's settings left out is said in `excluded`, not sent
+        # as part of the step.
+        left_out = cedsteps.take_excluded(steps)
         if steps:
             parts["steps"] = steps
     groups = asset_group_names(context)
@@ -312,7 +316,7 @@ def _sensor(
     )
     budget = cemit.new_budget()
     body = cemit.dump(payload, budget=budget)
-    excluded = budget.excluded
+    excluded = budget.excluded + left_out
     if isinstance(body, dict) and "job_snapshot" in body:
         body["job_snapshot"] = prune_snapshot(body["job_snapshot"])
     if isinstance(body, dict) and isinstance(body.get("asset_metadata"), dict):

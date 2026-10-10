@@ -126,12 +126,12 @@ class Test_gate_wire1(_ServerCase):
         given, the same as the recording operator.
         """
         cegate.is_open(
-            "urn:li:dataset:(urn:li:dataPlatform:hive,orders,PROD)",
+            "urn:cvl:dataset:(urn:cvl:dataPlatform:hive,orders,PROD)",
             config=self._config(),
         )
         self.assertEqual(
             _Recorder.requests[0]["query"]["dataset"],
-            "urn:li:dataset:(urn:li:dataPlatform:hive,orders,PROD)",
+            "urn:cvl:dataset:(urn:cvl:dataPlatform:hive,orders,PROD)",
         )
         self.assertEqual(_Recorder.requests[0]["path"], "/v1/gate")
 

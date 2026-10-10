@@ -136,6 +136,42 @@ Each value or list of values is then replaced by how many there were.
 Counts, percentages and numeric statistics (a mean, a maximum, a row count)
 are sent either way.
 
+## Settings
+
+Set `CONVALESCE_SEND_SETTINGS=true` where your checkpoints run and each
+validation result also carries the environment variables of the process
+that ran it. It is off by default.
+
+A setting whose name or value reads as a credential, and any value longer
+than 300 characters, is sent as a `fingerprint`: a keyed hash, sixteen hex
+characters long, made in your process. It says that the value changed
+between two runs and nothing of what the value is. Every other setting is
+sent as its `value`.
+
+The hash is keyed with `CONVALESCE_FINGERPRINT_KEY` where you set one, and
+with a key derived from your ingest key otherwise. The fingerprint key is
+only ever read in your process and is never sent. `keyed_by` identifies the
+key the hashes were made under, so hashes are compared only between runs
+that used the same one.
+
+Set `CONVALESCE_SETTINGS_SKIP` to a comma-separated list of names to keep
+those settings out in either form, such as
+`CONVALESCE_SETTINGS_SKIP=HOSTNAME,INTERNAL_REGION`.
+
+The event then holds:
+
+```json
+{
+  "settings": {
+    "items": [
+      {"kind": "environment", "name": "API_KEY", "fingerprint": "5d1c0a9e7b3f2468"},
+      {"kind": "environment", "name": "WAREHOUSE", "value": "analytics"}
+    ],
+    "keyed_by": "9f3b6c1d2e4a5b70"
+  }
+}
+```
+
 ## Supported
 
 Great Expectations 0.17 through 1.x, on Python 3.9 and later. Verified on

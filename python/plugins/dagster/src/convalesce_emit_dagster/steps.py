@@ -8,10 +8,11 @@ the configuration it was resolved with exist only in the process that ran
 the step, which under the default executor is not even the run's own.
 
 So this module works in two places. In a step's process it brackets the
-step, notes the statements `convalesce_emit.sqlcapture` saw and the step's
-resolved configuration, and writes them to the run's event log as one
-engine event. In the sensor it reads those events back, reads each executed
-step's source from the repository, and hands the sensor one entry per step.
+step, notes the statements `convalesce_emit.sqlcapture` saw, the step's
+resolved configuration and, where asked for, the settings its process had,
+and writes them to the run's event log as one engine event. In the sensor
+it reads those events back, reads each executed step's source from the
+repository, and hands the sensor one entry per step.
 
 The bracket is put in when this package is imported, which every step
 process does, because it imports the definitions the sensor is declared
@@ -31,6 +32,8 @@ import sys
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional
 
 import convalesce_emit as cemit
+import convalesce_emit.config as ceconfig
+import convalesce_emit.settings as cesettin
 import convalesce_emit.source as cesource
 import convalesce_emit.sqlcapture as cesqlcap
 import convalesce_emit_dagster._env as cedagenv
@@ -83,6 +86,14 @@ _OWN_STORAGE = (
 _STEP_BOUNDARY = "dagster._core.execution.plan"
 _MAX_FRAMES = 200
 
+# What a step's note keeps the settings it could not send under, by path and
+# reason. The sensor moves them to the event's `excluded`; they are in the
+# note because only the step's process knows them.
+SETTINGS_EXCLUDED = "settings_excluded"
+# The sensor has an emitter and its key; a step's process has neither, only
+# the variable an emitter would read.
+_INGEST_KEY_ENV = "CONVALESCE_INGEST_KEY"
+
 # Module state, not a constant: the bracket is process-wide by nature.
 _installed = False  # pylint: disable=invalid-name
 
@@ -110,7 +121,12 @@ def install() -> bool:
     global _installed  # pylint: disable=global-statement
     if _installed:
         return False
-    if not (cesqlcap.enabled() or arguments_enabled() or cesource.enabled()):
+    if not (
+        cesqlcap.enabled()
+        or arguments_enabled()
+        or cesource.enabled()
+        or cesettin.enabled()
+    ):
         return False
     _installed = True
     try:
@@ -189,8 +205,9 @@ def note_of(
 
     :param step_context: Dagster's context for the step
     :param noted: what `sqlcapture.drain` handed over, if anything
-    :return: `{"sql", "config", "ran": {"sha256", "file_sha256"}}`, each
-        only when there is one; empty when the step left nothing to say
+    :return: `{"sql", "config", "ran": {"sha256", "file_sha256"},
+        "settings", "settings_excluded"}`, each only when there is one;
+        empty when the step left nothing to say
     """
     note: Dict[str, Any] = {}
     if noted and cesqlcap.enabled():
@@ -211,7 +228,36 @@ def note_of(
                 if source.get(name)
             }
     masked, _ = cemit.redact_secrets(note)
-    return masked if isinstance(masked, dict) else {}
+    out = masked if isinstance(masked, dict) else {}
+    # After the masking, not before: a setting is already either a value
+    # that is no credential or a hash, and neither is to be changed here.
+    out.update(_settings())
+    return out
+
+
+def _settings() -> Dict[str, Any]:
+    """
+    The settings this step's process had, as a note carries them.
+
+    Read here and not in the sensor, whose environment is the daemon's:
+    under the multiprocess executor or a step launcher a step has its own.
+
+    :return: `{"settings", "settings_excluded"}`, each only when there is
+        one; empty unless `CONVALESCE_SEND_SETTINGS` is on
+    """
+    # Trimmed as an emitter trims it, so a hash made here and one made
+    # where the key is held by an emitter are under the same key.
+    ingest_key = (ceconfig.read_setting(_INGEST_KEY_ENV) or "").strip()
+    found, left_out = cesettin.collect(
+        ingest_key or None,
+        {cesettin.ENVIRONMENT: cesettin.environment(), **cesettin.noted()},
+    )
+    out: Dict[str, Any] = {}
+    if found:
+        out[cesettin.FIELD] = found
+    if left_out:
+        out[SETTINGS_EXCLUDED] = left_out
+    return out
 
 
 def _fitted(noted: Dict[str, Any]) -> Dict[str, Any]:
@@ -318,8 +364,9 @@ def describe(
     :param context: Dagster's run-status context
     :param run: the run the context exposed
     :param step_stats: the run's step stats, when already read
-    :return: `[{"step_key", "source", "sql", "config", "ran"}]`, each
-        field only where there is one; empty when nothing could be read
+    :return: `[{"step_key", "source", "sql", "config", "ran", "settings",
+        "settings_excluded"}]`, each field only where there is one; empty
+        when nothing could be read
     """
     run_id = getattr(run, "run_id", None)
     notes = read_notes(getattr(context, "instance", None), run_id)
@@ -359,6 +406,28 @@ def describe(
             entry[name] = value
         if len(entry) > 1:
             out.append(entry)
+    return out
+
+
+def take_excluded(steps: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """
+    Move what each step's settings left out from its entry to one list.
+
+    :param steps: what `describe` returned, changed in place
+    :return: what was left out, by path from the payload's root and reason
+    """
+    out: List[Dict[str, str]] = []
+    for index, entry in enumerate(steps):
+        left_out = entry.pop(SETTINGS_EXCLUDED, None)
+        if not isinstance(left_out, list):
+            continue
+        for item in left_out:
+            # Read back from the event log, so only the shape it was
+            # written in is passed on.
+            path = item.get("path") if isinstance(item, dict) else None
+            reason = item.get("reason") if isinstance(item, dict) else None
+            if isinstance(path, str) and isinstance(reason, str):
+                out.append({"path": f"steps[{index}].{path}", "reason": reason})
     return out
 
 

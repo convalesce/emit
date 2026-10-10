@@ -127,6 +127,23 @@ subprocess with the plugin discovered through the entry point; the failure
 message reaches the wire from Airflow 2.10 and not before; a Spark driver
 flushes what it batched before exiting.
 
+Settings (`CONVALESCE_SEND_SETTINGS`) ran there too, with
+`collect/e2e-observe/matrix.sh`, one version at a time: an ordinary variable
+arrives as its value, a credential as a keyed hash and nowhere as text, and
+the catalogue holds both on the run.
+
+| Tool | Versions where the settings checks pass |
+| --- | --- |
+| Airflow | 2.5.3, 2.6.3, 2.7.3, 2.8.4, 2.9.3, 2.10.5, 2.11.0, 3.0.3, 3.1.0, 3.2.2 |
+| Dagster | 1.7.16, 1.9.13, 1.10.0, 1.13.21, 1.13.24, 1.13.25 |
+| Prefect | 2.20.26, 3.1.15, 3.4.25, 3.8.5 |
+| Great Expectations | 0.17.23, 0.18.22, 1.22.0, 1.23.2 (on the wire; a checkpoint has no run to store them on) |
+| Spark | 3.3.3, 3.4.4, 3.5.3, 4.0.3 |
+
+On every Airflow version, 2.x and 3.x alike, a Variable read in a template
+and one read from the task's own code were both noted and sent with the
+task's end.
+
 ## Spark platforms
 
 Where a Spark driver runs decides how the listener and
