@@ -238,7 +238,7 @@ def runtime_platform(payload: Any) -> Dict[str, Any]:
     A receiver has only the datasource's *name* to go on otherwise
     (`meta.active_batch_definition.datasource_name`), and falls back to
     using that as the platform, which produces a urn like
-    `urn:li:dataset:(urn:li:dataPlatform:orders,orders,PROD)` for a
+    `urn:cvl:dataset:(urn:cvl:dataPlatform:orders,orders,PROD)` for a
     datasource named `orders`. On 0.x the engine's own dialect is the real
     platform -- `engine.dialect.name`, and of the engine's URL only the
     database, so no credential travels.

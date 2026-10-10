@@ -119,7 +119,7 @@ class Test_list_pending1(_ServerCase):
                 "retries": [
                     {
                         "remedy_id": "r1",
-                        "incident_urn": "urn:li:incident:1",
+                        "incident_urn": "urn:cvl:incident:1",
                         "tool": "airflow",
                         "coordinates": {"dag_id": "orders", "task_id": "load"},
                         "created_at_millis": 123,
@@ -150,7 +150,7 @@ class Test_list_pending1(_ServerCase):
                     {"remedy_id": "r1"},
                     {
                         "remedy_id": "r2",
-                        "incident_urn": "urn:li:incident:2",
+                        "incident_urn": "urn:cvl:incident:2",
                         "tool": "dagster",
                         "coordinates": {"run_id": "abc"},
                         "created_at_millis": 456,

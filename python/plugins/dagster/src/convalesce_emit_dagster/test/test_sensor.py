@@ -416,8 +416,8 @@ class Test_redact_metadata1(unittest.TestCase):
             "dagster/relation_identifier": {"text": "db.shop.orders"},
             "size_in_bytes": {"value": 10},
             "dagster/code_version": {"text": "abc"},
-            "convalesce_urn": {"text": "urn:li:dataset:x"},
-            "datahub_urn": {"text": "urn:li:dataset:y"},
+            "convalesce_urn": {"text": "urn:cvl:dataset:x"},
+            "datahub_urn": {"text": "urn:cvl:dataset:y"},
             "row_count": 5,
             "table_name": "orders",
             "uri": "s3://b/orders",
@@ -1322,7 +1322,7 @@ class Test_declared_lineage1(unittest.TestCase):
         a side is one reference, a list or a set, and that an op with
         nothing declared is left out.
         """
-        urn = "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.raw.orders,PROD)"
+        urn = "urn:cvl:dataset:(urn:cvl:dataPlatform:snowflake,my_db.raw.orders,PROD)"
         recorder = _Recorder()
         cedsens.convalesce_sensor(
             _Context(),

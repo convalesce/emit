@@ -17,7 +17,7 @@ import convalesce_emit_prefect.hooks as cephooks
 
 _LOG = logging.getLogger(__name__)
 
-_URN = "urn:li:dataset:(urn:li:dataPlatform:snowflake,db.s.t,PROD)"
+_URN = "urn:cvl:dataset:(urn:cvl:dataPlatform:snowflake,db.s.t,PROD)"
 
 
 class _Recorder:

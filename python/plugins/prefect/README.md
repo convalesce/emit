@@ -47,7 +47,7 @@ from convalesce_emit_prefect import lineage
 def load():
     lineage(
         inputs=[{"platform": "postgres", "name": "shop.public.orders"}],
-        outputs=["urn:li:dataset:(urn:li:dataPlatform:snowflake,db.s.t,PROD)"],
+        outputs=["urn:cvl:dataset:(urn:cvl:dataPlatform:snowflake,db.s.t,PROD)"],
     )
 ```
 

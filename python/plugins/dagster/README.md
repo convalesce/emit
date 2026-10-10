@@ -118,7 +118,7 @@ LINEAGE = {
     "load_orders": {
         "inputs": ["s3://my-bucket/exports/orders"],
         "outputs": [
-            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.orders,PROD)"
+            "urn:cvl:dataset:(urn:cvl:dataPlatform:snowflake,my_db.my_schema.orders,PROD)"
         ],
     },
 }

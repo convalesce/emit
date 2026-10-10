@@ -533,7 +533,7 @@ def _candidate(**coords: str) -> ceretry.RetryCandidate:
     """One airflow-tool candidate, coordinates as given."""
     return ceretry.RetryCandidate(
         remedy_id="r1",
-        incident_urn="urn:li:incident:1",
+        incident_urn="urn:cvl:incident:1",
         tool="airflow",
         coordinates=coords,
         created_at_millis=1,
@@ -705,7 +705,7 @@ class Test_run_pending_retries1(unittest.TestCase):
         """
         candidate = ceretry.RetryCandidate(
             remedy_id="r2",
-            incident_urn="urn:li:incident:2",
+            incident_urn="urn:cvl:incident:2",
             tool="dagster",
             coordinates={"run_id": "abc"},
             created_at_millis=1,
