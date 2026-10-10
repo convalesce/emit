@@ -84,6 +84,49 @@ result is sent as `result_text` when Prefect holds it in memory and it is a
 200 characters. Anything else it returns is never sent. Set
 `CONVALESCE_PREFECT_SEND_RESULT=false` to send no result at all.
 
+## Settings
+
+Set `CONVALESCE_SEND_SETTINGS=true` where your flows run and the event a
+flow run or a task run ends with, on completion, failure, a crash or a
+cancellation, also carries the settings of its process: its environment
+variables, and each Prefect Variable the process read with `Variable.get`
+or `Variable.aget`. It is off by default.
+
+A Variable is noted as your code reads it, from the moment your flow
+imports `convalesce_emit_prefect`. A task run's event carries the Variables
+read so far, and the flow run's last event carries them all.
+
+A setting whose name or value reads as a credential, and any value longer
+than 300 characters, is sent as a `fingerprint`: a keyed hash, sixteen hex
+characters long, made in your process. It says that the value changed
+between two runs and nothing of what the value is. Every other setting is
+sent as its `value`.
+
+The hash is keyed with `CONVALESCE_FINGERPRINT_KEY` where you set one, and
+with a key derived from your ingest key otherwise. The fingerprint key is
+only ever read in your process and is never sent. `keyed_by` identifies the
+key the hashes were made under, so hashes are compared only between runs
+that used the same one.
+
+Set `CONVALESCE_SETTINGS_SKIP` to a comma-separated list of names to keep
+those settings out in either form, such as
+`CONVALESCE_SETTINGS_SKIP=HOSTNAME,INTERNAL_REGION`.
+
+The event then holds:
+
+```json
+{
+  "settings": {
+    "items": [
+      {"kind": "environment", "name": "API_KEY", "fingerprint": "5d1c0a9e7b3f2468"},
+      {"kind": "environment", "name": "WAREHOUSE", "value": "analytics"},
+      {"kind": "variable", "name": "region", "value": "eu"}
+    ],
+    "keyed_by": "9f3b6c1d2e4a5b70"
+  }
+}
+```
+
 ## Supported
 
 Prefect 2.20 and 3.x, on Python 3.9 and later. Verified on real installs:

@@ -135,6 +135,49 @@ of a path in an object store. `lineage` may also be a function of the
 sensor's context that returns such a mapping, for a declaration that
 depends on the run.
 
+## Settings
+
+Set `CONVALESCE_SEND_SETTINGS=true` where your steps run and each step's
+entry also carries the environment variables its process had. It is off by
+default.
+
+The settings are read in the process that runs the step, so a step on the
+multiprocess executor or behind a step launcher reports its own
+environment. They travel in the same engine event as the rest of what the
+step ran, already in the form they are sent in. Set `CONVALESCE_INGEST_KEY`
+or `CONVALESCE_FINGERPRINT_KEY` where your steps run, so there is a key to
+hash with there.
+
+A setting whose name or value reads as a credential, and any value longer
+than 300 characters, is sent as a `fingerprint`: a keyed hash, sixteen hex
+characters long, made in your process. It says that the value changed
+between two runs and nothing of what the value is. Every other setting is
+sent as its `value`.
+
+The hash is keyed with `CONVALESCE_FINGERPRINT_KEY` where you set one, and
+with a key derived from your ingest key otherwise. The fingerprint key is
+only ever read in your process and is never sent. `keyed_by` identifies the
+key the hashes were made under, so hashes are compared only between runs
+that used the same one.
+
+Set `CONVALESCE_SETTINGS_SKIP` to a comma-separated list of names to keep
+those settings out in either form, such as
+`CONVALESCE_SETTINGS_SKIP=HOSTNAME,INTERNAL_REGION`.
+
+Each step's entry then holds:
+
+```json
+{
+  "settings": {
+    "items": [
+      {"kind": "environment", "name": "API_KEY", "fingerprint": "5d1c0a9e7b3f2468"},
+      {"kind": "environment", "name": "WAREHOUSE", "value": "analytics"}
+    ],
+    "keyed_by": "9f3b6c1d2e4a5b70"
+  }
+}
+```
+
 ## Supported
 
 Dagster 1.7 and later, on Python 3.9 and later. Verified on real installs:

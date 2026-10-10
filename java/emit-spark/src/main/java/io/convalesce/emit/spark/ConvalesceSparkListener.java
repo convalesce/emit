@@ -1,9 +1,13 @@
 package io.convalesce.emit.spark;
 
+import io.convalesce.emit.Config;
 import io.convalesce.emit.Emitter;
 import io.convalesce.emit.Exclusion;
+import io.convalesce.emit.Settings;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.logging.Logger;
 import org.apache.spark.SparkConf;
 import org.apache.spark.scheduler.SparkListener;
@@ -70,6 +74,10 @@ import org.apache.spark.scheduler.SparkListenerUnschedulableTaskSetRemoved;
  * included, and Spark redacts them only on the way into its own event log. They are redacted here
  * by the same rule before anything leaves the driver.
  *
+ * <p><b>Settings.</b> With {@code CONVALESCE_SEND_SETTINGS} on, the application's end also carries
+ * the driver's environment variables under {@code settings}, a secret among them only as a keyed
+ * hash; see {@link Settings}. It is the one field here that Spark did not write.
+ *
  * <p><b>Lineage.</b> None of Spark's events carries the logical plan, so exact tables and columns
  * come from OpenLineage-Spark, which the {@code _2.12} and {@code _2.13} packages bring with them.
  * Where the job has not set OpenLineage up itself, this starts it and passes it every event; see
@@ -82,6 +90,7 @@ public class ConvalesceSparkListener extends SparkListener {
 
   private static final Logger LOG = Logger.getLogger(ConvalesceSparkListener.class.getName());
   private static final String TOOL = "spark";
+  private static final String INGEST_KEY = "CONVALESCE_INGEST_KEY";
 
   private final Emitter emitter;
   private final String sparkVersion;
@@ -94,6 +103,9 @@ public class ConvalesceSparkListener extends SparkListener {
   // Written by the listener bus thread and read by it; volatile so a later event on another
   // thread, which Spark does not promise against, still sees it.
   private volatile String appId;
+  // The driver's environment: where this library's settings are read, and what is sent as the
+  // run's settings when they are asked for.
+  private final Map<String, String> env;
 
   /** Built by Spark when no constructor takes a SparkConf. */
   public ConvalesceSparkListener() {
@@ -127,10 +139,20 @@ public class ConvalesceSparkListener extends SparkListener {
 
   ConvalesceSparkListener(
       Emitter emitter, String sparkVersion, Redaction redaction, SparkListenerInterface lineage) {
+    this(emitter, sparkVersion, redaction, lineage, System.getenv());
+  }
+
+  ConvalesceSparkListener(
+      Emitter emitter,
+      String sparkVersion,
+      Redaction redaction,
+      SparkListenerInterface lineage,
+      Map<String, String> env) {
     this.emitter = emitter;
     this.sparkVersion = sparkVersion;
     this.redaction = redaction;
     this.lineage = lineage;
+    this.env = env;
     if (!SparkEventJson.available()) {
       LOG.warning(
           "convalesce: this Spark has no serialiser we recognise; events will carry only their type");
@@ -422,11 +444,38 @@ public class ConvalesceSparkListener extends SparkListener {
       String json = SparkEventJson.toJson(event);
       List<Exclusion> masked = new ArrayList<Exclusion>();
       json = SparkEventJson.withAppId(redaction.apply(json, masked), remember(json));
+      if (event instanceof SparkListenerApplicationEnd) {
+        // After the redaction, which is for what Spark wrote: this field has already had its
+        // secrets hashed, by a rule a job's `spark.redaction.regex` knows nothing of.
+        json = withSettings(json, env, masked);
+      }
       emitter.emit(TOOL, name, json, sparkVersion, masked);
     } catch (Throwable t) {
       // A job must not fail because we could not report on it.
       LOG.warning("convalesce: could not emit an event: " + t.getMessage());
     }
+  }
+
+  /**
+   * Adds the driver's environment to the event that ends a run, when settings are asked for.
+   *
+   * <p>The application's end, because it is the run's last event and the only one sent once for the
+   * whole driver, and because the environment is the driver's and not any one job's.
+   *
+   * @param json the application-end event, redacted
+   * @param env the driver's environment
+   * @param excluded where what was left out of the settings is added, for the observation
+   * @return the event with a {@code settings} field, or as it was when there is nothing to send
+   */
+  static String withSettings(String json, Map<String, String> env, List<Exclusion> excluded) {
+    String ingestKey = Config.setting(env, INGEST_KEY);
+    Settings.Collected found =
+        Settings.collect(
+            ingestKey == null ? null : ingestKey.trim(),
+            Collections.singletonMap(Settings.ENVIRONMENT, env),
+            env);
+    excluded.addAll(found.excluded());
+    return SparkEventJson.withField(json, Settings.FIELD, found.json());
   }
 
   /**

@@ -33,10 +33,12 @@ import types
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import convalesce_emit as cemit
+import convalesce_emit.settings as cesettin
 import convalesce_emit_prefect._capture as cecap
 import convalesce_emit_prefect._env as ceprefenv
 import convalesce_emit_prefect._lineage as celin
 import convalesce_emit_prefect._mask as cemask
+import convalesce_emit_prefect._settings as ceset
 
 _LOG = cemask.logger(__name__)
 
@@ -226,6 +228,16 @@ def _emit(  # pylint: disable=too-many-arguments
         # whatever launched it typed, and any can hold a literal credential;
         # so can a statement that creates a user or a connection.
         dumped, secrets = cemit.redact_secrets(dumped)
+        # Added after the redaction above, which is for what a person
+        # typed: a setting is already a value that is no credential or a
+        # hash. Only on the event a run ends with, so once a run.
+        if _is_final(payload) and isinstance(dumped, dict):
+            found, left_out = ceset.collect(
+                ceset.ingest_key_of(emitter), forget=_ends_flow_run(payload)
+            )
+            if found:
+                dumped[cesettin.FIELD] = found
+            withheld = withheld + left_out
     except Exception as exc:  # pylint: disable=broad-exception-caught
         # A Prefect hook that raises is logged by Prefect as the flow's own
         # failure; nothing about reporting on it is worth that.
@@ -723,6 +735,16 @@ def _ends_flow_run(payload: Dict[str, Any]) -> bool:
     """
     if "task" in payload or "task_run" in payload:
         return False
+    return _is_final(payload)
+
+
+def _is_final(payload: Dict[str, Any]) -> bool:
+    """
+    Whether an event is one a run ends with, a flow's or a task's.
+
+    :param payload: the hook's own arguments
+    :return: False while the run is pending or running
+    """
     state = payload.get("state")
     return _state_type(getattr(state, "type", None)) in _FINAL_STATES
 

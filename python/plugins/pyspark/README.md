@@ -179,6 +179,42 @@ into it, and the observation's `excluded` says so
 (`{"path": "$", "reason": "ingest key masked"}`). A key under 8 characters
 is too short to look for.
 
+## Settings
+
+Set `CONVALESCE_SEND_SETTINGS=true` where the driver runs and both
+`driver_script` and `driver_failure` also carry the environment variables
+of the driver's process. It is off by default.
+
+A setting whose name or value reads as a credential, and any value longer
+than 300 characters, is sent as a `fingerprint`: a keyed hash, sixteen hex
+characters long, made in your process. It says that the value changed
+between two runs and nothing of what the value is. Every other setting is
+sent as its `value`.
+
+The hash is keyed with `CONVALESCE_FINGERPRINT_KEY` where you set one, and
+with a key derived from your ingest key otherwise. The fingerprint key is
+only ever read in your process and is never sent. `keyed_by` identifies the
+key the hashes were made under, so hashes are compared only between runs
+that used the same one.
+
+Set `CONVALESCE_SETTINGS_SKIP` to a comma-separated list of names to keep
+those settings out in either form, such as
+`CONVALESCE_SETTINGS_SKIP=HOSTNAME,INTERNAL_REGION`.
+
+Each observation then holds:
+
+```json
+{
+  "settings": {
+    "items": [
+      {"kind": "environment", "name": "API_KEY", "fingerprint": "5d1c0a9e7b3f2468"},
+      {"kind": "environment", "name": "WAREHOUSE", "value": "analytics"}
+    ],
+    "keyed_by": "9f3b6c1d2e4a5b70"
+  }
+}
+```
+
 ## Supported
 
 PySpark 3.3 to 4.0, on Python 3.9 and later.

@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import shutil
 import sys
 import tempfile
@@ -1079,6 +1080,179 @@ class Test_databricks1(_HookTestCase):
         payload = self.recorder.sent[0]["payload"]
         self.assertNotIn("databricks", payload)
         self.assertEqual(payload["application_id"], "local-1790387079999")
+
+
+# #############################################################################
+# Test_settings
+# #############################################################################
+
+_INGEST_KEY = "cvl_ingest_3f9a1c77d2e04b58"
+_FINGERPRINT_KEY = "fingerprint-key-kept-at-home"
+_SECRET = "s3cr3t-warehouse-pass"
+_HEX16 = re.compile(r"^[0-9a-f]{16}$")
+# A driver's process as a customer would have it with settings switched on.
+_SETTINGS_ENV = {
+    "CONVALESCE_SEND_SETTINGS": "true",
+    "CONVALESCE_INGEST_KEY": _INGEST_KEY,
+    "CONVALESCE_FINGERPRINT_KEY": _FINGERPRINT_KEY,
+    "WAREHOUSE": "analytics",
+    "API_KEY": _SECRET,
+}
+
+
+class _KeyedRecorder(_Recorder):
+    """A recorder holding an ingest key, as a real emitter does."""
+
+    def __init__(self, ingest_key: Optional[str] = _INGEST_KEY) -> None:
+        super().__init__()
+        self.config = types.SimpleNamespace(ingest_key=ingest_key)
+
+
+class Test_settings1(_HookTestCase):
+    """The settings the driver's process had, on both observations."""
+
+    def events(
+        self, environ: Dict[str, str], emitter: Any = None
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Fail a driver in a process with these variables, and let it exit.
+
+        :param environ: the whole environment of the driver's process
+        :param emitter: the emitter to send through; one with a key by
+            default
+        :return: what was sent, by event
+        """
+        recorder = emitter or _KeyedRecorder()
+        with mock.patch.dict(os.environ, environ, clear=True):
+            self.install(recorder)
+            self.fail_main(ValueError("relation does not exist"))
+            hook = cepysdri._INSTALLED  # pylint: disable=protected-access
+            assert hook is not None
+            hook.at_exit()
+        sent = {each["event"]: each for each in recorder.sent}
+        self.assertEqual(sorted(sent), ["driver_failure", "driver_script"])
+        return sent
+
+    def items(self, sent: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+        """
+        The settings an observation carries, by the name of each.
+
+        :param sent: one observation
+        :return: name to item
+        """
+        return {
+            item["name"]: item for item in sent["payload"]["settings"]["items"]
+        }
+
+    def test_a_plain_setting_crosses_and_a_secret_as_a_hash(self) -> None:
+        """A plain setting crosses and a secret as a hash."""
+        for sent in self.events(_SETTINGS_ENV).values():
+            items = self.items(sent)
+            self.assertEqual(
+                items["WAREHOUSE"],
+                {
+                    "kind": "environment",
+                    "name": "WAREHOUSE",
+                    "value": "analytics",
+                },
+            )
+            self.assertEqual(
+                set(items["API_KEY"]), {"kind", "name", "fingerprint"}
+            )
+            self.assertRegex(items["API_KEY"]["fingerprint"], _HEX16)
+            self.assertRegex(sent["payload"]["settings"]["keyed_by"], _HEX16)
+
+    def test_no_secret_and_no_key_is_sent(self) -> None:
+        """No secret and no key is sent."""
+        for sent in self.events(_SETTINGS_ENV).values():
+            wire = json.dumps(sent, default=str)
+            self.assertIn("API_KEY", wire)
+            self.assertNotIn(_SECRET, wire)
+            self.assertNotIn(_INGEST_KEY, wire)
+            self.assertNotIn(_FINGERPRINT_KEY, wire)
+
+    def test_off_sends_no_settings_at_all(self) -> None:
+        """Off sends no settings at all."""
+        environ = {
+            name: value
+            for name, value in _SETTINGS_ENV.items()
+            if name != "CONVALESCE_SEND_SETTINGS"
+        }
+        for sent in self.events(environ).values():
+            self.assertNotIn("settings", sent["payload"])
+            self.assertNotIn("settings", json.dumps(sent, default=str))
+
+    def test_the_hash_is_keyed_from_the_ingest_key_without_another(
+        self,
+    ) -> None:
+        """The hash is keyed from the ingest key without another."""
+        own = self.events(_SETTINGS_ENV)["driver_failure"]
+        cepysdri.uninstall()
+        environ = dict(_SETTINGS_ENV)
+        del environ["CONVALESCE_FINGERPRINT_KEY"]
+        derived = self.events(environ)["driver_failure"]
+        self.assertRegex(derived["payload"]["settings"]["keyed_by"], _HEX16)
+        self.assertNotEqual(
+            derived["payload"]["settings"]["keyed_by"],
+            own["payload"]["settings"]["keyed_by"],
+        )
+        self.assertNotIn(_INGEST_KEY, json.dumps(derived, default=str))
+
+    def test_without_a_key_a_secret_is_left_out_and_declared(self) -> None:
+        """Without a key a secret is left out and declared."""
+        environ = {
+            "CONVALESCE_SEND_SETTINGS": "true",
+            "WAREHOUSE": "analytics",
+            "API_KEY": _SECRET,
+        }
+        for sent in self.events(environ, _Recorder()).values():
+            self.assertNotIn("API_KEY", self.items(sent))
+            self.assertNotIn("keyed_by", sent["payload"]["settings"])
+            self.assertIn(
+                {
+                    "path": "settings",
+                    "reason": "no key to fingerprint 1 settings with",
+                },
+                sent["excluded"],
+            )
+            self.assertNotIn(_SECRET, json.dumps(sent, default=str))
+
+    def test_a_listed_name_is_never_sent(self) -> None:
+        """A listed name is never sent."""
+        environ = dict(_SETTINGS_ENV, CONVALESCE_SETTINGS_SKIP="WAREHOUSE")
+        for sent in self.events(environ).values():
+            items = self.items(sent)
+            self.assertNotIn("WAREHOUSE", items)
+            self.assertIn("API_KEY", items)
+
+    def test_an_emitter_built_from_the_environment_keys_the_hash(
+        self,
+    ) -> None:
+        """An emitter built from the environment keys the hash."""
+        given = self.events(
+            {
+                name: value
+                for name, value in _SETTINGS_ENV.items()
+                if name != "CONVALESCE_FINGERPRINT_KEY"
+            }
+        )["driver_failure"]
+        cepysdri.uninstall()
+        environ = {
+            "CONVALESCE_SEND_SETTINGS": "true",
+            "CONVALESCE_INGEST_KEY": _INGEST_KEY,
+            "CONVALESCE_DRY_RUN": "true",
+            "API_KEY": _SECRET,
+        }
+        with mock.patch.dict(os.environ, environ, clear=True):
+            self.assertTrue(cepyspar.install())
+            with mock.patch.object(cepysdri.cemit, "send_one") as send_one:
+                self.fail_main(ValueError("x"))
+        payload = send_one.call_args.kwargs["payload"]
+        self.assertEqual(
+            payload["settings"]["keyed_by"],
+            given["payload"]["settings"]["keyed_by"],
+        )
+        self.assertNotIn(_SECRET, json.dumps(payload, default=str))
 
 
 # #############################################################################
