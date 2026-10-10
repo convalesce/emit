@@ -2,16 +2,27 @@
 Tests for what each step ran: its source, its SQL and its configuration.
 """
 
+import json
 import os
+import re
 import sys
 import types
 import unittest
 import unittest.mock
 from typing import Any, Dict, Iterator, List, Optional
 
+import convalesce_emit.settings as cesettin
 import convalesce_emit.sqlcapture as cesqlcap
 import convalesce_emit_dagster.sensor as cedsens
 import convalesce_emit_dagster.steps as cedsteps
+
+# Each plugin proves the same thing of its own event: a plain setting
+# crosses, a secret crosses as a hash, and no key crosses at all. The
+# plugins are independently installable with no dependency on each other,
+# so sharing a test module between them would add one for no real benefit;
+# the similarity stays and the check is turned off here rather than
+# everywhere.
+# pylint: disable=duplicate-code
 
 _SEAM = "dagster._core.execution.plan.execute_plan"
 
@@ -800,3 +811,216 @@ class Test_sensor_steps1(unittest.TestCase):
             3,
         )
         self.assertEqual(kept["count"], 1)
+
+
+# #############################################################################
+# Test_settings1
+# #############################################################################
+
+_INGEST_KEY = "cvl_ingest_3f9a1c77d2e04b58"
+_FINGERPRINT_KEY = "fingerprint-key-kept-at-home"
+_SECRET = "s3cr3t-warehouse-pass"
+_HEX16 = re.compile(r"^[0-9a-f]{16}$")
+# A step's process as a customer would have it with settings switched on.
+_STEP_ENV = {
+    "CONVALESCE_SEND_SETTINGS": "true",
+    "CONVALESCE_INGEST_KEY": _INGEST_KEY,
+    "CONVALESCE_FINGERPRINT_KEY": _FINGERPRINT_KEY,
+    "WAREHOUSE": "analytics",
+    "API_KEY": _SECRET,
+}
+
+
+def _step_note(environ: Dict[str, str]) -> Dict[str, Any]:
+    """
+    The note a step's process would write, as the event log hands it back.
+
+    :param environ: the whole environment of the step's process
+    :return: the note, through the JSON the event log keeps it as
+    """
+    with unittest.mock.patch.dict(os.environ, environ, clear=True):
+        note = cedsteps.note_of(_StepContext({"limit": 5}), None)
+    return json.loads(json.dumps(note))  # type: ignore[no-any-return]
+
+
+def _sent_for(note: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    What the sensor sends for a run whose one step wrote `note`.
+
+    :param note: the step's note
+    :return: the one observation, as the emitter was given it
+    """
+    context = _SensorContext()
+    context.instance = _SensorInstance([_engine_event("load", _note(note))])
+    recorder = _Recorder()
+    # The sensor's process is the daemon's and has none of the step's
+    # variables: what crosses is what the note carried.
+    with unittest.mock.patch.dict(sys.modules, _fake_dagster()):
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            cedsens.convalesce_sensor(context, emitter=recorder)
+    return recorder.sent[0]
+
+
+def _by_name(settings: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    """
+    A `settings` field's items, by the name of each.
+
+    :param settings: what was sent under `settings`
+    :return: name to item
+    """
+    return {item["name"]: item for item in settings[cesettin.ITEMS]}
+
+
+class Test_settings1(unittest.TestCase):
+    """
+    Test that a step's settings cross from its process, secrets as hashes.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a plain setting arrives intact and a secret as a hash.
+        """
+        sent = _sent_for(_step_note(_STEP_ENV))
+        settings = sent["payload"]["steps"][0]["settings"]
+        items = _by_name(settings)
+        self.assertEqual(
+            items["WAREHOUSE"],
+            {"kind": "environment", "name": "WAREHOUSE", "value": "analytics"},
+        )
+        self.assertEqual(set(items["API_KEY"]), {"kind", "name", "fingerprint"})
+        self.assertRegex(items["API_KEY"]["fingerprint"], _HEX16)
+        self.assertRegex(settings["keyed_by"], _HEX16)
+
+    def test2(self) -> None:
+        """
+        Test that no secret and neither key is anywhere in what is sent,
+        nor in the note the customer's event log keeps.
+        """
+        note = _step_note(_STEP_ENV)
+        sent = _sent_for(note)
+        for text in (json.dumps(sent, default=str), json.dumps(note)):
+            self.assertNotIn(_SECRET, text)
+            self.assertNotIn(_INGEST_KEY, text)
+            self.assertNotIn(_FINGERPRINT_KEY, text)
+
+    def test3(self) -> None:
+        """
+        Test that with the setting off there is no `settings` field at all.
+        """
+        environ = {
+            name: value
+            for name, value in _STEP_ENV.items()
+            if name != "CONVALESCE_SEND_SETTINGS"
+        }
+        note = _step_note(environ)
+        self.assertNotIn("settings", note)
+        sent = _sent_for(note)
+        self.assertNotIn("settings", sent["payload"]["steps"][0])
+        self.assertNotIn("settings", json.dumps(sent, default=str))
+
+    def test4(self) -> None:
+        """
+        Test that the hash is keyed from the ingest key where there is no
+        fingerprint key, and differs from one keyed otherwise.
+        """
+        environ = dict(_STEP_ENV)
+        del environ["CONVALESCE_FINGERPRINT_KEY"]
+        own = _step_note(_STEP_ENV)["settings"]
+        derived = _step_note(environ)["settings"]
+        self.assertRegex(derived["keyed_by"], _HEX16)
+        self.assertNotEqual(derived["keyed_by"], own["keyed_by"])
+        self.assertNotEqual(
+            _by_name(derived)["API_KEY"]["fingerprint"],
+            _by_name(own)["API_KEY"]["fingerprint"],
+        )
+
+    def test5(self) -> None:
+        """
+        Test that a step with no key leaves its secrets out and the sensor
+        says so in `excluded`, not in the step.
+        """
+        environ = {
+            "CONVALESCE_SEND_SETTINGS": "true",
+            "WAREHOUSE": "analytics",
+            "API_KEY": _SECRET,
+        }
+        note = _step_note(environ)
+        self.assertNotIn("API_KEY", _by_name(note["settings"]))
+        self.assertNotIn("keyed_by", note["settings"])
+        sent = _sent_for(note)
+        step = sent["payload"]["steps"][0]
+        self.assertNotIn(cedsteps.SETTINGS_EXCLUDED, step)
+        self.assertIn(
+            {
+                "path": "steps[0].settings",
+                "reason": "no key to fingerprint 1 settings with",
+            },
+            sent["excluded"],
+        )
+        self.assertNotIn(_SECRET, json.dumps(sent, default=str))
+
+    def test6(self) -> None:
+        """
+        Test that a name the operator listed is never sent.
+        """
+        environ = {**_STEP_ENV, "CONVALESCE_SETTINGS_SKIP": "WAREHOUSE"}
+        items = _by_name(_step_note(environ)["settings"])
+        self.assertNotIn("WAREHOUSE", items)
+        self.assertIn("API_KEY", items)
+
+    def test7(self) -> None:
+        """
+        Test that settings alone are reason enough to bracket a step.
+        """
+
+        def original(step_context: Any) -> Iterator[str]:
+            del step_context
+            yield "STEP_SUCCESS"
+
+        seam = types.SimpleNamespace(dagster_event_sequence_for_step=original)
+        environ = {
+            "CONVALESCE_SQL_CAPTURE": "false",
+            "CONVALESCE_SEND_ARGUMENTS": "false",
+            "CONVALESCE_SEND_SOURCE": "false",
+            "CONVALESCE_SEND_SETTINGS": "true",
+        }
+        patches = (
+            unittest.mock.patch.object(cedsteps, "_installed", False),
+            unittest.mock.patch.object(cesqlcap, "ignore", lambda *a: None),
+            unittest.mock.patch.object(cesqlcap, "install", lambda *a: None),
+            unittest.mock.patch.dict(sys.modules, {_SEAM: seam}),
+            unittest.mock.patch.dict(os.environ, environ),
+        )
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.assertTrue(cedsteps.install())
+        self.assertIsNot(seam.dagster_event_sequence_for_step, original)
+
+    def test8(self) -> None:
+        """
+        Test that a note read back in another shape adds nothing and
+        raises nothing.
+        """
+        steps: List[Dict[str, Any]] = [
+            {"step_key": "a", cedsteps.SETTINGS_EXCLUDED: "not a list"},
+            {"step_key": "b", cedsteps.SETTINGS_EXCLUDED: [7, {"path": 1}]},
+            {"step_key": "c"},
+        ]
+        self.assertEqual(cedsteps.take_excluded(steps), [])
+        self.assertEqual(
+            steps, [{"step_key": "a"}, {"step_key": "b"}, {"step_key": "c"}]
+        )
+
+    def test9(self) -> None:
+        """
+        Test that a variable the step read for itself crosses with it.
+        """
+        with unittest.mock.patch.dict(os.environ, _STEP_ENV, clear=True):
+            cesettin.noted()
+            cesettin.note(cesettin.VARIABLE, "region", "eu")
+            note = cedsteps.note_of(_StepContext(), None)
+        self.assertIn(
+            {"kind": "variable", "name": "region", "value": "eu"},
+            note["settings"]["items"],
+        )

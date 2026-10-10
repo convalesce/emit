@@ -22,6 +22,11 @@ be; what ran is the file on the machine that ran it. Arguments are sent
 unless `CONVALESCE_SEND_ARGUMENTS` is false, and the text unless
 `CONVALESCE_SEND_SOURCE` is.
 
+Both also carry the settings the driver's process had, its environment,
+where `CONVALESCE_SEND_SETTINGS` is on: an ordinary one as its value, and
+one that reads as a credential as a hash keyed in this process; see
+`convalesce_emit.settings`.
+
 Where the platform says which of its runs the driver is, both say so too:
 on Databricks the job run, the task's run, the job, notebook, cluster and
 workspace (`databricks`), and on YARN which try of the application it is
@@ -55,6 +60,7 @@ import types
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
+import convalesce_emit.settings as cesettin
 import convalesce_emit.source as cesource
 import convalesce_emit_pyspark._env as cepysenv
 
@@ -656,6 +662,7 @@ class _Hook:
         excluded: List[Dict[str, str]] = []
         if not _in_notebook():
             payload["argv"], excluded = _argv()
+        self.add_settings(payload, excluded)
         self._send(EVENT, self.describe(payload), excluded)
 
     def report_script(self, context: _Context) -> None:
@@ -692,7 +699,38 @@ class _Hook:
         if source is not None:
             payload["source"] = source
             excluded.extend(masked)
+        self.add_settings(payload, excluded)
         self._send(SCRIPT_EVENT, self.describe(payload), excluded)
+
+    def add_settings(
+        self, payload: Dict[str, Any], excluded: List[Dict[str, str]]
+    ) -> None:
+        """
+        Put the settings of the driver's process on an observation.
+
+        Nothing is added unless `CONVALESCE_SEND_SETTINGS` is on. Added to
+        a payload whose parts were each masked as they were read, so no
+        pass walks it afterwards: a setting is already a value that is no
+        credential, or a hash.
+
+        :param payload: what is about to be sent, changed in place
+        :param excluded: what was left out of it, by path and reason, added
+            to in place
+        :return: nothing
+        """
+        # The key the observation is sent with: the given emitter's, or
+        # the one the emitter built in `_send` will read.
+        holder = self._config
+        if self._emitter is not None:
+            holder = getattr(self._emitter, "config", None)
+        key = getattr(holder, "ingest_key", None)
+        found, left_out = cesettin.collect(
+            key if isinstance(key, str) and key else None,
+            {cesettin.ENVIRONMENT: cesettin.environment(), **cesettin.noted()},
+        )
+        if found:
+            payload[cesettin.FIELD] = found
+        excluded.extend(left_out)
 
     def _send(
         self, event: str, payload: Dict[str, Any], excluded: List[Dict[str, str]]

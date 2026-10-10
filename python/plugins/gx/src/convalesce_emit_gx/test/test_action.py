@@ -12,14 +12,24 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import sys
 import types
 import unittest
 import unittest.mock
-from typing import Any, List
+from typing import Any, Dict, List, Optional
 
+import convalesce_emit.settings as cesettin
 import convalesce_emit_gx._common as cegxcom
 import convalesce_emit_gx.action as cegxact
+
+# Each plugin proves the same thing of its own event: a plain setting
+# crosses, a secret crosses as a hash, and no key crosses at all. The
+# plugins are independently installable with no dependency on each other,
+# so sharing a test module between them would add one for no real benefit;
+# the similarity stays and the check is turned off here rather than
+# everywhere.
+# pylint: disable=duplicate-code
 
 _LOG = logging.getLogger(__name__)
 
@@ -1184,3 +1194,171 @@ class Test_gx_query1(unittest.TestCase):
         bounded, excluded = cegxcom.bound_queries(payload)
         self.assertEqual(bounded, payload)
         self.assertEqual(excluded, [])
+
+
+# #############################################################################
+# Test_gx_settings1
+# #############################################################################
+
+_INGEST_KEY = "cvl_ingest_3f9a1c77d2e04b58"
+_FINGERPRINT_KEY = "fingerprint-key-kept-at-home"
+_SECRET = "s3cr3t-warehouse-pass"
+_HEX16 = re.compile(r"^[0-9a-f]{16}$")
+# The process a checkpoint runs in, as a customer would have it with
+# settings switched on.
+_SETTINGS_ENV = {
+    "CONVALESCE_SEND_SETTINGS": "true",
+    "CONVALESCE_INGEST_KEY": _INGEST_KEY,
+    "CONVALESCE_FINGERPRINT_KEY": _FINGERPRINT_KEY,
+    "WAREHOUSE": "analytics",
+    "API_KEY": _SECRET,
+}
+
+
+class _KeyedRecorder(_Recorder):
+    """A recorder holding an ingest key, as a real emitter does."""
+
+    def __init__(self, ingest_key: Optional[str] = _INGEST_KEY) -> None:
+        super().__init__()
+        self.config = types.SimpleNamespace(ingest_key=ingest_key)
+
+
+def _sent_with(environ: Dict[str, str], recorder: _Recorder) -> Any:
+    """
+    What is sent for a result validated in a process with these variables.
+
+    :param environ: the whole environment of the checkpoint's process
+    :param recorder: the emitter to send through
+    :return: the one observation, as the emitter was given it
+    """
+    with unittest.mock.patch.dict(os.environ, environ, clear=True):
+        cegxcom.forward(_RESULT, recorder)
+    return recorder.sent[0]
+
+
+def _items(sent: Any) -> Dict[str, Dict[str, str]]:
+    """
+    The settings an observation carries, by the name of each.
+
+    :param sent: one observation
+    :return: name to item
+    """
+    return {
+        item["name"]: item
+        for item in sent["payload"]["settings"][cesettin.ITEMS]
+    }
+
+
+class Test_gx_settings1(unittest.TestCase):
+    """
+    Test that a validation result carries the settings of its process,
+    secrets as hashes.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that a plain setting arrives intact and a secret as a hash.
+        """
+        sent = _sent_with(_SETTINGS_ENV, _KeyedRecorder())
+        items = _items(sent)
+        self.assertEqual(
+            items["WAREHOUSE"],
+            {"kind": "environment", "name": "WAREHOUSE", "value": "analytics"},
+        )
+        self.assertEqual(set(items["API_KEY"]), {"kind", "name", "fingerprint"})
+        self.assertRegex(items["API_KEY"]["fingerprint"], _HEX16)
+        self.assertRegex(sent["payload"]["settings"]["keyed_by"], _HEX16)
+        self.assertFalse(sent["payload"]["success"])
+
+    def test2(self) -> None:
+        """
+        Test that no secret and neither key is anywhere in what is sent.
+        """
+        sent = _sent_with(_SETTINGS_ENV, _KeyedRecorder())
+        wire = json.dumps(sent, default=str)
+        self.assertIn("API_KEY", wire)
+        self.assertNotIn(_SECRET, wire)
+        self.assertNotIn(_INGEST_KEY, wire)
+        self.assertNotIn(_FINGERPRINT_KEY, wire)
+
+    def test3(self) -> None:
+        """
+        Test that with the setting off there is no `settings` field at all.
+        """
+        environ = dict(_SETTINGS_ENV, CONVALESCE_SEND_SETTINGS="false")
+        sent = _sent_with(environ, _KeyedRecorder())
+        self.assertNotIn("settings", sent["payload"])
+        self.assertNotIn("settings", json.dumps(sent, default=str))
+        del environ["CONVALESCE_SEND_SETTINGS"]
+        sent = _sent_with(environ, _KeyedRecorder())
+        self.assertNotIn("settings", sent["payload"])
+
+    def test4(self) -> None:
+        """
+        Test that the settings cross the same with samples switched off:
+        the passes that take a result's values out leave them alone.
+        """
+        kept = _items(_sent_with(_SETTINGS_ENV, _KeyedRecorder()))
+        environ = dict(_SETTINGS_ENV, CONVALESCE_GX_SEND_SAMPLES="false")
+        sent = _sent_with(environ, _KeyedRecorder())
+        self.assertNotIn("alice@x.com", json.dumps(sent, default=str))
+        items = _items(sent)
+        self.assertEqual(items["API_KEY"], kept["API_KEY"])
+        self.assertEqual(items["WAREHOUSE"], kept["WAREHOUSE"])
+
+    def test5(self) -> None:
+        """
+        Test that the hash is keyed from the emitter's ingest key where
+        there is no fingerprint key.
+        """
+        own = _sent_with(_SETTINGS_ENV, _KeyedRecorder())
+        environ = dict(_SETTINGS_ENV)
+        del environ["CONVALESCE_FINGERPRINT_KEY"]
+        derived = _sent_with(environ, _KeyedRecorder())
+        self.assertRegex(derived["payload"]["settings"]["keyed_by"], _HEX16)
+        self.assertNotEqual(
+            derived["payload"]["settings"]["keyed_by"],
+            own["payload"]["settings"]["keyed_by"],
+        )
+        self.assertNotIn(_INGEST_KEY, json.dumps(derived, default=str))
+
+    def test6(self) -> None:
+        """
+        Test that without a key a secret is left out and declared so.
+        """
+        environ = {
+            "CONVALESCE_SEND_SETTINGS": "true",
+            "WAREHOUSE": "analytics",
+            "API_KEY": _SECRET,
+        }
+        sent = _sent_with(environ, _Recorder())
+        self.assertNotIn("API_KEY", _items(sent))
+        self.assertNotIn("keyed_by", sent["payload"]["settings"])
+        self.assertIn(
+            {
+                "path": "settings",
+                "reason": "no key to fingerprint 1 settings with",
+            },
+            sent["excluded"],
+        )
+        self.assertNotIn(_SECRET, json.dumps(sent, default=str))
+
+    def test7(self) -> None:
+        """
+        Test that a name the operator listed is never sent.
+        """
+        environ = dict(_SETTINGS_ENV, CONVALESCE_SETTINGS_SKIP="WAREHOUSE")
+        items = _items(_sent_with(environ, _KeyedRecorder()))
+        self.assertNotIn("WAREHOUSE", items)
+        self.assertIn("API_KEY", items)
+
+    def test8(self) -> None:
+        """
+        Test that a payload that is no mapping is sent as it was, with
+        nothing added and nothing raised.
+        """
+        recorder = _KeyedRecorder()
+        with unittest.mock.patch.dict(os.environ, _SETTINGS_ENV, clear=True):
+            outcome = cegxcom.forward(["not", "a", "result"], recorder)
+        self.assertTrue(outcome["convalesce_emitted"])
+        self.assertNotIn("settings", json.dumps(recorder.sent, default=str))

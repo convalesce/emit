@@ -1,0 +1,168 @@
+{
+  "hashes": [
+    {
+      "secret": "ingest",
+      "kind": "environment",
+      "name": "DB_PASSWORD",
+      "value": "hunter2",
+      "fingerprint": "7ee700b0447bb731"
+    },
+    {
+      "secret": "ingest",
+      "kind": "variable",
+      "name": "api_token",
+      "value": "abc",
+      "fingerprint": "03632bac5e3f9598"
+    },
+    {
+      "secret": "another-key",
+      "kind": "environment",
+      "name": "DB_PASSWORD",
+      "value": "hunter2",
+      "fingerprint": "160070ebd0e2c589"
+    },
+    {
+      "secret": "ingest",
+      "kind": "keyed_by",
+      "name": "",
+      "value": "",
+      "fingerprint": "2b4957b70d863694"
+    },
+    {
+      "secret": "ingest",
+      "kind": "environment",
+      "name": "UNICODE",
+      "value": "p\u00e4ssw\u00f6rd \u2603",
+      "fingerprint": "9850bb0fe249958c"
+    },
+    {
+      "secret": "ingest",
+      "kind": "environment",
+      "name": "EMPTY",
+      "value": "",
+      "fingerprint": "367bc689ebffbdb4"
+    }
+  ],
+  "secret": [
+    {
+      "name": "ENVIRONMENT",
+      "value": "production",
+      "is_secret": false
+    },
+    {
+      "name": "AIRFLOW__CORE__EXECUTOR",
+      "value": "CeleryExecutor",
+      "is_secret": false
+    },
+    {
+      "name": "BATCH_SIZE",
+      "value": "500",
+      "is_secret": false
+    },
+    {
+      "name": "TZ",
+      "value": "Europe/London",
+      "is_secret": false
+    },
+    {
+      "name": "AIRFLOW_HOME",
+      "value": "/opt/airflow",
+      "is_secret": false
+    },
+    {
+      "name": "DB_PASSWORD",
+      "value": "x",
+      "is_secret": true
+    },
+    {
+      "name": "apiKey",
+      "value": "x",
+      "is_secret": true
+    },
+    {
+      "name": "GITHUB_TOKEN",
+      "value": "x",
+      "is_secret": true
+    },
+    {
+      "name": "AZURE_SAS",
+      "value": "x",
+      "is_secret": true
+    },
+    {
+      "name": "SOMETHING",
+      "value": "postgresql://user:hunter2@db:5432/app",
+      "is_secret": true
+    },
+    {
+      "name": "SOMETHING",
+      "value": "postgresql://db:5432/app",
+      "is_secret": true
+    },
+    {
+      "name": "SOMETHING",
+      "value": "Server=db;Password=hunter2",
+      "is_secret": true
+    },
+    {
+      "name": "SOMETHING",
+      "value": "-----BEGIN PRIVATE KEY-----",
+      "is_secret": true
+    },
+    {
+      "name": "SOMETHING",
+      "value": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig",
+      "is_secret": true
+    },
+    {
+      "name": "SOMETHING",
+      "value": "Zq9aF3kQ7zL2mX8vB4nC6tR1yU0p",
+      "is_secret": true
+    },
+    {
+      "name": "SOMETHING",
+      "value": "a-plain-sentence-of-words-only",
+      "is_secret": false
+    },
+    {
+      "name": "SOMETHING",
+      "value": "1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+      "is_secret": true
+    },
+    {
+      "name": "PATH",
+      "value": "/usr/local/bin:/usr/bin:/bin",
+      "is_secret": false
+    },
+    {
+      "name": "HOSTNAME",
+      "value": "worker-7f9c6d5b8-x2k4q",
+      "is_secret": true
+    },
+    {
+      "name": "AIRFLOW_CONN_WAREHOUSE",
+      "value": "{\"conn_type\":\"sqlite\",\"host\":\"/opt/airflow/x.db\"}",
+      "is_secret": true
+    },
+    {
+      "name": "SOMETHING",
+      "value": "{\"login\": \"etl\", \"password\": \"hunter2\"}",
+      "is_secret": true
+    },
+    {
+      "name": "SOMETHING",
+      "value": "token: abc",
+      "is_secret": true
+    },
+    {
+      "name": "SOMETHING",
+      "value": "a note about passwords",
+      "is_secret": false
+    },
+    {
+      "name": "SQL_ALCHEMY_CONN",
+      "value": "sqlite:////opt/airflow/airflow.db",
+      "is_secret": true
+    }
+  ]
+}

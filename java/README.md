@@ -145,6 +145,42 @@ Convalesce's own key is held to more than that rule:
   `excluded` says `{"path": "$", "reason": "ingest key masked"}`. The key travels in the
   `Authorization` header only. A key under 8 characters is too short to look for.
 
+## Settings
+
+Off by default. With `CONVALESCE_SEND_SETTINGS=true` on the driver, the application's end also
+carries the driver's environment variables, so a receiver holding them for the last good run and
+for this one can say which changed.
+
+An ordinary variable is sent as its value. One whose name or value reads as a credential, or whose
+value is over 300 characters, is sent only as a keyed hash made in the driver: an HMAC-SHA-256 of
+its kind, name and value, cut to 16 hex characters. The hash says that a secret changed and nothing of
+what it is.
+
+```json
+"settings": {
+  "items": [
+    {"kind": "environment", "name": "DB_PASSWORD", "fingerprint": "7ee700b0447bb731"},
+    {"kind": "environment", "name": "TZ", "value": "Europe/London"}
+  ],
+  "keyed_by": "2b4957b70d863694"
+}
+```
+
+- The hash is keyed with `CONVALESCE_FINGERPRINT_KEY` where you set one, and with a key derived
+  from the ingest key where you do not. `CONVALESCE_FINGERPRINT_KEY` is never sent. `keyed_by` is
+  a hash of the key itself: two runs' hashes compare only where it is the same.
+- With neither key, each secret is left out and the observation's `excluded` says
+  `{"path": "settings", "reason": "no key to fingerprint 3 settings with"}`.
+- `CONVALESCE_SETTINGS_SKIP` lists names that are sent in neither form, separated by commas:
+  `CONVALESCE_SETTINGS_SKIP=INTERNAL_HOST,BUILD_USER`.
+- `CONVALESCE_INGEST_KEY`, `CONVALESCE_API_KEY` and `CONVALESCE_FINGERPRINT_KEY` are sent in
+  neither form, under their own names or with `CUSTOMER_` in front.
+- At most 500 names are sent, in name order, and `excluded` says
+  `{"path": "settings.environment", "reason": "limited to 500 names"}` when there were more.
+
+The field is added after Spark's redaction has run on the event, and its hashes are the same ones
+the Python client makes for the same key, name and value.
+
 ## Why it is small
 
 Spark already knows how to render its own events -- `JsonProtocol` is what writes the event log --

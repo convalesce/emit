@@ -853,7 +853,14 @@
       "kwargs.validation_result_suite_identifier.run_id.run_name",
       "kwargs.validation_result_suite_identifier.run_id.run_time",
       "platform",
-      "platform_instance"
+      "platform_instance",
+      "settings",
+      "settings.items",
+      "settings.items[].fingerprint",
+      "settings.items[].kind",
+      "settings.items[].name",
+      "settings.items[].value",
+      "settings.keyed_by"
     ]
   },
   "tool": "great_expectations"

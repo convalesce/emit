@@ -10,7 +10,7 @@ that is in the task's own code. A task says so with one call::
     def load():
         lineage(
             inputs=[{"platform": "postgres", "name": "shop.public.orders"}],
-            outputs=["urn:li:dataset:(urn:li:dataPlatform:snowflake,a.b.c,PROD)"],
+            outputs=["urn:cvl:dataset:(urn:cvl:dataPlatform:snowflake,a.b.c,PROD)"],
         )
 
 and the task-run hook sends it as the payload's `lineage`. A task that starts

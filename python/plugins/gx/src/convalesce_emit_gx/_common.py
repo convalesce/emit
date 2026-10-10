@@ -11,6 +11,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
+import convalesce_emit.settings as cesettin
 
 _LOG = logging.getLogger(__name__)
 
@@ -237,7 +238,7 @@ def runtime_platform(payload: Any) -> Dict[str, Any]:
     A receiver has only the datasource's *name* to go on otherwise
     (`meta.active_batch_definition.datasource_name`), and falls back to
     using that as the platform, which produces a urn like
-    `urn:li:dataset:(urn:li:dataPlatform:orders,orders,PROD)` for a
+    `urn:cvl:dataset:(urn:cvl:dataPlatform:orders,orders,PROD)` for a
     datasource named `orders`. On 0.x the engine's own dialect is the real
     platform -- `engine.dialect.name`, and of the engine's URL only the
     database, so no credential travels.
@@ -797,6 +798,30 @@ def forward_validation_result(
     )
 
 
+def add_settings(body: Any, emitter: Any) -> List[Dict[str, str]]:
+    """
+    Put the settings of the process the checkpoint ran in on its event.
+
+    Nothing is added unless `CONVALESCE_SEND_SETTINGS` is on. A secret
+    crosses as a hash keyed in this process; see `convalesce_emit.settings`.
+
+    :param body: the payload about to be sent, changed in place
+    :param emitter: the emitter it goes through, whose ingest key a hash
+        is keyed from where no fingerprint key is set
+    :return: every setting left out, by path and reason
+    """
+    if not isinstance(body, dict):
+        return []
+    key = getattr(getattr(emitter, "config", None), "ingest_key", None)
+    found, left_out = cesettin.collect(
+        key if isinstance(key, str) and key else None,
+        {cesettin.ENVIRONMENT: cesettin.environment(), **cesettin.noted()},
+    )
+    if found:
+        body[cesettin.FIELD] = found
+    return list(left_out)
+
+
 def forward(
     payload: Any,
     emitter: Optional[cemit.EmitterLike] = None,
@@ -854,6 +879,10 @@ def forward(
             body, values = redact_values(body)
             excluded = excluded + redacted + values
         target = emitter or cemit.Emitter()
+        # Last, past every pass above: each is for what a result or a
+        # datasource carries, and a setting is already a value that is no
+        # credential or a hash.
+        excluded = excluded + add_settings(body, target)
         target.emit(
             tool=TOOL,
             event="validation_result",

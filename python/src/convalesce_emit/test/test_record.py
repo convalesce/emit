@@ -157,12 +157,12 @@ class Test_record1(unittest.TestCase):
         """
         emitter = _FakeEmitter()
         cerecord.record(
-            dataset="urn:li:dataset:(urn:li:dataPlatform:hive,orders,PROD)",
+            dataset="urn:cvl:dataset:(urn:cvl:dataPlatform:hive,orders,PROD)",
             event=cerecord.OPERATION,
             outcome="SUCCESS",
             emitter=emitter,
         )
         self.assertEqual(
             emitter.emitted[0]["payload"]["dataset"],
-            "urn:li:dataset:(urn:li:dataPlatform:hive,orders,PROD)",
+            "urn:cvl:dataset:(urn:cvl:dataPlatform:hive,orders,PROD)",
         )

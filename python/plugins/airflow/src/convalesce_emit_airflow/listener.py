@@ -45,6 +45,14 @@ failures carry `error` alone.
 Credentials are withheld after the dump, the same as for the OpenLineage
 events; see `redact`.
 
+A task's end also carries `settings` where `CONVALESCE_SEND_SETTINGS` is
+on: its worker's environment and the Variables it read, each as a value or,
+for anything that reads as a credential, as a keyed hash. See
+`convalesce_emit_airflow.runsettings`.
+
+With `CONVALESCE_SEND_ARGUMENTS` off, an operator's templated fields are
+withheld along with its arguments; see `_without_templated`.
+
 A DAG can be left unreported by name: `CONVALESCE_AIRFLOW_DAG_ALLOW` and
 `CONVALESCE_AIRFLOW_DAG_DENY`, see `dag_reported`. Nothing about such a DAG
 is sent, by this listener or by the OpenLineage transport.
@@ -88,9 +96,11 @@ from typing import (
 )
 
 import convalesce_emit as cemit
+import convalesce_emit.settings as cesettin
 import convalesce_emit.source as cesource
 import convalesce_emit.sqlcapture as cesqlcap
 import convalesce_emit_airflow._env as cealenv
+import convalesce_emit_airflow.runsettings as cealruns
 
 _LOG = logging.getLogger(__name__)
 
@@ -253,6 +263,10 @@ class _Base:
             return
         try:
             if event == _RUNNING:
+                cealruns.start()
+                # Again, for a process where it could not be done as the
+                # plugin loaded; what is wrapped already is left alone.
+                cealruns.watch_variables()
                 # From here until the task ends, the SQL it runs is noted.
                 watch_sql()
             shaped, excluded = shape(payload)
@@ -261,6 +275,12 @@ class _Base:
                 if noted:
                     excluded = excluded + name_connections(noted, shaped)
                     shaped["sql_capture"] = cemit.redact_secrets(noted)[0]
+                # Added after `shape`, which withholds a value under a
+                # credential's name: here that value is already a hash.
+                found, left_out = cealruns.collect(_ingest_key(emitter))
+                excluded = excluded + left_out
+                if found:
+                    shaped[cesettin.FIELD] = found
             emitter.emit(
                 tool=TOOL,
                 event=event,
@@ -359,6 +379,17 @@ def dag_reported(dag_id: Any) -> bool:
         return False
     allowed = _patterns(DAG_ALLOW_ENV)
     return not allowed or any(fnmatch.fnmatchcase(dag_id, p) for p in allowed)
+
+
+def _ingest_key(emitter: Any) -> Optional[str]:
+    """
+    The key an emitter sends with, which a setting's hash is keyed from.
+
+    :param emitter: the emitter the event is about to go through
+    :return: its ingest key, or None for an emitter that holds none
+    """
+    key = getattr(getattr(emitter, "config", None), "ingest_key", None)
+    return key if isinstance(key, str) and key else None
 
 
 def send_arguments() -> bool:
@@ -680,10 +711,63 @@ def redact(
     :param excluded: what the dump already left out
     :return: the payload with credentials withheld, and everything left out
     """
+    withheld: List[Dict[str, str]] = []
+    if not send_arguments():
+        out = _without_templated(out, "", withheld)
     redacted, secrets = cemit.redact_secrets(out)
     pairs: List[Dict[str, str]] = []
     redacted = _redact_named_values(redacted, "", pairs)
-    return redacted, excluded + secrets + pairs
+    return redacted, excluded + withheld + secrets + pairs
+
+
+# What Airflow keeps of a task's templates once they are rendered.
+_RENDERED = frozenset(
+    {"rendered_task_instance_fields", "rendered_map_index", "rendered_fields"}
+)
+_NOT_SENT = "arguments not sent"
+
+
+def _without_templated(
+    value: Any, path: str, excluded: List[Dict[str, str]]
+) -> Any:
+    """
+    Drop every templated field of every operator in a dumped payload.
+
+    An operator names its own templated fields in `template_fields`:
+    `bash_command`, `sql`, `env`, whatever its author declared. Airflow
+    renders them in place, so by the time a task ends they hold the values
+    of the Variables and connections the template read. They are what the
+    task was called with as much as `op_kwargs` is, and an operator is
+    found wherever it sits in the payload: the task, and each task of its
+    DAG.
+
+    :param value: the dumped value being walked
+    :param path: dotted path of `value` from the payload root
+    :param excluded: accumulator every dropped field is appended to
+    :return: the same shape without those fields
+    """
+    if isinstance(value, list):
+        return [
+            _without_templated(item, f"{path}[{i}]", excluded)
+            for i, item in enumerate(value)
+        ]
+    if not isinstance(value, dict):
+        return value
+    fields = value.get("template_fields")
+    templated = (
+        {f for f in fields if isinstance(f, str)}
+        if isinstance(fields, (list, tuple))
+        else set()
+    )
+    out: Dict[str, Any] = {}
+    for key, item in value.items():
+        child = f"{path}.{key}" if path else str(key)
+        if key in templated or key in _RENDERED:
+            if item not in (None, "", [], {}):
+                excluded.append({"path": child, "reason": _NOT_SENT})
+            continue
+        out[key] = _without_templated(item, child, excluded)
+    return out
 
 
 def _redact_named_values(
@@ -1176,6 +1260,8 @@ def get_listener() -> Optional[_Base]:
 
     :return: the listener, or None if one could not be built
     """
+    # As the plugin loads, which is before a task's templates are rendered.
+    cealruns.watch_variables()
     try:
         return build_listener_class()()
     except Exception as exc:  # pylint: disable=broad-exception-caught
