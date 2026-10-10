@@ -87,6 +87,54 @@ The same is sent for the connection of each database hook a task builds in
 its own code, such as a `PostgresHook` inside a `@task`, and each statement
 that hook ran carries the connection's id as `conn_id`.
 
+## Settings
+
+Set `CONVALESCE_SEND_SETTINGS=true` on your workers and each task's success
+or failed event also carries the settings the task ran with: the environment
+variables of its process and the Airflow Variables it read. It is off by
+default.
+
+A Variable is noted as the task reads it, in a template such as
+`{{ var.value.my_var }}` or from the task's own code. A Variable the task
+depends on without reading it through Airflow can be named in
+`CONVALESCE_SETTINGS_VARIABLES`, a comma-separated list of exact names, up
+to 50. Each is read once when the task ends.
+
+A setting whose name or value reads as a credential, and any value longer
+than 300 characters, is sent as a `fingerprint`: a keyed hash, sixteen hex
+characters long, made on your worker. It says that the value changed
+between two runs and nothing of what the value is. Every other setting is
+sent as its `value`.
+
+The hash is keyed with `CONVALESCE_FINGERPRINT_KEY` where you set one, and
+with a key derived from your ingest key otherwise. The fingerprint key is
+only ever read on your worker and is never sent. `keyed_by` identifies the
+key the hashes were made under, so hashes are compared only between runs
+that used the same one.
+
+Set `CONVALESCE_SETTINGS_SKIP` to a comma-separated list of names to keep
+those settings out in either form.
+
+The event then holds:
+
+```json
+{
+  "settings": {
+    "items": [
+      {"kind": "environment", "name": "DB_PASSWORD", "fingerprint": "5d1c0a9e7b3f2468"},
+      {"kind": "environment", "name": "STAGE", "value": "prod"},
+      {"kind": "variable", "name": "region", "value": "eu-west-1"}
+    ],
+    "keyed_by": "9f3b6c1d2e4a5b70"
+  }
+}
+```
+
+With `CONVALESCE_SEND_ARGUMENTS=false`, an operator's templated fields
+(`bash_command`, `sql`, `env` and whatever else it declares) are withheld
+along with its arguments, since a rendered template holds the values it
+read.
+
 ## Configure
 
 `CONVALESCE_INGEST_KEY`, `CONVALESCE_ENDPOINT`, `CONVALESCE_DRY_RUN` and the
