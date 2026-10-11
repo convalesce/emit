@@ -127,6 +127,35 @@ The event then holds:
 }
 ```
 
+## Output of a failed run
+
+A run that fails or crashes also says what it logged last. The event of a
+failed task run carries `output_tail`, the last lines that task run logged:
+what its code logged through `get_run_logger()`, what it printed with
+`log_prints` on, and what Prefect said of the run. The event of a failed
+flow run carries the lines the flow itself logged, outside any task. A run
+that completes sends none of it.
+
+At most 60 lines and 4096 bytes are sent, the end of the output being the
+part that is kept. A password in a URI, the value of a name such as
+`password`, `token` or `api_key`, a JSON Web Token and a PEM block are
+masked first, and a masked or shortened tail is declared in the event's
+`excluded`.
+
+The lines are held in the process that runs the flow, the last 2000 across
+its runs, so a task among many that log a great deal may have fewer than 60
+left when it fails.
+
+Set `CONVALESCE_SEND_OUTPUT=false` where the flow runs to send none of it.
+
+The event then holds:
+
+```json
+{
+  "output_tail": "Running with dbt=1.8.7\ninvalid identifier 'SALES_AMOUNT'\nTask run failed with exception: ValueError('boom')"
+}
+```
+
 ## Supported
 
 Prefect 2.20 and 3.x, on Python 3.9 and later. Verified on real installs:
