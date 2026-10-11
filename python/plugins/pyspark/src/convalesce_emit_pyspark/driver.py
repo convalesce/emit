@@ -27,6 +27,13 @@ where `CONVALESCE_SEND_SETTINGS` is on: an ordinary one as its value, and
 one that reads as a credential as a hash keyed in this process; see
 `convalesce_emit.settings`.
 
+A `driver_failure` also carries `output_tail`, the last lines the driver
+logged before it failed, unless `CONVALESCE_SEND_OUTPUT` is false; see
+`convalesce_emit.output`. They are the records logged in the driver's
+process from the moment the hook went in: the driver's own, PySpark's and
+py4j's. What the JVM writes to the driver's stderr never passes through
+Python and is not among them.
+
 Where the platform says which of its runs the driver is, both say so too:
 on Databricks the job run, the task's run, the job, notebook, cluster and
 workspace (`databricks`), and on YARN which try of the application it is
@@ -60,6 +67,7 @@ import types
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import convalesce_emit as cemit
+import convalesce_emit.output as ceoutput
 import convalesce_emit.settings as cesettin
 import convalesce_emit.source as cesource
 import convalesce_emit_pyspark._env as cepysenv
@@ -254,6 +262,8 @@ class _Hook:
         self._previous_excepthook: Callable[..., Any] = sys.excepthook
         self._previous_threading: Callable[..., Any] = threading.excepthook
         self._original_exit: Callable[..., Any] = sys.exit
+        # The last records the driver logged, for the failure it may end in.
+        self._output: Optional[ceoutput.Ring] = None
 
     def attach(self) -> None:
         """
@@ -269,6 +279,7 @@ class _Hook:
         sys.exit = self.exit  # type: ignore[assignment]
         atexit.register(self.at_exit)
         self._attached_ms = int(time.time() * 1000)
+        self._output = ceoutput.watch()
         self.watch_cells()
         if not self.wrap_stop():
             # Hooked before the driver imported PySpark, as the `.pth` does.
@@ -289,6 +300,8 @@ class _Hook:
         if sys.exit == self.exit:
             sys.exit = self._original_exit
         atexit.unregister(self.at_exit)
+        ceoutput.unwatch(self._output)
+        self._output = None
         if self._shell is not None:
             try:
                 self._shell.events.unregister(_CELL_EVENT, self.after_cell)
@@ -663,6 +676,7 @@ class _Hook:
         if not _in_notebook():
             payload["argv"], excluded = _argv()
         self.add_settings(payload, excluded)
+        self.add_output(payload, excluded)
         self._send(EVENT, self.describe(payload), excluded)
 
     def report_script(self, context: _Context) -> None:
@@ -731,6 +745,30 @@ class _Hook:
         if found:
             payload[cesettin.FIELD] = found
         excluded.extend(left_out)
+
+    def add_output(
+        self, payload: Dict[str, Any], excluded: List[Dict[str, str]]
+    ) -> None:
+        """
+        Put the last lines the driver logged on its failure.
+
+        Nothing is added when `CONVALESCE_SEND_OUTPUT` is off or the driver
+        logged nothing. The lines are masked as they are cut, by rules made
+        for output.
+
+        :param payload: what is about to be sent, changed in place
+        :param excluded: what was left out of it, by path and reason, added
+            to in place
+        :return: nothing
+        """
+        try:
+            if self._output is not None:
+                excluded.extend(ceoutput.add(payload, self._output.lines()))
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            # The class and not the message, which could quote the output.
+            _LOG.debug(
+                "convalesce: could not read the output: %s", type(err).__name__
+            )
 
     def _send(
         self, event: str, payload: Dict[str, Any], excluded: List[Dict[str, str]]

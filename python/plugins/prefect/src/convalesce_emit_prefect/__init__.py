@@ -9,6 +9,7 @@ import convalesce_emit_prefect as ceprefec
 import logging
 
 import convalesce_emit_prefect._capture as cecap
+import convalesce_emit_prefect._output as ceout
 import convalesce_emit_prefect._settings as ceset
 from convalesce_emit_prefect._lineage import launched, lineage
 from convalesce_emit_prefect._version import __version__
@@ -21,6 +22,8 @@ _LOG = logging.getLogger(__name__)
 # runs, so the watching starts here, where the author's own import of the
 # hooks lands.
 cecap.watch()
+# And what a run logs is held as it is logged, for the run that fails.
+ceout.watch()
 # The same holds for a Variable a run reads: it is noted as it is read, or
 # not at all.
 ceset.watch_variables()

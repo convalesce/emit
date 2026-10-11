@@ -144,6 +144,44 @@ On every Airflow version, 2.x and 3.x alike, a Variable read in a template
 and one read from the task's own code were both noted and sent with the
 task's end.
 
+The output of a failed run (`CONVALESCE_SEND_OUTPUT`) was checked another
+way, and on fewer versions: each tool installed in its own environment on a
+macOS host, run for real, and what the plugin sent read off a stand-in
+receiver. It has not been run in Docker with `collect/e2e-observe`, and
+nothing was checked past the wire. In every run below the failure carried
+`output_tail` with a seeded password masked, and the success beside it
+carried none.
+
+| Tool | Versions where the output checks pass | How it was run |
+| --- | --- | --- |
+| Airflow | 2.5.3, 2.7.3, 2.9.3, 2.10.5, 2.11.0 | a scheduler with the sequential executor, a failing `BashOperator` and a failing `PythonOperator` |
+| Airflow | 3.0.3, 3.1.0, 3.2.2 | `airflow standalone`, the same DAG |
+| Dagster | 1.7.16, 1.13.21 | a job with a failing op, in process and under the multiprocess executor, read back the way the sensor reads it |
+| Prefect | 2.20.26, 3.1.15, 3.8.5 | a flow with a failing task, against the server each starts for itself |
+| PySpark driver | 3.5.3 | a local driver that fails in Python |
+| Spark listener | 3.5.3 | a local driver whose job fails in a task |
+
+What those runs found, by tool:
+
+- Airflow 2 sends a failing `BashOperator`'s output and what the task's
+  code prints. Airflow 3 sends the `BashOperator`'s output and not the
+  prints: a task's stdout goes to the supervisor without passing through a
+  logger.
+- From Airflow 3.1 an operator logs through `structlog` and nothing it says
+  becomes a `logging` record. The lines are read from a `structlog`
+  processor there; 3.0 and 2.x are read from the records.
+- A handler put on Prefect's run loggers before `prefect` is imported is
+  taken off again when it is, on all three versions; a filter is not.
+- A handler on the root logger made `logging.basicConfig` in a PySpark
+  driver do nothing, so no handler is put there on any tool.
+- Dagster's log manager logs a step's failure with its whole stack, which
+  alone is longer than a tail; those records are left out and the error is
+  written at the end of the tail instead.
+
+Not run for this field: Airflow 2.6.3 and 2.8.4, Dagster 1.9.13 and
+1.10.0, Prefect 3.4.25, Spark 3.3, 3.4 and 4.0, and Great Expectations,
+which does not send it.
+
 ## Spark platforms
 
 Where a Spark driver runs decides how the listener and

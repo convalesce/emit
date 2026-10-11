@@ -38,6 +38,7 @@ import convalesce_emit_prefect._capture as cecap
 import convalesce_emit_prefect._env as ceprefenv
 import convalesce_emit_prefect._lineage as celin
 import convalesce_emit_prefect._mask as cemask
+import convalesce_emit_prefect._output as ceout
 import convalesce_emit_prefect._settings as ceset
 
 _LOG = cemask.logger(__name__)
@@ -164,6 +165,8 @@ _TASK_RUN_NODE = "task-run"
 # this process knows of is listed in a state that ended it, re-reading after
 # each of these waits and never past the budget in total.
 _FINAL_STATES = frozenset({"COMPLETED", "FAILED", "CRASHED", "CANCELLED"})
+# The states a run's last lines are sent with.
+_FAILED_STATES = frozenset({"FAILED", "CRASHED"})
 _COMPLETE_READ_BUDGET_SECONDS = 5.0
 _COMPLETE_READ_WAITS = (0.25, 0.5, 1.0, 1.5, 1.5)
 # The task runs each flow run's task hooks fired for in this process, which
@@ -238,6 +241,12 @@ def _emit(  # pylint: disable=too-many-arguments
             if found:
                 dumped[cesettin.FIELD] = found
             withheld = withheld + left_out
+        # Only a run that failed says what it logged, and its lines are
+        # masked as they are read, by rules made for output.
+        if _failed(payload) and isinstance(dumped, dict):
+            withheld = withheld + ceout.add(
+                dumped, payload.get(f"{subject}_run")
+            )
     except Exception as exc:  # pylint: disable=broad-exception-caught
         # A Prefect hook that raises is logged by Prefect as the flow's own
         # failure; nothing about reporting on it is worth that.
@@ -747,6 +756,17 @@ def _is_final(payload: Dict[str, Any]) -> bool:
     """
     state = payload.get("state")
     return _state_type(getattr(state, "type", None)) in _FINAL_STATES
+
+
+def _failed(payload: Dict[str, Any]) -> bool:
+    """
+    Whether an event is a run's failure: its own, or its process's.
+
+    :param payload: the hook's own arguments
+    :return: True for a state that is failed or crashed
+    """
+    state = payload.get("state")
+    return _state_type(getattr(state, "type", None)) in _FAILED_STATES
 
 
 def _state_type(value: Any) -> str:
