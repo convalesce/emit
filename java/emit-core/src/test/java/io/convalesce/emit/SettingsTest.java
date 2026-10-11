@@ -5,11 +5,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
-import java.io.File;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -233,7 +229,7 @@ public class SettingsTest {
   public void aNameOrValueThatNeedsEscapingIsStillOneJsonString() {
     Settings.Collected found =
         Settings.collect("ingest", kinds(env("QUOTE\"D", "say \"hi\"\n\\")), on());
-    Map<String, Object> item = map(list(map(new Reader(found.json()).value()).get("items")).get(0));
+    Map<String, Object> item = map(list(Vectors.parse(found.json()).get("items")).get(0));
     assertEquals("QUOTE\"D", item.get("name"));
     assertEquals("say \"hi\"\n\\", item.get("value"));
   }
@@ -285,130 +281,15 @@ public class SettingsTest {
     return found;
   }
 
-  /** The shared vectors, found by walking up from wherever Gradle ran the tests. */
   private static Map<String, Object> vectors() throws IOException {
-    File at = new File(System.getProperty("user.dir")).getAbsoluteFile();
-    while (at != null && !new File(at, VECTORS).isFile()) {
-      at = at.getParentFile();
-    }
-    assertTrue(VECTORS + " not found above " + System.getProperty("user.dir"), at != null);
-    byte[] bytes = Files.readAllBytes(new File(at, VECTORS).toPath());
-    return map(new Reader(new String(bytes, StandardCharsets.UTF_8)).value());
+    return Vectors.read(VECTORS);
   }
 
-  @SuppressWarnings("unchecked")
   private static Map<String, Object> map(Object value) {
-    return (Map<String, Object>) value;
+    return Vectors.map(value);
   }
 
-  @SuppressWarnings("unchecked")
   private static List<Object> list(Object value) {
-    return (List<Object>) value;
-  }
-
-  /** Just enough of a JSON reader for the vectors: there is no JSON library here to borrow. */
-  private static final class Reader {
-
-    private final String text;
-    private int at;
-
-    Reader(String text) {
-      this.text = text;
-    }
-
-    Object value() {
-      space();
-      char c = text.charAt(at);
-      if (c == '{') {
-        Map<String, Object> out = new LinkedHashMap<String, Object>();
-        at++;
-        for (space(); text.charAt(at) != '}'; space()) {
-          String key = string();
-          space();
-          expect(':');
-          out.put(key, value());
-          space();
-          if (text.charAt(at) == ',') {
-            at++;
-          }
-        }
-        at++;
-        return out;
-      }
-      if (c == '[') {
-        List<Object> out = new ArrayList<Object>();
-        at++;
-        for (space(); text.charAt(at) != ']'; space()) {
-          out.add(value());
-          space();
-          if (text.charAt(at) == ',') {
-            at++;
-          }
-        }
-        at++;
-        return out;
-      }
-      if (c == '"') {
-        return string();
-      }
-      int start = at;
-      while (at < text.length() && ",}] \n\r\t".indexOf(text.charAt(at)) < 0) {
-        at++;
-      }
-      String word = text.substring(start, at);
-      if (word.equals("true") || word.equals("false")) {
-        return Boolean.valueOf(word);
-      }
-      return word.equals("null") ? null : (Object) Double.valueOf(word);
-    }
-
-    private String string() {
-      expect('"');
-      StringBuilder out = new StringBuilder();
-      while (text.charAt(at) != '"') {
-        char c = text.charAt(at++);
-        if (c != '\\') {
-          out.append(c);
-          continue;
-        }
-        char escaped = text.charAt(at++);
-        switch (escaped) {
-          case 'n':
-            out.append('\n');
-            break;
-          case 't':
-            out.append('\t');
-            break;
-          case 'r':
-            out.append('\r');
-            break;
-          case 'b':
-            out.append('\b');
-            break;
-          case 'f':
-            out.append('\f');
-            break;
-          case 'u':
-            out.append((char) Integer.parseInt(text.substring(at, at + 4), 16));
-            at += 4;
-            break;
-          default:
-            out.append(escaped);
-        }
-      }
-      at++;
-      return out.toString();
-    }
-
-    private void expect(char c) {
-      assertEquals("at " + at, c, text.charAt(at));
-      at++;
-    }
-
-    private void space() {
-      while (at < text.length() && Character.isWhitespace(text.charAt(at))) {
-        at++;
-      }
-    }
+    return Vectors.list(value);
   }
 }
