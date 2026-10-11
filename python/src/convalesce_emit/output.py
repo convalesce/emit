@@ -156,7 +156,9 @@ class Ring(logging.Handler):
             if record is self._last or record.name.startswith(_OWN):
                 return
             self._last = record
-            self._records.append((self.scope(record), text_of(record)))
+            text = self.text(record)
+            if text is not None:
+                self._records.append((self.scope(record), text))
         except Exception:  # pylint: disable=broad-exception-caught
             # Called from inside the tool's own logging call, which must
             # return; and logging from a handler would come straight back.
@@ -171,6 +173,18 @@ class Ring(logging.Handler):
         :return: nothing
         """
         self._records.append((scope, clip(text)))
+
+    def text(self, record: logging.LogRecord) -> Optional[str]:
+        """
+        What a record is held as.
+
+        Its message here. A plugin whose tool wraps what its user logged
+        in words of its own answers with the user's.
+
+        :param record: what was logged
+        :return: the text to hold; None for a record that is not output
+        """
+        return text_of(record)
 
     def scope(self, record: logging.LogRecord) -> Any:
         """

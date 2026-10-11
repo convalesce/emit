@@ -815,6 +815,7 @@
       "steps[].config.min_total",
       "steps[].config.seconds",
       "steps[].config.source_table",
+      "steps[].output_tail",
       "steps[].ran",
       "steps[].ran.file_sha256",
       "steps[].ran.sha256",
