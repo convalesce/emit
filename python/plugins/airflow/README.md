@@ -135,6 +135,31 @@ With `CONVALESCE_SEND_ARGUMENTS=false`, an operator's templated fields
 along with its arguments, since a rendered template holds the values it
 read.
 
+## Output of a failed task
+
+A task that runs a command fails with an exception that says only that the
+command failed. What the command said is in the task's log. So each task's
+failed event also carries `output_tail`: the last lines the task logged
+before it failed, including each line a `BashOperator`'s command printed.
+A task that succeeds sends none of it.
+
+At most 60 lines and 4096 bytes are sent, the end of the output being the
+part that is kept. A password in a URI, the value of a name such as
+`password`, `token` or `api_key`, a JSON Web Token and a PEM block are
+masked first, and a masked or shortened tail is declared in the event's
+`excluded`. On Airflow 3 a task's own `print()` is sent to the supervisor
+without passing through a logger, and is not part of the tail.
+
+Set `CONVALESCE_SEND_OUTPUT=false` on your workers to send none of it.
+
+The event then holds:
+
+```json
+{
+  "output_tail": "Database Error in model stg_orders\n  invalid identifier 'SALES_AMOUNT'\nCommand exited with return code 1"
+}
+```
+
 ## Configure
 
 `CONVALESCE_INGEST_KEY`, `CONVALESCE_ENDPOINT`, `CONVALESCE_DRY_RUN` and the
