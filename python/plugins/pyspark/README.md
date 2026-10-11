@@ -215,6 +215,34 @@ Each observation then holds:
 }
 ```
 
+## Output of a failed driver
+
+A `driver_failure` also carries `output_tail`: the last lines the driver
+logged before it failed, through its own loggers, PySpark's and py4j's,
+from the moment the hook went in. A driver that does not fail sends none
+of it.
+
+At most 60 lines and 4096 bytes are sent, the end of the output being the
+part that is kept. A password in a URI, the value of a name such as
+`password`, `token` or `api_key`, a JSON Web Token and a PEM block are
+masked first, and a masked or shortened tail is declared in the
+observation's `excluded`.
+
+The lines are the records Python's `logging` made in the driver's process.
+What the JVM writes to the driver's stderr, and what the driver prints, is
+not among them. The hook puts no handler on the root logger, so
+`logging.basicConfig` in your script works as it did.
+
+Set `CONVALESCE_SEND_OUTPUT=false` on the driver to send none of it.
+
+The observation then holds:
+
+```json
+{
+  "output_tail": "reading orders\nTable or view not found: sales_amount"
+}
+```
+
 ## Supported
 
 PySpark 3.3 to 4.0, on Python 3.9 and later.

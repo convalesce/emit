@@ -22,6 +22,7 @@
       "error_detail.message",
       "error_detail.traceback",
       "error_detail.type",
+      "output_tail",
       "pyspark_version",
       "python_version",
       "settings",
