@@ -4,6 +4,7 @@ Tests for sending the last lines a failed task logged.
 Run with `make test`.
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -356,12 +357,22 @@ class Test_output_known_secrets1(unittest.TestCase):
         cealist._airflow_redact.cache_clear()
 
     def _masker(self, redact: Any) -> Any:
-        """Stand in for the module Airflow keeps its masker in."""
-        module = types.ModuleType(cealist._MASKER_MODULES[-1])
-        module.redact = redact  # type: ignore[attr-defined]
-        return unittest.mock.patch.dict(
-            sys.modules, {cealist._MASKER_MODULES[-1]: module}
+        """
+        Stand in for the module Airflow keeps its masker in, whatever
+        Airflow is installed here.
+        """
+        name = "convalesce_test_masker"
+        module = types.ModuleType(name)
+        if redact is not None:
+            module.redact = redact  # type: ignore[attr-defined]
+        stack = contextlib.ExitStack()
+        stack.enter_context(
+            unittest.mock.patch.dict(sys.modules, {name: module})
         )
+        stack.enter_context(
+            unittest.mock.patch.object(cealist, "_MASKER_MODULES", (name,))
+        )
+        return stack
 
     def test1(self) -> None:
         """
@@ -418,10 +429,11 @@ class Test_output_known_secrets1(unittest.TestCase):
         """
         Test that without Airflow's masker the core's rules still apply.
         """
-        self.assertIsNone(cealist._airflow_redact())
-        sent = _run(
-            _FAILED, lambda: logging.getLogger(_HOOK_LOGGER).info("pwd=abc")
-        )
+        with self._masker(None):
+            self.assertIsNone(cealist._airflow_redact())
+            sent = _run(
+                _FAILED, lambda: logging.getLogger(_HOOK_LOGGER).info("pwd=abc")
+            )
         self.assertEqual(sent["payload"]["output_tail"], "pwd=***")
 
 
