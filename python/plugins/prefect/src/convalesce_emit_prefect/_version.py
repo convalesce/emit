@@ -7,4 +7,4 @@ import convalesce_emit_prefect._version as ceprefectver
 """
 
 __package_name__ = "convalesce-emit-prefect"
-__version__ = "0.3.0"
+__version__ = "1.0.0"
