@@ -31,7 +31,16 @@ import importlib
 import json
 import logging
 import sys
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+)
 
 import convalesce_emit as cemit
 import convalesce_emit.config as ceconfig
@@ -110,14 +119,14 @@ _OF_A_FAILURE = frozenset({ceoutput.FIELD, OUTPUT_EXCLUDED})
 # the variable an emitter would read.
 _INGEST_KEY_ENV = "CONVALESCE_INGEST_KEY"
 
+# How far up from the ring the `makeRecord` that called the factory is
+# looked for: it is four frames up, and a subclass's own adds one.
+_MAKER_FRAMES = 8
 # Where Dagster's log manager puts what it knows of a record it hands on.
 _RECORD_META = "dagster_meta"
 # Dagster 1.7 reports each step's start and end to its own telemetry
 # through a logger that reaches the root: a line of JSON about Dagster.
 _TELEMETRY = "dagster_telemetry_logger"
-# The root logger's name, where what a library logs in a step arrives.
-_ROOT = ""
-
 # Module state, not a constant: the bracket is process-wide by nature.
 _installed = False  # pylint: disable=invalid-name
 
@@ -147,6 +156,12 @@ class _StepRing(ceoutput.Ring):
     and a failure's alone is longer than a tail: held, it left no room
     for anything the step had said. Those are passed over. The failure
     crosses with the run's event log, and its error ends the tail.
+
+    Which kind a record is, the manager says only after the record is
+    made, and every record is first seen as it is made. So the manager's
+    are left until its handlers show them again, with what it knows. It
+    then logs each one once more to every logger the job configured, and
+    those copies are left out for good.
     """
 
     def text(self, record: logging.LogRecord) -> Optional[str]:
@@ -155,19 +170,46 @@ class _StepRing(ceoutput.Ring):
 
         :param record: what was logged
         :return: the line as the step's code wrote it; None for an event
-            of Dagster's own
+            of Dagster's own, a copy of a line, and a record of the
+            manager's that has yet to be shown by it
         """
         if record.name == _TELEMETRY:
             return None
         meta = getattr(record, _RECORD_META, None)
-        if not isinstance(meta, Mapping):
+        if isinstance(meta, Mapping):
+            if meta.get("dagster_event") is not None:
+                return None
+            written = meta.get("orig_message")
+            if isinstance(written, str):
+                return ceoutput.clip(written)
             return ceoutput.text_of(record)
-        if meta.get("dagster_event") is not None:
+        logger, extra = _maker()
+        copied = isinstance(extra, Mapping) and _RECORD_META in extra
+        if copied or self in (getattr(logger, "handlers", None) or ()):
             return None
-        written = meta.get("orig_message")
-        if isinstance(written, str):
-            return ceoutput.clip(written)
         return ceoutput.text_of(record)
+
+
+def _maker() -> Tuple[Any, Any]:
+    """
+    The logger making the record this is called for, and the `extra` it
+    is making it with.
+
+    `logging` hands the factory a record's fields and not the logger, and
+    sets what `extra` holds on the record only once the factory is done.
+    Both are in the frame of the `makeRecord` that called it.
+
+    :return: the two; None for each where no such frame is found
+    """
+    frame: Any = sys._getframe(1)  # pylint: disable=protected-access
+    for _ in range(_MAKER_FRAMES):
+        if frame is None:
+            break
+        if frame.f_code.co_name == "makeRecord":
+            held = frame.f_locals
+            return held.get("self"), held.get("extra")
+        frame = frame.f_back
+    return None, None
 
 
 # #############################################################################
@@ -266,17 +308,16 @@ def _begin(step_context: Any) -> Optional[ceoutput.Ring]:
         cesqlcap.start()
     except Exception:  # pylint: disable=broad-exception-caught
         pass
-    return ceoutput.watch(
-        _ROOT, ring=_StepRing(), loggers=_step_loggers(step_context)
-    )
+    return ceoutput.watch(*_step_loggers(step_context), ring=_StepRing())
 
 
 def _step_loggers(step_context: Any) -> List[Any]:
     """
     The logger behind a step's `context.log`.
 
-    Dagster builds it for the run, outside the hierarchy `logging` keeps,
-    so no name finds it and nothing it is handed reaches the root.
+    Its records are read where its handlers see them, with what it has
+    added to each; see `_StepRing`. It is in no hierarchy to be found by
+    name.
 
     :param step_context: Dagster's context for the step
     :return: the logger, or none where the context has no such thing
@@ -317,7 +358,7 @@ def _finish(
     :param ring: what `_begin` put on the step's loggers
     :param failure: what the step failed with; empty for one that did not
     """
-    ceoutput.unwatch(ring, _ROOT, loggers=_step_loggers(step_context))
+    ceoutput.unwatch(ring, *_step_loggers(step_context))
     try:
         output = None
         if failure:

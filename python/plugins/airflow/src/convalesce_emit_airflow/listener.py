@@ -277,12 +277,12 @@ class _Base:
                 # From here until the task ends, the SQL it runs is noted.
                 watch_sql()
                 watch_output()
-            # Before anything that can fail: the ring comes off the task's
-            # loggers however the rest of this goes.
+            # Before anything that can fail: the task's records stop being
+            # held however the rest of this goes.
             output = take_output() if event in _ENDED else []
             shaped, excluded = shape(payload)
             if event == _FAILED:
-                excluded = excluded + ceoutput.add(shaped, output)
+                excluded = excluded + add_output(shaped, output)
             if event in _ENDED:
                 noted = cesqlcap.drain()
                 if noted:
@@ -350,9 +350,17 @@ _OWN_TABLES = re.compile(
     re.IGNORECASE,
 )
 _WATCH: Dict[str, Any] = {}
-# The ring on the running task's loggers, from its start to its end.
+# Where Airflow keeps its masker: 3.1 and later, 3.0, and 2.5 to 2.11. The
+# newest first, since 3.2 still answers at 3.0's place with a warning that
+# it will stop.
+_MASKER_MODULES = (
+    "airflow.sdk._shared.secrets_masker",
+    "airflow.sdk.execution_time.secrets_masker",
+    "airflow.utils.log.secrets_masker",
+)
+# The ring the running task's records are held in, from its start to its
+# end.
 _OUTPUT: Dict[str, Any] = {}
-_OUTPUT_LOGGERS = ("", "airflow.task")
 # Each statement a database hook ran, as the core keeps it, to the id of the
 # connection that hook was built from. Kept here because the core notes a
 # statement and knows nothing of Airflow's connections.
@@ -468,11 +476,10 @@ def watch_output() -> None:
 
     A task's hooks fire in the process that runs it, and that process
     routes everything the task says through `logging`: an operator's own
-    lines, and each line a `BashOperator`'s command prints. On Airflow 2
-    they reach the root logger, where the task's log file is written
-    from, some by way of `airflow.task` and some not; on Airflow 3 the
-    root is where the supervisor's stream is fed from. One ring on both
-    names holds a record once.
+    lines, each line a `BashOperator`'s command prints and, on Airflow 2,
+    what the task's code prints. Each record is seen as it is made; see
+    `convalesce_emit.output.watch`. From Airflow 3.1 an operator's lines
+    never become records, and are seen another way; see `_watch_events`.
 
     :return: nothing
     """
@@ -482,7 +489,7 @@ def watch_output() -> None:
             # A process that runs one task after another, as `dag.test()`
             # does.
             ring.clear()
-        _OUTPUT["ring"] = ceoutput.watch(*_OUTPUT_LOGGERS, ring=ring)
+        _OUTPUT["ring"] = ceoutput.watch(ring=ring)
         if _OUTPUT["ring"] is not None:
             _watch_events(True)
     except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -503,7 +510,7 @@ def take_output() -> List[str]:
     ring = _OUTPUT.pop("ring", None)
     if ring is None:
         return []
-    ceoutput.unwatch(ring, *_OUTPUT_LOGGERS)
+    ceoutput.unwatch(ring)
     _watch_events(False)
     try:
         held: List[str] = ring.lines()
@@ -515,6 +522,75 @@ def take_output() -> List[str]:
             type(exc).__name__,
         )
         return []
+
+
+def add_output(shaped: Dict[str, Any], lines: List[str]) -> List[Dict[str, str]]:
+    """
+    Put a failed task's last lines on its event.
+
+    Airflow knows credentials no pattern can: the password of each
+    connection the task opened, every Variable with a sensitive name,
+    whatever the task itself named with `mask_secret`. Its task log has
+    them masked wherever they appear, bare or not, so the lines pass
+    through the same masker before the core's rules for output.
+
+    :param shaped: the payload being sent, changed in place
+    :param lines: what `take_output` handed over
+    :return: what was masked in the lines or cut from them, by path and
+        reason
+    """
+    try:
+        masked = [_known_secrets_masked(line) for line in lines]
+        excluded = ceoutput.add(shaped, masked)
+        declared = any(item["reason"] == ceoutput.MASKED for item in excluded)
+        if masked != lines and ceoutput.FIELD in shaped and not declared:
+            excluded.insert(
+                0, {"path": ceoutput.FIELD, "reason": ceoutput.MASKED}
+            )
+        return excluded
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # The event is still worth sending without its output.
+        shaped.pop(ceoutput.FIELD, None)
+        _LOG.warning(
+            "convalesce: could not send the task's output: %s",
+            type(exc).__name__,
+        )
+        return []
+
+
+@functools.lru_cache(maxsize=1)
+def _airflow_redact() -> Optional[Callable[[Any], Any]]:
+    """
+    Airflow's own function for masking the credentials it knows.
+
+    :return: its `redact`, from wherever this Airflow keeps it; None
+        where Airflow is absent or keeps none
+    """
+    for module_name in _MASKER_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Moved in another Airflow release; the next may have it.
+            continue
+        redact_ = getattr(module, "redact", None)
+        if callable(redact_):
+            found: Callable[[Any], Any] = redact_
+            return found
+    return None
+
+
+def _known_secrets_masked(line: str) -> str:
+    """
+    One line with the credentials Airflow knows masked in it.
+
+    :param line: a line the task logged
+    :return: the line as Airflow's task log would show it
+    """
+    redact_ = _airflow_redact()
+    if redact_ is None:
+        return line
+    masked = redact_(line)
+    return masked if isinstance(masked, str) else line
 
 
 def _watch_events(on: bool) -> None:

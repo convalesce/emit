@@ -138,12 +138,15 @@ class Test_step_output1(unittest.TestCase):
         self.addCleanup(root.setLevel, root.level)
         root.setLevel(logging.INFO)
         self.handlers = list(root.handlers)
+        self.factory = logging.getLogRecordFactory()
+        self.addCleanup(logging.setLogRecordFactory, self.factory)
         self.context = _StepContext()
 
     def _assert_detached(self) -> None:
-        """Check nothing of ours is left on the step's loggers."""
+        """Check `logging` is left as the step's process had it."""
         self.assertEqual(logging.getLogger().handlers, self.handlers)
         self.assertEqual(self.context.log.handlers, [])
+        self.assertIs(logging.getLogRecordFactory(), self.factory)
 
     def test1(self) -> None:
         """
@@ -182,6 +185,29 @@ class Test_step_output1(unittest.TestCase):
         )
         self.assertNotIn("output_excluded", note)
         self._assert_detached()
+
+    def test10(self) -> None:
+        """
+        Test that a line written to one of Dagster's named loggers is held
+        in its place, and the copy the log manager makes of each line for
+        a job's own loggers is not held again.
+        """
+        configured = logging.Logger("dagster")
+
+        def body() -> None:
+            self.context.say("first")
+            meta = {"orig_message": "first", "dagster_event": None}
+            configured.info(
+                "orders - 1a2b - first", extra={"dagster_meta": meta}
+            )
+            logging.getLogger("dagster.builtin").warning("to a named logger")
+            self.context.say("third")
+
+        note = _noted(self.context, body, _failure(_error("ValueError: x")))
+        self.assertEqual(
+            note["output_tail"].split("\n"),
+            ["first", "to a named logger", "third", "ValueError: x"],
+        )
 
     def test2(self) -> None:
         """

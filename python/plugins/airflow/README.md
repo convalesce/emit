@@ -144,11 +144,16 @@ before it failed, including each line a `BashOperator`'s command printed.
 A task that succeeds sends none of it.
 
 At most 60 lines and 4096 bytes are sent, the end of the output being the
-part that is kept. A password in a URI, the value of a name such as
-`password`, `token` or `api_key`, a JSON Web Token and a PEM block are
-masked first, and a masked or shortened tail is declared in the event's
-`excluded`. On Airflow 3 a task's own `print()` is sent to the supervisor
-without passing through a logger, and is not part of the tail.
+part that is kept. Each line first passes through Airflow's own masker, so
+a connection's password, a sensitive Variable and anything named with
+`mask_secret` is masked as it is in the task's log. Then a password in a
+URI, the value of a name such as `password`, `token` or `api_key`, a JSON
+Web Token and a PEM block are masked. A masked or shortened tail is
+declared in the event's `excluded`.
+
+On Airflow 2 the tail includes what the task's code prints. On Airflow 3 a
+task's own `print()` is sent to the supervisor without passing through a
+logger, and is not part of the tail.
 
 Set `CONVALESCE_SEND_OUTPUT=false` on your workers to send none of it.
 

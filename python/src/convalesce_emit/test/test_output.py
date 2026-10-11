@@ -75,7 +75,7 @@ class Test_enabled1(unittest.TestCase):
             payload: dict = {}
             self.assertEqual(ceoutput.add(payload, ["it failed"]), [])
             self.assertEqual(payload, {})
-            self.assertIsNone(ceoutput.watch("convalesce.test.off"))
+            self.assertIsNone(ceoutput.watch())
 
 
 # #############################################################################
@@ -288,29 +288,112 @@ class Test_ring1(unittest.TestCase):
 
 class Test_watch1(unittest.TestCase):
     """
-    Test putting a ring on loggers and taking it off.
+    Test starting and stopping the holding of what a process logs.
     """
+
+    def setUp(self) -> None:
+        self.factory = logging.getLogRecordFactory()
+        self.addCleanup(logging.setLogRecordFactory, self.factory)
+        self.logger = logging.getLogger("jobs.revenue")
+        self.addCleanup(self.logger.setLevel, self.logger.level)
+        self.logger.setLevel(logging.INFO)
 
     def test1(self) -> None:
         """
-        Test that a ring is put on each logger once and taken off cleanly.
+        Test that every record made is held, and that stopping leaves
+        `logging` making records as it was.
         """
-        name = "convalesce.test.watch"
-        loose = logging.Logger("in no hierarchy")
-        before = list(logging.getLogger(name).handlers)
-        ring = ceoutput.watch(name, loggers=[loose])
+        ring = ceoutput.watch()
         assert ring is not None
-        self.assertIs(ceoutput.watch(name, ring=ring, loggers=[loose]), ring)
-        self.assertEqual(logging.getLogger(name).handlers.count(ring), 1)
-        self.assertEqual(loose.handlers.count(ring), 1)
-        logging.getLogger(name).error("seen")
-        loose.error("and this")
-        self.assertEqual(ring.lines(), ["seen", "and this"])
-        ceoutput.unwatch(ring, name, loggers=[loose])
-        self.assertEqual(logging.getLogger(name).handlers, before)
-        self.assertEqual(loose.handlers, [])
+        self.logger.info("seen %d", 1)
+        logging.getLogger("another.library").error("and this")
+        ceoutput.unwatch(ring)
+        self.logger.info("not seen")
+        self.assertEqual(ring.lines(), ["seen 1", "and this"])
+        self.assertIs(logging.getLogRecordFactory(), self.factory)
 
     def test2(self) -> None:
+        """
+        Test that no handler is put on the root logger, so a process that
+        has yet to configure its logging still can.
+        """
+        root = logging.getLogger()
+        before = list(root.handlers)
+        ring = ceoutput.watch()
+        self.assertEqual(root.handlers, before)
+        ceoutput.unwatch(ring)
+        self.assertEqual(root.handlers, before)
+
+    def test3(self) -> None:
+        """
+        Test that a logger handed over has the ring on it once, holds a
+        record once though it is seen twice, and is left as it was.
+        """
+        loose = logging.Logger("in no hierarchy")
+        ring = ceoutput.watch(loose)
+        assert ring is not None
+        self.assertIs(ceoutput.watch(loose, ring=ring), ring)
+        self.assertEqual(loose.handlers.count(ring), 1)
+        loose.error("once")
+        self.assertEqual(ring.lines(), ["once"])
+        ceoutput.unwatch(ring, loose)
+        self.assertEqual(loose.handlers, [])
+        self.assertIs(logging.getLogRecordFactory(), self.factory)
+
+    def test4(self) -> None:
+        """
+        Test that two rings are each shown every record, and the factory
+        stays until the last of them is done.
+        """
+        first = ceoutput.watch()
+        second = ceoutput.watch()
+        assert first is not None and second is not None
+        self.logger.info("both")
+        ceoutput.unwatch(first)
+        self.logger.info("one")
+        self.assertEqual(first.lines(), ["both"])
+        self.assertEqual(second.lines(), ["both", "one"])
+        ceoutput.unwatch(second)
+        self.assertIs(logging.getLogRecordFactory(), self.factory)
+
+    def test5(self) -> None:
+        """
+        Test that a factory somebody put in front afterwards is left in
+        place, and records are still made through it.
+        """
+        ring = ceoutput.watch()
+        ours = logging.getLogRecordFactory()
+
+        def theirs(*args: Any, **kwargs: Any) -> logging.LogRecord:
+            record = ours(*args, **kwargs)
+            record.theirs = True  # type: ignore[attr-defined]
+            return record
+
+        logging.setLogRecordFactory(theirs)
+        ceoutput.unwatch(ring)
+        self.assertIs(logging.getLogRecordFactory(), theirs)
+        record = logging.getLogRecordFactory()(
+            "x", logging.INFO, __file__, 1, "made", (), None
+        )
+        self.assertTrue(record.theirs)  # type: ignore[attr-defined]
+        assert ring is not None
+        self.assertEqual(ring.lines(), [])
+
+    def test6(self) -> None:
+        """
+        Test that a ring that breaks never raises into the code that
+        logged, and the record is still made.
+        """
+        ring = ceoutput.watch()
+        with umock.patch.object(
+            ceoutput, "text_of", side_effect=RuntimeError("password=hunter2")
+        ):
+            with self.assertLogs("jobs.revenue", "INFO") as logs:
+                self.logger.info("still logged")
+        self.assertEqual(logs.output, ["INFO:jobs.revenue:still logged"])
+        ceoutput.unwatch(ring)
+
+    def test7(self) -> None:
         """
         Test that a ring that could not be put in place is reported by
         the error's class and nothing is raised.
@@ -319,11 +402,11 @@ class Test_watch1(unittest.TestCase):
         broken.handlers = []
         broken.addHandler.side_effect = RuntimeError("password=hunter2")
         with self.assertLogs("convalesce_emit.output", "WARNING") as logs:
-            self.assertIsNone(ceoutput.watch(loggers=[broken]))
+            self.assertIsNone(ceoutput.watch(broken))
         self.assertIn("RuntimeError", logs.output[0])
         self.assertNotIn("hunter2", logs.output[0])
         broken.removeHandler.side_effect = RuntimeError("password=hunter2")
         with self.assertLogs("convalesce_emit.output", "WARNING") as logs:
-            ceoutput.unwatch(ceoutput.Ring(), loggers=[broken])
+            ceoutput.unwatch(ceoutput.Ring(), broken)
         self.assertNotIn("hunter2", logs.output[0])
-        ceoutput.unwatch(None, "convalesce.test.watch")
+        ceoutput.unwatch(None, broken)

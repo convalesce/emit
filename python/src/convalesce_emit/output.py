@@ -7,8 +7,9 @@ and nowhere on the exception. So a plugin keeps the last records a task, a
 step or a run logged while it ran, and when that unit fails sends the end of
 them as `output_tail`. A unit that succeeds sends none of it.
 
-Two halves. `Ring` is a logging handler that holds the last records it was
-handed and nothing else: no formatting, no I/O, a bounded `deque`. `tail`
+Two halves. `Ring` holds the last records it was shown and nothing else:
+no formatting, no I/O, a bounded `deque`. `watch` shows it every record
+the process makes, without putting a handler on the root logger. `tail`
 turns text into what is sent: credentials masked, then the end kept, at most
 `MAX_LINES` lines and `MAX_BYTES` bytes of UTF-8.
 
@@ -150,14 +151,14 @@ class Ring(logging.Handler):
         :return: nothing
         """
         try:
-            # One ring on a logger and on its parent is handed a record
-            # that propagates twice. What this package and its plugins log
-            # is about the reporting, not the unit reported on.
+            # A record is seen as it is made and again by any logger this
+            # ring is on. What this package and its plugins log is about
+            # the reporting, not the unit reported on.
             if record is self._last or record.name.startswith(_OWN):
                 return
-            self._last = record
             text = self.text(record)
             if text is not None:
+                self._last = record
                 self._records.append((self.scope(record), text))
         except Exception:  # pylint: disable=broad-exception-caught
             # Called from inside the tool's own logging call, which must
@@ -250,15 +251,21 @@ def clip(text: str, limit: int = MAX_RECORD_CHARS) -> str:
     return kept[line_break + 1 :] if line_break >= 0 else kept
 
 
-def watch(
-    *names: str, ring: Optional[Ring] = None, loggers: Iterable[Any] = ()
-) -> Optional[Ring]:
+def watch(*loggers: Any, ring: Optional[Ring] = None) -> Optional[Ring]:
     """
-    Start holding what the named loggers are handed.
+    Start holding what this process logs.
 
-    :param names: loggers by name; `""` is the root
-    :param ring: the ring to put on them; a new one when not given
-    :param loggers: loggers that are in no hierarchy to be found by name
+    Every record is seen as it is made, through the factory `logging`
+    makes records with, and no handler is put on the root logger. A
+    handler there would be the first: `logging.basicConfig` then does
+    nothing, and a warning that reached nobody is no longer printed. Both
+    change what a driver or a task says for itself, and a PySpark driver
+    run with one lost its own log lines to it.
+
+    :param loggers: loggers whose records are wanted as their handlers
+        see them, with what the tool added to each: a ring is put on
+        these, and it holds a record once whichever way it comes
+    :param ring: the ring to feed; a new one when not given
     :return: the ring, or None when output is not sent or it could not be
         put in place
     """
@@ -266,10 +273,10 @@ def watch(
         if not enabled():
             return None
         held = Ring() if ring is None else ring
-        found = [logging.getLogger(name) for name in names] + list(loggers)
-        for logger in found:
+        for logger in loggers:
             if held not in logger.handlers:
                 logger.addHandler(held)
+        _feed(held)
         return held
     except Exception as exc:  # pylint: disable=broad-exception-caught
         _LOG.warning(
@@ -278,27 +285,75 @@ def watch(
         return None
 
 
-def unwatch(
-    ring: Optional[Ring], *names: str, loggers: Iterable[Any] = ()
-) -> None:
+def unwatch(ring: Optional[Ring], *loggers: Any) -> None:
     """
-    Stop holding what the named loggers are handed.
+    Stop holding what this process logs.
 
     :param ring: what `watch` returned; None is a ring that was never there
-    :param names: the names `watch` was given
     :param loggers: the loggers `watch` was given
     :return: nothing
     """
     if ring is None:
         return
     try:
-        found = [logging.getLogger(name) for name in names] + list(loggers)
-        for logger in found:
+        _starve(ring)
+        for logger in loggers:
             logger.removeHandler(ring)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         _LOG.warning(
             "convalesce: could not stop watching output: %s", type(exc).__name__
         )
+
+
+# The rings fed each record this process makes, and the factory that was
+# making them before this module's went in front of it.
+_FED: List[Ring] = []
+_FACTORY: Dict[str, Any] = {}
+
+
+def _made(*args: Any, **kwargs: Any) -> logging.LogRecord:
+    """
+    Make a record as it was being made, and show it to each ring.
+
+    :param args: what `logging` hands the factory
+    :param kwargs: the same, by name
+    :return: the record, unchanged
+    """
+    record: logging.LogRecord = _FACTORY["previous"](*args, **kwargs)
+    for ring in tuple(_FED):
+        ring.emit(record)
+    return record
+
+
+def _feed(ring: Ring) -> None:
+    """
+    Show a ring every record made from here on.
+
+    :param ring: the ring
+    :return: nothing
+    """
+    if ring not in _FED:
+        _FED.append(ring)
+    current = logging.getLogRecordFactory()
+    if current is not _made:
+        _FACTORY["previous"] = current
+        logging.setLogRecordFactory(_made)
+
+
+def _starve(ring: Ring) -> None:
+    """
+    Stop showing a ring the records made, and step aside when no ring is
+    left.
+
+    :param ring: the ring
+    :return: nothing
+    """
+    if ring in _FED:
+        _FED.remove(ring)
+    # Only when nobody has put a factory of their own in front since: then
+    # this one stays where it is, showing records to no one.
+    if not _FED and logging.getLogRecordFactory() is _made:
+        logging.setLogRecordFactory(_FACTORY.pop("previous"))
 
 
 # #############################################################################

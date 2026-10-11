@@ -138,15 +138,15 @@ class Test_output_tail1(unittest.TestCase):
             self.addCleanup(logger.setLevel, level)
         logging.getLogger().setLevel(logging.INFO)
         self.handlers = list(logging.getLogger().handlers)
+        self.factory = logging.getLogRecordFactory()
+        self.addCleanup(logging.setLogRecordFactory, self.factory)
         self.addCleanup(cealist._OUTPUT.clear)
 
     def _assert_detached(self) -> None:
-        """Check nothing of ours is left on the task's loggers."""
+        """Check `logging` is left as the task's process had it."""
         self.assertEqual(cealist._OUTPUT, {})
         self.assertEqual(logging.getLogger().handlers, self.handlers)
-        for name in cealist._OUTPUT_LOGGERS:
-            for handler in logging.getLogger(name).handlers:
-                self.assertNotIsInstance(handler, ceoutput.Ring)
+        self.assertIs(logging.getLogRecordFactory(), self.factory)
 
     def test1(self) -> None:
         """
@@ -165,7 +165,7 @@ class Test_output_tail1(unittest.TestCase):
 
     def test2(self) -> None:
         """
-        Test that a success carries none of it, and the ring comes off.
+        Test that a success carries none of it, and nothing is held on.
         """
         sent = _run(_SUCCESS)
         self.assertNotIn("output_tail", sent["payload"])
@@ -335,6 +335,94 @@ class Test_output_errors1(unittest.TestCase):
         self.assertEqual(sent["event"], _FAILED)
         self.assertNotIn("output_tail", sent["payload"])
         self.assertNotIn("hunter2", "".join(logs.output))
+
+
+# #############################################################################
+# Test_output_known_secrets1
+# #############################################################################
+
+
+class Test_output_known_secrets1(unittest.TestCase):
+    """
+    Test the credentials only Airflow knows, which no pattern can find.
+    """
+
+    def setUp(self) -> None:
+        logger = logging.getLogger()
+        self.addCleanup(logger.setLevel, logger.level)
+        logger.setLevel(logging.INFO)
+        self.addCleanup(cealist._OUTPUT.clear)
+        self.addCleanup(cealist._airflow_redact.cache_clear)
+        cealist._airflow_redact.cache_clear()
+
+    def _masker(self, redact: Any) -> Any:
+        """Stand in for the module Airflow keeps its masker in."""
+        module = types.ModuleType(cealist._MASKER_MODULES[-1])
+        module.redact = redact  # type: ignore[attr-defined]
+        return unittest.mock.patch.dict(
+            sys.modules, {cealist._MASKER_MODULES[-1]: module}
+        )
+
+    def test1(self) -> None:
+        """
+        Test that a connection's password logged bare is masked as
+        Airflow's own task log masks it, and that this is declared.
+        """
+
+        def task() -> None:
+            logging.getLogger(_HOOK_LOGGER).info("psql -W wh-pass-91 -c x")
+
+        with self._masker(lambda line: line.replace("wh-pass-91", "***")):
+            sent = _run(_FAILED, task)
+        self.assertEqual(sent["payload"]["output_tail"], "psql -W *** -c x")
+        self.assertNotIn("wh-pass-91", json.dumps(sent, default=str))
+        self.assertEqual(
+            _output_paths(sent),
+            [{"path": "output_tail", "reason": "credential masked"}],
+        )
+
+    def test2(self) -> None:
+        """
+        Test that a line Airflow's masker and the core's rules both
+        change is declared once.
+        """
+
+        def task() -> None:
+            logging.getLogger(_HOOK_LOGGER).info("wh-pass-91 token=abc")
+
+        with self._masker(lambda line: line.replace("wh-pass-91", "***")):
+            sent = _run(_FAILED, task)
+        self.assertEqual(sent["payload"]["output_tail"], "*** token=***")
+        self.assertEqual(len(_output_paths(sent)), 1)
+
+    def test3(self) -> None:
+        """
+        Test that where Airflow's masker breaks, the failure is sent
+        without the lines it could not vouch for.
+        """
+
+        def broken(line: str) -> str:
+            raise RuntimeError(line)
+
+        with (
+            self._masker(broken),
+            self.assertLogs(cealist._LOG, "WARNING") as logs,
+        ):
+            sent = _run(_FAILED)
+        self.assertEqual(sent["event"], _FAILED)
+        self.assertNotIn("output_tail", sent["payload"])
+        self.assertIn("RuntimeError", logs.output[0])
+        self.assertNotIn("dbt", "".join(logs.output))
+
+    def test4(self) -> None:
+        """
+        Test that without Airflow's masker the core's rules still apply.
+        """
+        self.assertIsNone(cealist._airflow_redact())
+        sent = _run(
+            _FAILED, lambda: logging.getLogger(_HOOK_LOGGER).info("pwd=abc")
+        )
+        self.assertEqual(sent["payload"]["output_tail"], "pwd=***")
 
 
 # #############################################################################
