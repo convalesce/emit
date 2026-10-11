@@ -53,6 +53,11 @@ for anything that reads as a credential, as a keyed hash. See
 With `CONVALESCE_SEND_ARGUMENTS` off, an operator's templated fields are
 withheld along with its arguments; see `_without_templated`.
 
+A task's failure also carries `output_tail`, the last lines the task logged
+before it failed, unless `CONVALESCE_SEND_OUTPUT` is off: what a command
+printed is where the reason it failed is, and the exception says only that
+it did. See `watch_output` and `convalesce_emit.output`.
+
 A DAG can be left unreported by name: `CONVALESCE_AIRFLOW_DAG_ALLOW` and
 `CONVALESCE_AIRFLOW_DAG_DENY`, see `dag_reported`. Nothing about such a DAG
 is sent, by this listener or by the OpenLineage transport.
@@ -82,6 +87,7 @@ import importlib
 import inspect
 import logging
 import re
+import sys
 from typing import (
     Any,
     Callable,
@@ -96,6 +102,7 @@ from typing import (
 )
 
 import convalesce_emit as cemit
+import convalesce_emit.output as ceoutput
 import convalesce_emit.settings as cesettin
 import convalesce_emit.source as cesource
 import convalesce_emit.sqlcapture as cesqlcap
@@ -269,7 +276,13 @@ class _Base:
                 cealruns.watch_variables()
                 # From here until the task ends, the SQL it runs is noted.
                 watch_sql()
+                watch_output()
+            # Before anything that can fail: the task's records stop being
+            # held however the rest of this goes.
+            output = take_output() if event in _ENDED else []
             shaped, excluded = shape(payload)
+            if event == _FAILED:
+                excluded = excluded + add_output(shaped, output)
             if event in _ENDED:
                 noted = cesqlcap.drain()
                 if noted:
@@ -312,7 +325,8 @@ class _Base:
 
 
 _RUNNING = "on_task_instance_running"
-_ENDED = frozenset({"on_task_instance_success", "on_task_instance_failed"})
+_FAILED = "on_task_instance_failed"
+_ENDED = frozenset({"on_task_instance_success", _FAILED})
 _FALSY = frozenset({"0", "false", "no", "off"})
 # What a task was called with. Sent unless `CONVALESCE_SEND_ARGUMENTS` is off.
 _ARGUMENT_PATHS = frozenset(
@@ -336,6 +350,17 @@ _OWN_TABLES = re.compile(
     re.IGNORECASE,
 )
 _WATCH: Dict[str, Any] = {}
+# Where Airflow keeps its masker: 3.1 and later, 3.0, and 2.5 to 2.11. The
+# newest first, since 3.2 still answers at 3.0's place with a warning that
+# it will stop.
+_MASKER_MODULES = (
+    "airflow.sdk._shared.secrets_masker",
+    "airflow.sdk.execution_time.secrets_masker",
+    "airflow.utils.log.secrets_masker",
+)
+# The ring the running task's records are held in, from its start to its
+# end.
+_OUTPUT: Dict[str, Any] = {}
 # Each statement a database hook ran, as the core keeps it, to the id of the
 # connection that hook was built from. Kept here because the core notes a
 # statement and knows nothing of Airflow's connections.
@@ -443,6 +468,183 @@ def watch_sql() -> None:
         watch_hooks()
     _HOOK_CONNECTIONS.clear()
     cesqlcap.start()
+
+
+def watch_output() -> None:
+    """
+    Start holding the last records the task logs, for its failure.
+
+    A task's hooks fire in the process that runs it, and that process
+    routes everything the task says through `logging`: an operator's own
+    lines, each line a `BashOperator`'s command prints and, on Airflow 2,
+    what the task's code prints. Each record is seen as it is made; see
+    `convalesce_emit.output.watch`. From Airflow 3.1 an operator's lines
+    never become records, and are seen another way; see `_watch_events`.
+
+    :return: nothing
+    """
+    try:
+        ring = _OUTPUT.get("ring")
+        if ring is not None:
+            # A process that runs one task after another, as `dag.test()`
+            # does.
+            ring.clear()
+        _OUTPUT["ring"] = ceoutput.watch(ring=ring)
+        if _OUTPUT["ring"] is not None:
+            _watch_events(True)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # The class and not the message, which could quote the output.
+        _LOG.warning(
+            "convalesce: could not watch the task's output: %s",
+            type(exc).__name__,
+        )
+
+
+def take_output() -> List[str]:
+    """
+    Stop holding the task's records, and hand over what was held.
+
+    :return: each record's text, oldest first; none where nothing was
+        being held, as in a scheduler failing a task it found dead
+    """
+    ring = _OUTPUT.pop("ring", None)
+    if ring is None:
+        return []
+    ceoutput.unwatch(ring)
+    _watch_events(False)
+    try:
+        held: List[str] = ring.lines()
+        return held
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # The event is still worth sending without its output.
+        _LOG.warning(
+            "convalesce: could not read the task's output: %s",
+            type(exc).__name__,
+        )
+        return []
+
+
+def add_output(shaped: Dict[str, Any], lines: List[str]) -> List[Dict[str, str]]:
+    """
+    Put a failed task's last lines on its event.
+
+    Airflow knows credentials no pattern can: the password of each
+    connection the task opened, every Variable with a sensitive name,
+    whatever the task itself named with `mask_secret`. Its task log has
+    them masked wherever they appear, bare or not, so the lines pass
+    through the same masker before the core's rules for output.
+
+    :param shaped: the payload being sent, changed in place
+    :param lines: what `take_output` handed over
+    :return: what was masked in the lines or cut from them, by path and
+        reason
+    """
+    try:
+        masked = [_known_secrets_masked(line) for line in lines]
+        excluded = ceoutput.add(shaped, masked)
+        declared = any(item["reason"] == ceoutput.MASKED for item in excluded)
+        if masked != lines and ceoutput.FIELD in shaped and not declared:
+            excluded.insert(
+                0, {"path": ceoutput.FIELD, "reason": ceoutput.MASKED}
+            )
+        return excluded
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # The event is still worth sending without its output.
+        shaped.pop(ceoutput.FIELD, None)
+        _LOG.warning(
+            "convalesce: could not send the task's output: %s",
+            type(exc).__name__,
+        )
+        return []
+
+
+@functools.lru_cache(maxsize=1)
+def _airflow_redact() -> Optional[Callable[[Any], Any]]:
+    """
+    Airflow's own function for masking the credentials it knows.
+
+    :return: its `redact`, from wherever this Airflow keeps it; None
+        where Airflow is absent or keeps none
+    """
+    for module_name in _MASKER_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Moved in another Airflow release; the next may have it.
+            continue
+        redact_ = getattr(module, "redact", None)
+        if callable(redact_):
+            found: Callable[[Any], Any] = redact_
+            return found
+    return None
+
+
+def _known_secrets_masked(line: str) -> str:
+    """
+    One line with the credentials Airflow knows masked in it.
+
+    :param line: a line the task logged
+    :return: the line as Airflow's task log would show it
+    """
+    redact_ = _airflow_redact()
+    if redact_ is None:
+        return line
+    masked = redact_(line)
+    return masked if isinstance(masked, str) else line
+
+
+def _watch_events(on: bool) -> None:
+    """
+    Hold what the task says through `structlog`, or stop.
+
+    From Airflow 3.1 an operator's logger is a `structlog` one, and what
+    it is handed never becomes a `logging` record: a ring on the root saw
+    a failed `BashOperator` say nothing at all. Every such logger runs the
+    one list of processors `structlog` is configured with, so the ring is
+    fed from a processor put into that list, just before the one that
+    renders. There an event has its arguments in it and has passed
+    Airflow's own masking.
+
+    Read from the modules already loaded, never imported: where
+    `structlog` is not loaded, nothing logs through it.
+
+    :param on: whether to start, or to stop
+    :return: nothing
+    """
+    try:
+        structlog = sys.modules.get("structlog")
+        if structlog is None or not structlog.is_configured():
+            return
+        processors = structlog.get_config().get("processors")
+        if not isinstance(processors, list):
+            return
+        if _hold_event in processors:
+            processors.remove(_hold_event)
+        if on and processors:
+            processors.insert(len(processors) - 1, _hold_event)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _LOG.warning(
+            "convalesce: could not watch the task's events: %s",
+            type(exc).__name__,
+        )
+
+
+def _hold_event(_logger: Any, _method: str, event: Any) -> Any:
+    """
+    A `structlog` processor that keeps an event's text and changes nothing.
+
+    :param event: the event on its way to being rendered
+    :return: the same event
+    """
+    try:
+        ring = _OUTPUT.get("ring")
+        text = event.get("event") if isinstance(event, Mapping) else None
+        if ring is not None and isinstance(text, str):
+            ring.hold(text)
+    except Exception:  # pylint: disable=broad-exception-caught
+        # Inside the task's own logging call, which must return.
+        pass
+    return event
 
 
 def watch_hooks() -> None:

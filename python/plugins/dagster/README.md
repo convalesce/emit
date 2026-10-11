@@ -178,6 +178,37 @@ Each step's entry then holds:
 }
 ```
 
+## Output of a failed step
+
+A step that fails also says what it logged last. Its entry in `steps`
+carries `output_tail`: the last lines the step logged through
+`context.log`, `get_dagster_logger()` or a library's own logger, as they
+were written, followed by the error it failed with, each cause's message
+under the three innermost frames of its stack. A step that succeeds sends
+none of it, and neither does one that failed on one try and succeeded on a
+later one.
+
+At most 60 lines and 4096 bytes are sent, the end of the output being the
+part that is kept. A password in a URI, the value of a name such as
+`password`, `token` or `api_key`, a JSON Web Token and a PEM block are
+masked first, and a masked or shortened tail is declared in the event's
+`excluded`. What a step writes to stdout and stderr is Dagster's compute
+log, and is not part of the tail.
+
+Like the rest of a step's entry, the tail is noted in the step's process
+and written to the run's event log, where the sensor reads it.
+
+Set `CONVALESCE_SEND_OUTPUT=false` where your steps run to note none of it.
+
+The entry then holds:
+
+```json
+{
+  "step_key": "load_orders",
+  "output_tail": "Running with dbt=1.8.7\ninvalid identifier 'SALES_AMOUNT'\nValueError: dbt build failed"
+}
+```
+
 ## Supported
 
 Dagster 1.7 and later, on Python 3.9 and later. Verified on real installs:

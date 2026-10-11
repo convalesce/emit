@@ -1256,6 +1256,155 @@ class Test_settings1(_HookTestCase):
 
 
 # #############################################################################
+# Test_output
+# #############################################################################
+
+
+_PEM = (
+    "-----BEGIN PRIVATE KEY-----\n"
+    "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n"
+    "-----END PRIVATE KEY-----"
+)
+
+
+class Test_output1(_HookTestCase):
+    """The last lines the driver logged, on its failure and nowhere else."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        root = logging.getLogger()
+        self.addCleanup(root.setLevel, root.level)
+        root.setLevel(logging.INFO)
+        self.handlers = list(root.handlers)
+        self.log = logging.getLogger("jobs.revenue")
+
+    def events(
+        self, environ: Optional[Dict[str, str]] = None, fail: bool = True
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Run a driver that logs and, perhaps, fails, and let it exit.
+
+        :param environ: the whole environment of the driver's process
+        :param fail: whether the driver ends in an uncaught exception
+        :return: what was sent, by event
+        """
+        with mock.patch.dict(os.environ, environ or {}, clear=True):
+            self.install()
+            self.log.info("reading orders")
+            self.log.error("Table or view not found: sales_amount")
+            if fail:
+                self.fail_main(ValueError("relation does not exist"))
+            hook = cepysdri._INSTALLED  # pylint: disable=protected-access
+            assert hook is not None
+            hook.at_exit()
+        return {each["event"]: each for each in self.recorder.sent}
+
+    def test_a_failure_carries_what_the_driver_logged(self) -> None:
+        """A failure carries what the driver logged."""
+        sent = self.events()["driver_failure"]
+        self.assertEqual(
+            sent["payload"]["output_tail"],
+            "reading orders\nTable or view not found: sales_amount",
+        )
+        self.assertEqual(sent["excluded"], [])
+
+    def test_the_script_observation_carries_none(self) -> None:
+        """The script observation carries none."""
+        self.assertNotIn(
+            "output_tail", self.events()["driver_script"]["payload"]
+        )
+
+    def test_a_driver_that_does_not_fail_sends_none(self) -> None:
+        """A driver that does not fail sends none."""
+        sent = self.events(fail=False)
+        self.assertEqual(sorted(sent), ["driver_script"])
+        self.assertNotIn("output_tail", sent["driver_script"]["payload"])
+
+    def test_the_end_is_kept_within_both_limits(self) -> None:
+        """The end is kept within both limits."""
+        self.install()
+        for i in range(500):
+            self.log.info("line %04d %s", i, "x" * 150)
+        self.fail_main(ValueError("x"))
+        sent = self.recorder.sent[0]
+        tail = sent["payload"]["output_tail"]
+        lines = tail.split("\n")
+        self.assertLessEqual(len(lines), 60)
+        self.assertLessEqual(len(tail.encode("utf-8")), 4096)
+        self.assertTrue(lines[-1].startswith("line 0499 "))
+        self.assertEqual(
+            [item for item in sent["excluded"] if item["path"] == "output_tail"],
+            [
+                {"path": "output_tail", "reason": "limited to 60 lines"},
+                {"path": "output_tail", "reason": "limited to 4096 bytes"},
+            ],
+        )
+
+    def test_no_seeded_credential_is_sent(self) -> None:
+        """No seeded credential is sent."""
+        self.install()
+        self.log.info("export DB_PASSWORD=hunter2")
+        self.log.info("jdbc at postgresql://svc:hunter2@db.internal/app")
+        self.log.info(_PEM)
+        self.fail_main(ValueError("x"))
+        sent = self.recorder.sent[0]
+        wire = json.dumps(sent, default=str)
+        self.assertNotIn("hunter2", wire)
+        self.assertNotIn("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", wire)
+        self.assertIn("svc:***@db.internal", sent["payload"]["output_tail"])
+        self.assertIn(
+            {"path": "output_tail", "reason": "credential masked"},
+            sent["excluded"],
+        )
+
+    def test_switched_off_nothing_is_held_or_sent(self) -> None:
+        """Switched off, nothing is held or sent."""
+        for name in (
+            "CONVALESCE_SEND_OUTPUT",
+            "CUSTOMER_CONVALESCE_SEND_OUTPUT",
+        ):
+            self.recorder.sent.clear()
+            sent = self.events({name: "false"})
+            self.assertEqual(logging.getLogger().handlers, self.handlers)
+            self.assertNotIn("output_tail", sent["driver_failure"]["payload"])
+            cepysdri.uninstall()
+
+    def test_logging_is_left_for_the_driver_to_configure(self) -> None:
+        """Logging is left for the driver to configure."""
+        factory = logging.getLogRecordFactory()
+        self.install()
+        self.assertEqual(logging.getLogger().handlers, self.handlers)
+        cepysdri.uninstall()
+        self.assertIs(logging.getLogRecordFactory(), factory)
+
+    def test_a_ring_that_breaks_never_reaches_the_driver(self) -> None:
+        """A ring that breaks never reaches the driver."""
+        self.install()
+        with mock.patch.object(
+            cepysdri.ceoutput, "clip", side_effect=RuntimeError("boom")
+        ):
+            self.log.error("lost")
+        self.fail_main(ValueError("x"))
+        sent = self.recorder.sent[0]
+        self.assertEqual(sent["event"], "driver_failure")
+        self.assertNotIn("output_tail", sent["payload"])
+
+    def test_output_that_cannot_be_read_still_sends_the_failure(self) -> None:
+        """Output that cannot be read still sends the failure."""
+        self.install()
+        self.log.error("held")
+        with mock.patch.object(
+            cepysdri.ceoutput.Ring,
+            "lines",
+            side_effect=RuntimeError("password=hunter2"),
+        ):
+            self.fail_main(ValueError("x"))
+        sent = self.recorder.sent[0]
+        self.assertEqual(sent["event"], "driver_failure")
+        self.assertNotIn("output_tail", sent["payload"])
+
+
+# #############################################################################
 # Test_never_raises
 # #############################################################################
 

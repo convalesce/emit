@@ -39,7 +39,7 @@ job:
   sql: decoded
   sourceCode: decoded
   sourceCodeLocation: decoded
-  jobType: "ignored: application versus action is read from the job's name, which says the same"
+  jobType: decoded
   ownership: "ignored: owners by name, which name no user in the graph"
   documentation: "ignored: a producer's description of the job; none of the Spark or Airflow producers set it"
   tags: "ignored: free-form labels no aspect maps yet"

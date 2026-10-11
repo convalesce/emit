@@ -181,6 +181,27 @@ what it is.
 The field is added after Spark's redaction has run on the event, and its hashes are the same ones
 the Python client makes for the same key, name and value.
 
+## Output of a failed job
+
+On by default. A job that fails ends with `output_tail` on its `SparkListenerJobEnd`: the error
+its last failed task gave, the reason its last failed stage gave and the reason the job itself
+gave, the job's own last. A reason that a later one quotes whole is said once, and of each stack
+only the three frames nearest its error are kept. A job that succeeds carries none of it.
+
+```json
+"output_tail": "Job aborted due to stage failure: Task 0 in stage 1.0 failed 1 times, most recent failure: Lost task 0.0 in stage 1.0 (TID 1): java.lang.IllegalStateException: bad row 17\n\tat jobs.Revenue.parse(Revenue.java:41)\nDriver stacktrace:"
+```
+
+- At most 60 lines and 4096 bytes are sent, the end of the text being the part that is kept, and
+  `excluded` says `{"path": "output_tail", "reason": "limited to 60 lines"}` when there was more.
+- A password in a URI, the value of a name such as `password`, `token` or `api_key`, a JSON Web
+  Token and a PEM block are masked first, and `excluded` says
+  `{"path": "output_tail", "reason": "credential masked"}`.
+- `CONVALESCE_SEND_OUTPUT=false` on the driver sends none of it.
+
+The field is added after Spark's redaction has run on the event, and its masking and its limits
+are the same ones the Python client applies to the same text.
+
 ## Why it is small
 
 Spark already knows how to render its own events -- `JsonProtocol` is what writes the event log --

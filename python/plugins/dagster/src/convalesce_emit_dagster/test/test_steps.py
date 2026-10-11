@@ -488,6 +488,7 @@ class Test_install1(unittest.TestCase):
             "CONVALESCE_SQL_CAPTURE": "false",
             "CONVALESCE_SEND_ARGUMENTS": "false",
             "CONVALESCE_SEND_SOURCE": "false",
+            "CONVALESCE_SEND_OUTPUT": "false",
         }
         with unittest.mock.patch.dict(sys.modules, {_SEAM: seam}):
             with unittest.mock.patch.dict(os.environ, off):

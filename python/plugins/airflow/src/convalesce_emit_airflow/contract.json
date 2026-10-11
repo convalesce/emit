@@ -3631,6 +3631,7 @@
       "error_detail.message",
       "error_detail.traceback",
       "error_detail.type",
+      "output_tail",
       "previous_state",
       "settings",
       "settings.items",

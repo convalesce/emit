@@ -3,6 +3,7 @@ package io.convalesce.emit.spark;
 import io.convalesce.emit.Config;
 import io.convalesce.emit.Emitter;
 import io.convalesce.emit.Exclusion;
+import io.convalesce.emit.Output;
 import io.convalesce.emit.Settings;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -78,6 +79,11 @@ import org.apache.spark.scheduler.SparkListenerUnschedulableTaskSetRemoved;
  * the driver's environment variables under {@code settings}, a secret among them only as a keyed
  * hash; see {@link Settings}. It is the one field here that Spark did not write.
  *
+ * <p><b>Output.</b> A job that fails ends with {@code output_tail}: the error its last failed task
+ * and stage gave and the reason the job itself gave, each stack cut to the frames nearest its
+ * error, credentials masked, and the end kept; see {@link Output} and {@link #failureText}. On
+ * unless {@code CONVALESCE_SEND_OUTPUT} is false, and a job that succeeds carries none.
+ *
  * <p><b>Lineage.</b> None of Spark's events carries the logical plan, so exact tables and columns
  * come from OpenLineage-Spark, which the {@code _2.12} and {@code _2.13} packages bring with them.
  * Where the job has not set OpenLineage up itself, this starts it and passes it every event; see
@@ -106,6 +112,9 @@ public class ConvalesceSparkListener extends SparkListener {
   // The driver's environment: where this library's settings are read, and what is sent as the
   // run's settings when they are asked for.
   private final Map<String, String> env;
+  // What the last task and the last stage to fail said, kept for the tail of the job they fail.
+  private volatile String taskError;
+  private volatile String stageError;
 
   /** Built by Spark when no constructor takes a SparkConf. */
   public ConvalesceSparkListener() {
@@ -201,7 +210,11 @@ public class ConvalesceSparkListener extends SparkListener {
   public void onStageCompleted(SparkListenerStageCompleted event) {
     // Stages are off by default, but a failed one carries the reason the job died; that is never
     // left behind.
-    forward(event, failed(event));
+    boolean failed = failed(event);
+    if (failed) {
+      stageError = reasonOf(event);
+    }
+    forward(event, failed);
     if (lineage != null) {
       carry(() -> lineage.onStageCompleted(event));
     }
@@ -209,7 +222,11 @@ public class ConvalesceSparkListener extends SparkListener {
 
   @Override
   public void onTaskEnd(SparkListenerTaskEnd event) {
-    forward(event, failed(event));
+    boolean failed = failed(event);
+    if (failed) {
+      taskError = reasonOf(event);
+    }
+    forward(event, failed);
     if (lineage != null) {
       carry(() -> lineage.onTaskEnd(event));
     }
@@ -449,6 +466,16 @@ public class ConvalesceSparkListener extends SparkListener {
         // secrets hashed, by a rule a job's `spark.redaction.regex` knows nothing of.
         json = withSettings(json, env, masked);
       }
+      if (event instanceof SparkListenerJobEnd) {
+        // After the redaction for the same reason: the tail is masked as it is cut, by rules made
+        // for output and not for configuration.
+        String failure = reasonOf((SparkListenerJobEnd) event);
+        if (failure != null) {
+          json = withOutput(json, env, failureText(taskError, stageError, failure), masked);
+        }
+        taskError = null;
+        stageError = null;
+      }
       emitter.emit(TOOL, name, json, sparkVersion, masked);
     } catch (Throwable t) {
       // A job must not fail because we could not report on it.
@@ -476,6 +503,116 @@ public class ConvalesceSparkListener extends SparkListener {
             env);
     excluded.addAll(found.excluded());
     return SparkEventJson.withField(json, Settings.FIELD, found.json());
+  }
+
+  /**
+   * Adds the last lines of a failure to the event of the job that failed.
+   *
+   * @param json the job-end event, redacted
+   * @param env the driver's environment, where the switch is read
+   * @param failure what the job, its stage and its task failed with, as {@link #failureText} wrote
+   *     it
+   * @param excluded where what was masked in the lines or cut from them is added, for the
+   *     observation
+   * @return the event with an {@code output_tail} field, or as it was when there is nothing to send
+   */
+  static String withOutput(
+      String json, Map<String, String> env, String failure, List<Exclusion> excluded) {
+    Output.Tail tail = Output.tail(failure, env);
+    excluded.addAll(tail.excluded());
+    return SparkEventJson.withField(json, Output.FIELD, tail.json());
+  }
+
+  /**
+   * What a failed job's task, stage and job each said, as one text that ends with the job's own.
+   *
+   * <p>Spark nests them: a stage's reason quotes its task's error, and the job's exception quotes
+   * the stage's. One that a later one quotes whole is left out. Each is a line of error above a
+   * stack of fifty frames, so of every run of frames only the first few are kept, the ones nearest
+   * the line that says what went wrong.
+   *
+   * @param taskError the last failed task's error, or null
+   * @param stageError the last failed stage's reason, or null
+   * @param jobError the job's own reason
+   * @return the text {@link Output#tail} is given
+   */
+  static String failureText(String taskError, String stageError, String jobError) {
+    String[] parts = {taskError, stageError, jobError};
+    StringBuilder out = new StringBuilder();
+    for (int i = 0; i < parts.length; i++) {
+      if (parts[i] == null || parts[i].trim().isEmpty()) {
+        continue;
+      }
+      boolean quoted = false;
+      for (int j = i + 1; j < parts.length; j++) {
+        quoted = quoted || (parts[j] != null && parts[j].contains(parts[i].trim()));
+      }
+      if (quoted) {
+        continue;
+      }
+      if (out.length() > 0) {
+        out.append('\n');
+      }
+      out.append(nearestFrames(parts[i]));
+    }
+    return out.toString();
+  }
+
+  /** How many frames of a stack are kept under the line they follow. */
+  static final int FRAMES = 3;
+
+  private static String nearestFrames(String trace) {
+    StringBuilder out = new StringBuilder();
+    int frames = 0;
+    for (String line : trace.split("\n")) {
+      String text = line.trim();
+      boolean frame = text.startsWith("at ") || (text.startsWith("... ") && text.endsWith(" more"));
+      frames = frame ? frames + 1 : 0;
+      if (frames > FRAMES || text.isEmpty()) {
+        continue;
+      }
+      if (out.length() > 0) {
+        out.append('\n');
+      }
+      out.append(line);
+    }
+    return out.toString();
+  }
+
+  /** The reason a failed stage gave; null when it gave none that can be read. */
+  static String reasonOf(SparkListenerStageCompleted event) {
+    try {
+      return event.stageInfo().failureReason().get();
+    } catch (Throwable t) {
+      return null;
+    }
+  }
+
+  /** The error a failed task gave; null when it gave none that can be read. */
+  static String reasonOf(SparkListenerTaskEnd event) {
+    try {
+      Object reason = event.reason();
+      return reason instanceof org.apache.spark.TaskFailedReason
+          ? ((org.apache.spark.TaskFailedReason) reason).toErrorString()
+          : null;
+    } catch (Throwable t) {
+      return null;
+    }
+  }
+
+  /** The reason a job failed; null for a job that did not, and for one that gave none. */
+  static String reasonOf(SparkListenerJobEnd event) {
+    try {
+      Object result = event.jobResult();
+      if (!(result instanceof org.apache.spark.scheduler.JobFailed)) {
+        return null;
+      }
+      Exception exception = ((org.apache.spark.scheduler.JobFailed) result).exception();
+      String message = exception == null ? null : exception.getMessage();
+      return message == null && exception != null ? exception.toString() : message;
+    } catch (Throwable t) {
+      return null;
+    }
   }
 
   /**

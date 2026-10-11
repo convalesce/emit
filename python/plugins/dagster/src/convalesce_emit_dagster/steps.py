@@ -10,7 +10,9 @@ the step, which under the default executor is not even the run's own.
 So this module works in two places. In a step's process it brackets the
 step, notes the statements `convalesce_emit.sqlcapture` saw, the step's
 resolved configuration and, where asked for, the settings its process had,
-and writes them to the run's event log as one engine event. In the sensor
+and writes them to the run's event log as one engine event. A step that
+fails also notes the last lines it logged and the error it failed with,
+as `output_tail`; see `convalesce_emit.output`. In the sensor
 it reads those events back, reads each executed step's source from the
 repository, and hands the sensor one entry per step.
 
@@ -29,10 +31,20 @@ import importlib
 import json
 import logging
 import sys
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+)
 
 import convalesce_emit as cemit
 import convalesce_emit.config as ceconfig
+import convalesce_emit.output as ceoutput
 import convalesce_emit.settings as cesettin
 import convalesce_emit.source as cesource
 import convalesce_emit.sqlcapture as cesqlcap
@@ -90,10 +102,31 @@ _MAX_FRAMES = 200
 # reason. The sensor moves them to the event's `excluded`; they are in the
 # note because only the step's process knows them.
 SETTINGS_EXCLUDED = "settings_excluded"
+# The same for what was masked in, or cut from, a failed step's output.
+OUTPUT_EXCLUDED = "output_excluded"
+# The event a step that failed yields, and how much of each error in its
+# chain is put after the step's own lines: where it was raised, not the
+# frames of Dagster's that led there. The whole stack crosses with the
+# event itself, in the run's event log.
+_STEP_FAILURE = "STEP_FAILURE"
+_STACK_FRAMES = 3
+_MAX_CAUSES = 5
+# What a step's stats call a step that failed, and the parts of a note
+# that are sent for no other.
+_FAILURE = "FAILURE"
+_OF_A_FAILURE = frozenset({ceoutput.FIELD, OUTPUT_EXCLUDED})
 # The sensor has an emitter and its key; a step's process has neither, only
 # the variable an emitter would read.
 _INGEST_KEY_ENV = "CONVALESCE_INGEST_KEY"
 
+# How far up from the ring the `makeRecord` that called the factory is
+# looked for: it is four frames up, and a subclass's own adds one.
+_MAKER_FRAMES = 8
+# Where Dagster's log manager puts what it knows of a record it hands on.
+_RECORD_META = "dagster_meta"
+# Dagster 1.7 reports each step's start and end to its own telemetry
+# through a logger that reaches the root: a line of JSON about Dagster.
+_TELEMETRY = "dagster_telemetry_logger"
 # Module state, not a constant: the bracket is process-wide by nature.
 _installed = False  # pylint: disable=invalid-name
 
@@ -105,6 +138,78 @@ def arguments_enabled() -> bool:
     :return: False only when the setting says so
     """
     return (cedagenv.read(_ARGUMENTS_ENV) or "").strip().lower() not in _FALSY
+
+
+# #############################################################################
+# _StepRing
+# #############################################################################
+
+
+class _StepRing(ceoutput.Ring):
+    """
+    A ring that holds what a step's code logged, as its author wrote it.
+
+    Dagster's log manager hands on two kinds of record. One is a line the
+    step logged, rewritten as `job - run id - step - line`; the line as it
+    was written is beside it. The other is one of Dagster's own events,
+    `STEP_START` or `STEP_FAILURE` with the whole stack in its message,
+    and a failure's alone is longer than a tail: held, it left no room
+    for anything the step had said. Those are passed over. The failure
+    crosses with the run's event log, and its error ends the tail.
+
+    Which kind a record is, the manager says only after the record is
+    made, and every record is first seen as it is made. So the manager's
+    are left until its handlers show them again, with what it knows. It
+    then logs each one once more to every logger the job configured, and
+    those copies are left out for good.
+    """
+
+    def text(self, record: logging.LogRecord) -> Optional[str]:
+        """
+        What a record is held as.
+
+        :param record: what was logged
+        :return: the line as the step's code wrote it; None for an event
+            of Dagster's own, a copy of a line, and a record of the
+            manager's that has yet to be shown by it
+        """
+        if record.name == _TELEMETRY:
+            return None
+        meta = getattr(record, _RECORD_META, None)
+        if isinstance(meta, Mapping):
+            if meta.get("dagster_event") is not None:
+                return None
+            written = meta.get("orig_message")
+            if isinstance(written, str):
+                return ceoutput.clip(written)
+            return ceoutput.text_of(record)
+        logger, extra = _maker()
+        copied = isinstance(extra, Mapping) and _RECORD_META in extra
+        if copied or self in (getattr(logger, "handlers", None) or ()):
+            return None
+        return ceoutput.text_of(record)
+
+
+def _maker() -> Tuple[Any, Any]:
+    """
+    The logger making the record this is called for, and the `extra` it
+    is making it with.
+
+    `logging` hands the factory a record's fields and not the logger, and
+    sets what `extra` holds on the record only once the factory is done.
+    Both are in the frame of the `makeRecord` that called it.
+
+    :return: the two; None for each where no such frame is found
+    """
+    frame: Any = sys._getframe(1)  # pylint: disable=protected-access
+    for _ in range(_MAKER_FRAMES):
+        if frame is None:
+            break
+        if frame.f_code.co_name == "makeRecord":
+            held = frame.f_locals
+            return held.get("self"), held.get("extra")
+        frame = frame.f_back
+    return None, None
 
 
 # #############################################################################
@@ -126,6 +231,7 @@ def install() -> bool:
         or arguments_enabled()
         or cesource.enabled()
         or cesettin.enabled()
+        or ceoutput.enabled()
     ):
         return False
     _installed = True
@@ -163,11 +269,26 @@ def bracketed(original: Callable[..., Iterator[Any]]) -> Callable[..., Any]:
     """
 
     def sequence(step_context: Any, *args: Any, **kwargs: Any) -> Iterator[Any]:
-        _begin()
+        ring = _begin(step_context)
+        # What the step failed with: the error on its failure event, or
+        # the exception that left Dagster's own code.
+        failure: List[Any] = []
+        events = original(step_context, *args, **kwargs)
         try:
-            yield from original(step_context, *args, **kwargs)
+            for event in events:
+                _note_failure(event, failure)
+                yield event
+        except GeneratorExit:
+            # The caller stopped reading; that is not the step failing.
+            raise
+        except BaseException as exc:
+            failure.append(exc)
+            raise
         finally:
-            _finish(step_context)
+            close = getattr(events, "close", None)
+            if callable(close):
+                close()
+            _finish(step_context, ring, failure)
 
     setattr(sequence, _MARK, True)
     sequence.__name__ = getattr(original, "__name__", _SEAM_NAME)
@@ -175,39 +296,127 @@ def bracketed(original: Callable[..., Iterator[Any]]) -> Callable[..., Any]:
     return sequence
 
 
-def _begin() -> None:
-    """Start noting statements for the step about to run."""
+def _begin(step_context: Any) -> Optional[ceoutput.Ring]:
+    """
+    Start noting statements, and holding what is logged, for the step
+    about to run.
+
+    :param step_context: Dagster's context for the step
+    :return: the ring on the step's loggers; None when output is not sent
+    """
     try:
         cesqlcap.start()
     except Exception:  # pylint: disable=broad-exception-caught
         pass
+    return ceoutput.watch(*_step_loggers(step_context), ring=_StepRing())
 
 
-def _finish(step_context: Any) -> None:
+def _step_loggers(step_context: Any) -> List[Any]:
+    """
+    The logger behind a step's `context.log`.
+
+    Its records are read where its handlers see them, with what it has
+    added to each; see `_StepRing`. It is in no hierarchy to be found by
+    name.
+
+    :param step_context: Dagster's context for the step
+    :return: the logger, or none where the context has no such thing
+    """
+    try:
+        logger = getattr(step_context, "log", None)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return []
+    return [logger] if isinstance(logger, logging.Logger) else []
+
+
+def _note_failure(event: Any, failure: List[Any]) -> None:
+    """
+    Keep the error of a step's failure event as it passes.
+
+    :param event: what Dagster's step execution just yielded
+    :param failure: where the error is put
+    """
+    try:
+        if getattr(event, "event_type_value", None) != _STEP_FAILURE:
+            return
+        data = getattr(event, "event_specific_data", None)
+        failure.append(getattr(data, "error", None))
+    except Exception:  # pylint: disable=broad-exception-caught
+        # The event is the step's own and is yielded whatever happens here.
+        pass
+
+
+def _finish(
+    step_context: Any,
+    ring: Optional[ceoutput.Ring] = None,
+    failure: Optional[List[Any]] = None,
+) -> None:
     """
     Write what the step ran to the run's event log.
 
     :param step_context: Dagster's context for the step that just ended
+    :param ring: what `_begin` put on the step's loggers
+    :param failure: what the step failed with; empty for one that did not
     """
+    ceoutput.unwatch(ring, *_step_loggers(step_context))
     try:
-        note = note_of(step_context, cesqlcap.drain())
+        output = None
+        if failure:
+            held = ring.lines() if ring is not None else []
+            output = held + error_lines(failure[-1])
+        note = note_of(step_context, cesqlcap.drain(), output)
         if note:
             write_note(step_context, note)
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        _LOG.debug("convalesce: could not note a step: %s", exc)
+        # The class and not the message, which could quote the output.
+        _LOG.debug("convalesce: could not note a step: %s", type(exc).__name__)
+
+
+def error_lines(error: Any) -> List[str]:
+    """
+    A step's failure as the last lines of its output.
+
+    Written the way Python prints an exception: the cause first, each
+    error's innermost frames above its message, and the error the step
+    failed with last, where the cut that keeps a tail's end keeps it.
+
+    :param error: the `error` of a `STEP_FAILURE` event, with its
+        `message`, `stack` and `cause`, or an exception
+    :return: the lines; none for an error that says nothing
+    """
+    if isinstance(error, BaseException):
+        return [f"{type(error).__name__}: {error}".rstrip()]
+    chain: List[Any] = []
+    while error is not None and len(chain) < _MAX_CAUSES:
+        chain.append(error)
+        error = getattr(error, "cause", None) or getattr(error, "context", None)
+    out: List[str] = []
+    for item in reversed(chain):
+        stack = getattr(item, "stack", None)
+        if isinstance(stack, (list, tuple)):
+            out.extend(str(f).rstrip() for f in stack[-_STACK_FRAMES:])
+        message = getattr(item, "message", None)
+        if isinstance(message, str) and message.strip():
+            out.append(message.rstrip())
+    return out
 
 
 def note_of(
-    step_context: Any, noted: Optional[Dict[str, Any]]
+    step_context: Any,
+    noted: Optional[Dict[str, Any]],
+    output: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     What one step ran, as plain data with its secrets masked.
 
     :param step_context: Dagster's context for the step
     :param noted: what `sqlcapture.drain` handed over, if anything
+    :param output: what a step that failed logged, and its error; None
+        for a step that did not fail
     :return: `{"sql", "config", "ran": {"sha256", "file_sha256"},
-        "settings", "settings_excluded"}`, each only when there is one;
-        empty when the step left nothing to say
+        "settings", "settings_excluded", "output_tail",
+        "output_excluded"}`, each only when there is one; empty when the
+        step left nothing to say
     """
     note: Dict[str, Any] = {}
     if noted and cesqlcap.enabled():
@@ -232,6 +441,13 @@ def note_of(
     # After the masking, not before: a setting is already either a value
     # that is no credential or a hash, and neither is to be changed here.
     out.update(_settings())
+    # The same holds for a failed step's output, masked by rules made for
+    # output as it is cut.
+    tail, left_out = ceoutput.tail(output)
+    if tail:
+        out[ceoutput.FIELD] = tail
+        if left_out:
+            out[OUTPUT_EXCLUDED] = left_out
     return out
 
 
@@ -365,8 +581,8 @@ def describe(
     :param run: the run the context exposed
     :param step_stats: the run's step stats, when already read
     :return: `[{"step_key", "source", "sql", "config", "ran", "settings",
-        "settings_excluded"}]`, each field only where there is one; empty
-        when nothing could be read
+        "settings_excluded", "output_tail", "output_excluded"}]`, each
+        field only where there is one; empty when nothing could be read
     """
     run_id = getattr(run, "run_id", None)
     notes = read_notes(getattr(context, "instance", None), run_id)
@@ -384,6 +600,7 @@ def describe(
         else {}
     )
     arguments = arguments_enabled()
+    failed = _failed_steps(step_stats)
     out: List[Dict[str, Any]] = []
     sent: set = set()
     read: Dict[str, Optional[Dict[str, Any]]] = {}
@@ -403,31 +620,60 @@ def describe(
         for name, value in notes.get(key, {}).items():
             if name == "config" and not arguments:
                 continue
+            if (
+                name in _OF_A_FAILURE
+                and failed is not None
+                and key not in failed
+            ):
+                # A step that ended well after a try that did not, and
+                # wrote no note for the try that ended it.
+                continue
             entry[name] = value
         if len(entry) > 1:
             out.append(entry)
     return out
 
 
+def _failed_steps(step_stats: Any) -> Optional[set]:
+    """
+    The steps a run's stats say failed.
+
+    :param step_stats: the run's step stats, when they were read
+    :return: their keys; None when there are no stats to tell by
+    """
+    if not step_stats:
+        return None
+    out = set()
+    for stat in step_stats:
+        status = getattr(stat, "status", None)
+        if str(getattr(status, "value", status)).upper() == _FAILURE:
+            out.add(getattr(stat, "step_key", None))
+    return out
+
+
 def take_excluded(steps: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     """
-    Move what each step's settings left out from its entry to one list.
+    Move what each step's settings and output left out from its entry to
+    one list.
 
     :param steps: what `describe` returned, changed in place
     :return: what was left out, by path from the payload's root and reason
     """
     out: List[Dict[str, str]] = []
     for index, entry in enumerate(steps):
-        left_out = entry.pop(SETTINGS_EXCLUDED, None)
-        if not isinstance(left_out, list):
-            continue
-        for item in left_out:
-            # Read back from the event log, so only the shape it was
-            # written in is passed on.
-            path = item.get("path") if isinstance(item, dict) else None
-            reason = item.get("reason") if isinstance(item, dict) else None
-            if isinstance(path, str) and isinstance(reason, str):
-                out.append({"path": f"steps[{index}].{path}", "reason": reason})
+        for name in (SETTINGS_EXCLUDED, OUTPUT_EXCLUDED):
+            left_out = entry.pop(name, None)
+            if not isinstance(left_out, list):
+                continue
+            for item in left_out:
+                # Read back from the event log, so only the shape it was
+                # written in is passed on.
+                path = item.get("path") if isinstance(item, dict) else None
+                reason = item.get("reason") if isinstance(item, dict) else None
+                if isinstance(path, str) and isinstance(reason, str):
+                    out.append(
+                        {"path": f"steps[{index}].{path}", "reason": reason}
+                    )
     return out
 
 
@@ -513,6 +759,11 @@ def _merged(
     if not earlier:
         return dict(later)
     out = {**earlier, **later}
+    if ceoutput.FIELD not in later:
+        # A try that failed and one after it that did not: the step did
+        # not fail, and says nothing of the try that did.
+        out.pop(ceoutput.FIELD, None)
+        out.pop(OUTPUT_EXCLUDED, None)
     before = earlier.get("sql")
     after = later.get("sql")
     if isinstance(before, dict) and isinstance(after, dict):

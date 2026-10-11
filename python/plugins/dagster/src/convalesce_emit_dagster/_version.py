@@ -7,4 +7,4 @@ import convalesce_emit_dagster._version as cedagsterver
 """
 
 __package_name__ = "convalesce-emit-dagster"
-__version__ = "0.3.0"
+__version__ = "1.0.0"
